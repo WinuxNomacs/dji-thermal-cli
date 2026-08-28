@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+
+# DJI Thermal SDK compiled binaries. Per lib/License.txt, only the headers
+# (tsdk-core/api/) are MIT-licensed; libdirp and everything under
+# tsdk-core/lib/ and utility/bin/ are covered by DJI's separate SDK EULA
+# (https://developer.dji.com/policies/eula/), which prohibits redistributing
+# the object code under an open source license. Download the SDK yourself
+# from https://www.dji.com/downloads/softwares/dji-thermal-sdk and place it
+# under lib/ -- see README.md.
+/lib/tsdk-core/lib/
+/lib/utility/

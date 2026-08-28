@@ -1,0 +1,21 @@
+[project]
+name = "dji-thermal-cli"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Winxu Nomacs", email = "16427666+WinuxNomacs@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.5.2",
+    "pillow>=11.0.0",
+    "tifffile>=2025.1.1",
+]
+
+[project.scripts]
+dji-thermal-cli = "dji_thermal_cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
