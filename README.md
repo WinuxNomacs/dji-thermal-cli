@@ -10,7 +10,7 @@ derivative files.
 
 ## Setup
 
-1. Download the DJI Thermal SDK yourself from
+1. Use static sdk version in libs or download the DJI Thermal SDK yourself from
    https://www.dji.com/downloads/softwares/dji-thermal-sdk and unpack it so
    its contents land under `lib/` here, i.e. `lib/tsdk-core/lib/<windows|linux>/...`
    should contain `libdirp.dll`/`libdirp.so` and its companion libraries.
