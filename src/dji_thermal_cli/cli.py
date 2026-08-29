@@ -198,6 +198,8 @@ def _cmd_list(args: argparse.Namespace) -> None:
             info["color_bar"]["low"] = to_display(info["color_bar"]["low"])
             info["color_bar"]["high"] = to_display(info["color_bar"]["high"])
         rows.append(info)
+        from pprint import pprint
+        pprint(info)
 
     if args.format == "json":
         print(json.dumps(rows, indent=2))

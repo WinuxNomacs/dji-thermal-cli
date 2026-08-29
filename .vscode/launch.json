@@ -1,0 +1,42 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "dji-thermal-cli: list",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "dji_thermal_cli",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "list",
+                "--input-dir", "${input:inputDir}"
+            ]
+        },
+        {
+            "name": "dji-thermal-cli: process",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "dji_thermal_cli",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "process",
+                "--input-dir", "${input:inputDir}",
+                "--output-dir", "${workspaceFolder}/out",
+                "--no-isolate"
+            ]
+        }
+    ],
+    "inputs": [
+        {
+            "id": "inputDir",
+            "type": "promptString",
+            "description": "Path to a single R-JPEG file or a directory of them"
+        }
+    ]
+}
