@@ -1,3 +1,30 @@
+# Portions of this file -- the struct layouts, enums and function signatures below -- are
+# transcribed from DJI's Thermal SDK header dirp_api.h, which DJI distributes under the MIT
+# License. DJI's notice, reproduced as that license requires:
+#
+# Copyright (c) 2020-2023 DJI. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# The rest of this file is part of dji-thermal-cli and is licensed under AGPL-3.0-only
+# (see the LICENSE file).
+
 """ctypes bindings for the DJI Thermal SDK's dirp (R-JPEG) API.
 
 These structs and function signatures are transcribed directly from
@@ -14,6 +41,7 @@ from __future__ import annotations
 import ctypes as CT
 import os
 import platform
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +85,15 @@ class DirpError(RuntimeError):
         self.func = func
         self.code = code
         super().__init__(f"{func} failed: {describe_ret(code)}")
+
+
+class UnsupportedSdkVersion(RuntimeError):
+    """The installed libdirp reports an API revision these bindings have not been built for."""
+
+
+# dirp_api_version_t.api values whose struct layouts match the bindings below (DJI Thermal SDK v1.8).
+SUPPORTED_API_VERSIONS = frozenset({20})
+ALLOW_UNKNOWN_ENV = "DJI_THERMAL_SDK_ALLOW_UNKNOWN_VERSION"
 
 
 def _check(func_name: str, code: int) -> None:
@@ -199,6 +236,7 @@ class DirpSDK:
     def __init__(self, dll_dir: str | Path | None = None):
         self.dll_path = resolve_dll_path(dll_dir)
         self._lib = CT.CDLL(str(self.dll_path))
+        self._version_checked = False
         self._bind()
 
     def _bind(self) -> None:
@@ -229,9 +267,56 @@ class DirpSDK:
         lib.dirp_get_measurement_params.restype = CT.c_int32
         lib.dirp_get_measurement_params_range.argtypes = [DIRP_HANDLE, CT.POINTER(dirp_measurement_params_range_t)]
         lib.dirp_get_measurement_params_range.restype = CT.c_int32
+        try:
+            lib.dirp_get_api_version.argtypes = [DIRP_HANDLE, CT.POINTER(dirp_api_version_t)]
+            lib.dirp_get_api_version.restype = CT.c_int32
+            self._has_api_version = True
+        except AttributeError:
+            self._has_api_version = False
+
+    def api_version(self, rjpeg: "RJpeg") -> tuple[int, str] | None:
+        """(API revision, magic tag) the library reports for an open handle, or None if it can't say."""
+        if not self._has_api_version:
+            return None
+        version = dirp_api_version_t()
+        if self._lib.dirp_get_api_version(rjpeg._handle, CT.byref(version)) != DIRP_SUCCESS:
+            return None
+        return version.api, version.magic.decode("ascii", "replace")
+
+    def _check_version(self, rjpeg: "RJpeg") -> None:
+        found = self.api_version(rjpeg)
+        if found is not None and found[0] in SUPPORTED_API_VERSIONS:
+            return
+        reported = (
+            "no version information (it is probably older than this tool supports)"
+            if found is None else f"API revision {found[0]} ({found[1]!r})"
+        )
+        if os.environ.get(ALLOW_UNKNOWN_ENV) == "1":
+            warnings.warn(
+                f"DJI Thermal SDK at {self.dll_path} reports {reported}; continuing because "
+                f"{ALLOW_UNKNOWN_ENV}=1. Results are unchecked.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return
+        supported = ", ".join(str(v) for v in sorted(SUPPORTED_API_VERSIONS))
+        raise UnsupportedSdkVersion(
+            f"The DJI Thermal SDK at {self.dll_path} reports {reported}; this tool supports API "
+            f"revision {supported} (SDK v1.8). Struct layouts differ between SDK releases and a "
+            f"mismatch can silently return wrong values. To try it anyway, pass "
+            f"--allow-unknown-sdk-version or set {ALLOW_UNKNOWN_ENV}=1."
+        )
 
     def open(self, data: bytes) -> "RJpeg":
-        return RJpeg(self._lib, data)
+        rjpeg = RJpeg(self._lib, data)
+        if not self._version_checked:
+            try:
+                self._check_version(rjpeg)
+            except BaseException:
+                rjpeg.close()
+                raise
+            self._version_checked = True
+        return rjpeg
 
 
 class RJpeg:

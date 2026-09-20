@@ -11,3 +11,10 @@ __pycache__/
 # under lib/ -- see README.md.
 /lib/tsdk-core/lib/
 /lib/utility/
+
+# Local R-JPEG samples used for reverse-engineering the radiometric formula
+# (real drone captures, not for redistribution).
+/calibration_samples/
+
+# Large generated calibration tables (not committed)
+/research/table_*.npz
