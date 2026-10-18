@@ -1,0 +1,83 @@
+[project]
+name = "dji-thermal-cli"
+version = "0.1.0"
+description = "DJI R-JPEG thermal images to temperatures, in pure Python: CLI and API for datasets, mosaics and WebODM"
+readme = "README.md"
+# AGPL for this project; tsdk/powf32.py carries Arm's optimized-routines powf tables
+license = "AGPL-3.0-only AND (MIT OR Apache-2.0 WITH LLVM-exception)"
+license-files = ["LICENSE", "LICENSES/*"]
+authors = [
+    { name = "Winxu Nomacs", email = "16427666+WinuxNomacs@users.noreply.github.com" }
+]
+keywords = [
+    "dji", "thermal", "radiometric", "r-jpeg", "infrared", "temperature", "drone",
+    "photogrammetry", "webodm", "odm", "geotiff", "mosaic",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+    "Typing :: Typed",
+]
+requires-python = ">=3.14"
+# lower bounds are tested in CI (lowest-direct resolution)
+dependencies = [
+    "numpy>=2.5.2",
+    "pillow>=11.3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/WinuxNomacs/dji-thermal-cli"
+Source = "https://github.com/WinuxNomacs/dji-thermal-cli"
+Issues = "https://github.com/WinuxNomacs/dji-thermal-cli/issues"
+Changelog = "https://github.com/WinuxNomacs/dji-thermal-cli/blob/main/CHANGELOG.md"
+
+[project.scripts]
+dji-thermal-cli = "dji_thermal_cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "openexr>=3.5.2",
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+    "tifffile>=2026.10.15",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error"]
+addopts = ["--strict-markers"]
+markers = [
+    "samples: needs sample R-JPEGs (DJI_THERMAL_SAMPLES_DIR, or the SDK's dataset/ via DJI_THERMAL_SDK_DIR)",
+    "flight: needs one flight's images (DJI_THERMAL_FLIGHT_DIR)",
+    "native: compares with the native DJI Thermal SDK's libraries (DJI_THERMAL_SDK_DIR)",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+# bugs, not style: the tsdk mirrors the SDK's C code line by line and keeps its layout
+select = ["F", "E9", "PLE", "B"]
+ignore = [
+    "B008",   # call in a default argument: used for immutable defaults
+    "B905",   # zip() without strict=
+    "B023",   # closure over a loop variable: every such closure is called within its iteration
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/dji_thermal_cli/__init__.py" = ["PLE0604"]          # __all__ extends api.__all__
+"src/dji_thermal_cli/tsdk/*" = ["B007"]                  # loop variables named as in the SDK

@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+.venv/
+ignored/
+
+# build and tool output
+/dist/
+/build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+/out/
+
+# personal settings: editor, assistant, local environment (e.g. DJI_THERMAL_* test paths)
+.env
+.env.*
+.claude/
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+/lib/tsdk-core/lib/
+/lib/utility/
+
+# Local R-JPEG samples
+# (real drone captures, not for redistribution).
+/calibration_samples/
+
