@@ -1,8 +1,10 @@
 # Releasing
 
 Releases are published by `.github/workflows/release.yml` when a `vX.Y.Z` tag is pushed:
-tests, build, the distribution check, TestPyPI, then PyPI after approval. No API token is
-stored anywhere: PyPI trusts the workflow itself (Trusted Publishing).
+tests, build, the distribution check, TestPyPI, then PyPI. No API token is
+stored anywhere: PyPI trusts the workflow itself (Trusted Publishing). Only the maintainer
+can push a `v*` tag (a tag rule), so pushing the tag is the release decision: nothing waits
+for a further approval.
 
 ## One-time setup
 
@@ -23,10 +25,11 @@ stored anywhere: PyPI trusts the workflow itself (Trusted Publishing).
    A pending publisher also reserves the name until the first upload.
 3. **GitHub environments** (repository Settings > Environments):
    - `testpypi`: deployment tags `v*`.
-   - `pypi`: deployment tags `v*` and a required reviewer (you), so nothing reaches PyPI
-     without an explicit approval after TestPyPI succeeds.
+   - `pypi`: deployment tags `v*`. (A required reviewer would pause the run before PyPI
+     for an approval; it is left off, because only you can push `v*` tags.)
 4. **Repository settings:** enable private vulnerability reporting (Security > Advisories),
-   protect `main`, and protect tags `v*` (Settings > Rules) so only you can push them.
+   protect `main`, and protect tags `v*` (Settings > Rules) so only you can push them: this
+   tag rule is what keeps anyone else from publishing.
 
 ## Each release
 
@@ -55,10 +58,11 @@ then `X.Y.Z` itself. A version number is used once, on TestPyPI and PyPI alike.
    it with "Interrupted.". On Linux, run the same with the native comparisons too (they run
    on Linux only). On Windows, run the same without them (`set` the variables in `cmd`, or
    `$env:` in PowerShell).
-4. Tag and push: `git tag -s vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
-5. Watch the Release workflow; check the TestPyPI page and
-   `uv tool run --index-url https://test.pypi.org/simple/ --index-strategy unsafe-best-match dji-thermal-cli --version`
-   if you want, then approve the `pypi` deployment.
+4. Push `main`, wait for CI to pass on all three systems, then tag and push the tag:
+   `git tag -s vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. This publishes: TestPyPI, then
+   PyPI, without stopping.
+5. Watch the Release workflow, then check the release installs:
+   `uvx dji-thermal-cli@X.Y.Z --version`.
 6. Create the GitHub release from the tag with the changelog notes.
 
 A version can never be uploaded to PyPI twice. If something is wrong after publishing,
