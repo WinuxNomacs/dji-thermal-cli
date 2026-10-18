@@ -30,6 +30,10 @@ stored anywhere: PyPI trusts the workflow itself (Trusted Publishing).
 
 ## Each release
 
+Versions follow PEP 440: a release candidate `X.Y.ZrcN` (tag `vX.Y.ZrcN`) first, to try the
+whole pipeline (PyPI marks it as a pre-release, so `pip install` skips it unless asked),
+then `X.Y.Z` itself. A version number is used once, on TestPyPI and PyPI alike.
+
 1. On a branch: set `version` in `pyproject.toml`, run `uv lock`, and move the
    `[Unreleased]` notes in `CHANGELOG.md` under the new version. Merge to `main`.
 2. Check locally:
