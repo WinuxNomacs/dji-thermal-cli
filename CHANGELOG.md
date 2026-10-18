@@ -6,9 +6,9 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0rc1] - 2026-10-18
+## [1.0.0] - 2026-10-18
 
-First release candidate.
+First release.
 
 - Pure-Python SDK tested against DJI's Thermal SDK v1.8 measurement and image processing,
   bit-for-bit identical to the SDK's `dirp_measure_ex` and `dirp_process`, with no native
@@ -32,5 +32,10 @@ First release candidate.
 - Python API (`import dji_thermal_cli as dtc`) with everything the command line does.
 - Linux, Windows and macOS.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v0.1.0rc1...HEAD
+## [0.1.0rc1] - 2026-10-18
+
+Release candidate of 1.0.0, with the same contents.
+
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/WinuxNomacs/dji-thermal-cli/releases/tag/v1.0.0
 [0.1.0rc1]: https://github.com/WinuxNomacs/dji-thermal-cli/releases/tag/v0.1.0rc1
