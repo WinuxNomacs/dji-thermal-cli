@@ -1,7 +1,7 @@
 name: Release
 
 # Push a tag vX.Y.Z matching pyproject.toml's version. The build is published to TestPyPI,
-# then to PyPI once the protected `pypi` environment is approved. Publishing uses Trusted
+# then to PyPI. Only the maintainer can push v* tags (a tag rule). Publishing uses Trusted
 # Publishing (OIDC, no API tokens) and uploads digital attestations (PEP 740).
 
 on:
@@ -65,7 +65,7 @@ jobs:
     needs: testpypi
     runs-on: ubuntu-latest
     environment:
-      name: pypi                           # protect it: required reviewers, tags v* only
+      name: pypi                           # deploys from v* tags only
       url: https://pypi.org/project/dji-thermal-cli/
     permissions:
       id-token: write                      # Trusted Publishing only
