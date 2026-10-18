@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="img/dji-thermal-cli-sub5.gif"
+  <img src="https://raw.githubusercontent.com/WinuxNomacs/dji-thermal-cli/main/img/dji-thermal-cli-sub5.gif"
        alt="dji-thermal-cli: DJI thermal images to temperatures" width="100%">
 </p>
 
