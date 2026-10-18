@@ -10,6 +10,7 @@ Supports finite non-negative x and finite y.
 """
 import math
 import struct
+from fractions import Fraction
 
 import numpy as np
 
@@ -39,7 +40,15 @@ _EXP2_TAB = [
 _C = (_h("0x1.c6af84b912394p-5"), _h("0x1.ebfce50fac4f3p-3"), _h("0x1.62e42ff0c52d6p-1"))
 _SHIFT = _h("0x1.8p+52") / 32
 _OFF = 0x3F330000
-_fma = math.fma
+
+
+def fma_exact(a: float, b: float, c: float) -> float:
+    """a*b+c rounded once, like math.fma (Python 3.13+): exact in rationals, then one correctly
+    rounded conversion. For finite arguments, which are all powf passes."""
+    return float(Fraction(a) * Fraction(b) + Fraction(c))
+
+
+_fma = getattr(math, "fma", fma_exact)
 
 
 def _f32bits(x):

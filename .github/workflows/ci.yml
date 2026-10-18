@@ -33,11 +33,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.14"]
         resolution: [locked]
         include:
+          # the oldest supported Python with the lowest dependency versions (numpy 1.26)
           - os: ubuntu-latest
+            python: "3.12"
             resolution: lowest-direct
     runs-on: ${{ matrix.os }}
+    env:
+      UV_PYTHON: ${{ matrix.python }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -88,6 +93,8 @@ jobs:
         shell: bash
         run: |
           wheel=$(ls dist/*.whl)
-          uvx --python 3.14 --from "$wheel" dji-thermal-cli --version
-          uvx --python 3.14 --from "$wheel" dji-thermal-cli --help > /dev/null
-          uv run --python 3.14 --no-project --with "$wheel" python -c "import dji_thermal_cli as dtc; print(dtc.__version__, len(dtc.PALETTES))"
+          for py in 3.12 3.14; do
+            uvx --python $py --from "$wheel" dji-thermal-cli --version
+            uvx --python $py --from "$wheel" dji-thermal-cli --help > /dev/null
+            uv run --python $py --no-project --with "$wheel" python -c "import dji_thermal_cli as dtc; print(dtc.__version__, len(dtc.PALETTES))"
+          done

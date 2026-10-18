@@ -178,6 +178,8 @@ def _plain(value):
         return value.strip("\0 ")
     try:
         f = float(value)
+    except ZeroDivisionError:       # an EXIF rational over 0: NaN in Pillow, which float() raises for before 3.14
+        return None
     except (TypeError, ValueError):
         return str(value)
     if math.isnan(f) or math.isinf(f):
@@ -199,7 +201,7 @@ def _temp(celsius: float, unit: str) -> float:
 def _num(value) -> float | None:
     try:
         f = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, ZeroDivisionError):
         return None
     return f if math.isfinite(f) else None
 
@@ -214,9 +216,11 @@ def _str(value) -> str | None:
 def _dms(value, ref) -> float | None:
     try:
         d, m, s = (float(v) for v in value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, ZeroDivisionError):
         return None
     deg = d + m / 60 + s / 3600
+    if not math.isfinite(deg):
+        return None
     return -deg if str(ref).upper() in ("S", "W") else deg
 
 

@@ -6,6 +6,12 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- Python 3.12 and 3.13 are supported, with numpy 1.26 or newer, so the package installs into
+  existing environments such as WebODM's. Results are bit-for-bit the same on every supported
+  version.
+- `list` and the mosaic no longer fail on an EXIF rational with a zero denominator before
+  Python 3.14; such a value is reported as missing, as on 3.14.
+
 ## [1.0.0] - 2026-10-18
 
 First release.
