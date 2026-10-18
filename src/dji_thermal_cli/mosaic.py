@@ -88,6 +88,16 @@ class Frame:
     pose: Pose
 
 
+def _exif_number(value) -> float | None:
+    """A positive, finite EXIF number, or None. A rational over 0 is NaN in Pillow, which float()
+    raises for before Python 3.14."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return f if math.isfinite(f) and f > 0 else None
+
+
 def read_pose(data: bytes) -> tuple[Pose | None, str | None]:
     """The frame's camera pose from its DJI XMP and EXIF, or (None, why not)."""
     f = djixmp.fields(data)
@@ -102,9 +112,8 @@ def read_pose(data: bytes) -> tuple[Pose | None, str | None]:
     exif = image.getexif()
     lens = exif.get_ifd(0x8769)
     model = str(exif.get(272, "")).strip("\0 ")
-    focal = lens.get(37386)
-    focal_px, focal_source = focal_length_px(model, width, height, float(focal) if focal else None,
-                                             float(lens.get(41989) or 0) or None)
+    focal_px, focal_source = focal_length_px(model, width, height, _exif_number(lens.get(37386)),
+                                             _exif_number(lens.get(41989)))
     if focal_px is None:
         return None, "no focal length in the EXIF"
     rel = djixmp.number(f, "RelativeAltitude")

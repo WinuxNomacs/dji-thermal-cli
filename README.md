@@ -24,7 +24,7 @@ pip install dji-thermal-cli
 ```
 
 or as a stand-alone command with `uv tool install dji-thermal-cli` or
-`pipx install dji-thermal-cli`. It needs Python 3.14 or newer; numpy and Pillow are its only
+`pipx install dji-thermal-cli`. It needs Python 3.12 or newer; numpy and Pillow are its only
 dependencies. Neither the DJI Thermal SDK nor any native library is needed. It runs on
 Linux, Windows and macOS, and gives the same results on each.
 
@@ -466,9 +466,7 @@ GNU Affero General Public License v3.0 (`AGPL-3.0-only`), the same license as
 This tool is an independent reimplementation of the DJI Thermal SDK's measurement and
 image-processing algorithms, verified against the SDK's outputs. No DJI code or binaries are
 included.
-`tsdk/data/dji_tsdk_v18.npz` holds data taken from the SDK v1.8 libraries (calibration
-tables and colour palettes); its use is subject to DJI's permission and
-[SDK EULA](https://developer.dji.com/policies/eula/). The
+`tsdk/data/dji_tsdk_v18.npz` holds the SDK v1.8's calibration tables and colour palettes. The
 `powf` implementation in `tsdk/powf32.py` follows ARM optimized-routines (MIT OR Apache-2.0
 WITH LLVM-exception). The test suite loads the DJI SDK binaries from your own SDK copy, under
 DJI's own EULA; `tests/native_sdk.py` transcribes struct layouts from DJI's MIT-licensed

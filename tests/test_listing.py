@@ -79,6 +79,19 @@ def test_missing_metadata_is_none():
     assert info["camera"]["model"] == "ZH20T" and info["temperature"]["valid_pixels"] > 0
 
 
+def test_rational_over_zero_is_missing():
+    """Pillow reads an EXIF rational over 0 as NaN, which float() raises for before Python 3.14."""
+    from PIL.TiffImagePlugin import IFDRational
+
+    from dji_thermal_cli import mosaic
+
+    nan = IFDRational(1, 0)
+    assert listing._plain(nan) is None and listing._num(nan) is None
+    assert listing._dms((nan, IFDRational(0), IFDRational(0)), "N") is None
+    assert listing._dms((IFDRational(45), IFDRational(30), IFDRational(0)), "S") == -45.5
+    assert mosaic._exif_number(nan) is None and mosaic._exif_number(IFDRational(12)) == 12.0
+
+
 @pytest.mark.flight
 def test_cli_formats():
     src = _flight_file()
