@@ -3,6 +3,7 @@ temperature field, GeoTIFF tags, and the command line."""
 
 from __future__ import annotations
 
+import io
 import json
 import math
 
@@ -15,6 +16,7 @@ from dji_thermal_cli import geo, mosaic, units
 
 from .conftest import flight_counts, flight_dir, sample_files, samples_dir
 from .test_cli import _cli
+from .test_rangefinder import _with_xmp, _xmp
 
 LAT, LON, GROUND = 42.1034, -88.0767, 200.0
 
@@ -148,6 +150,24 @@ def test_focal_length():
     f, source = mosaic.focal_length_px("other", 640, 512, 12.0, 52.0)
     assert f == pytest.approx(52.0 * math.hypot(640, 512) / mosaic.FULL_FRAME_DIAGONAL_MM) and source.startswith("35 mm")
     assert mosaic.focal_length_px("M2EA", 640, 512, None, None) == (None, "")
+
+
+def test_pose_takes_the_measured_size_not_the_upscaled_jpegs():
+    """A super-resolution frame (M4T: a 1280x1024 JPEG over 640x512 measurements) is posed at
+    the size it measures, with the focal length scaled to it; a JPEG that is no R-JPEG keeps
+    its own size."""
+    exif = Image.Exif()
+    exif[272] = "M4T"
+    exif.get_ifd(0x8769)[37386] = 12.0
+    buf = io.BytesIO()
+    Image.new("L", (1280, 1024)).save(buf, "JPEG", exif=exif)
+    data = _with_xmp(buf.getvalue(), _xmp(
+        'drone-dji:GpsLatitude="42.1" drone-dji:GpsLongitude="-88.1" drone-dji:AbsoluteAltitude="250" '
+        'drone-dji:GimbalYawDegree="0" drone-dji:GimbalPitchDegree="-90" drone-dji:GimbalRollDegree="0">'))
+    pose, why = mosaic.read_pose(data, (640, 512))
+    assert why is None and (pose.width, pose.height) == (640, 512) and pose.focal_px == pytest.approx(1000.0)
+    pose, _ = mosaic.read_pose(data)
+    assert (pose.width, pose.height) == (1280, 1024) and pose.focal_px == pytest.approx(2000.0)
 
 
 @pytest.mark.samples
