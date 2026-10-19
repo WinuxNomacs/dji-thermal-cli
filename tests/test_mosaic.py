@@ -12,7 +12,7 @@ import pytest
 import tifffile
 from PIL import Image
 
-from dji_thermal_cli import geo, mosaic, units
+from dji_thermal_cli import api, geo, mosaic, units
 
 from .conftest import flight_counts, flight_dir, sample_files, samples_dir
 from .test_cli import _cli
@@ -225,6 +225,18 @@ def test_flight(tmp_path):
     assert "mosaic_preview.png  (ironred, " in proc.stdout
     with Image.open(tmp_path / "mosaic_preview.png") as im:
         assert im.mode == "RGBA"
+    steps = [line for line in proc.stderr.splitlines() if line.startswith("Mosaic step ")]
+    assert steps[0] == f"Mosaic step 1 of 5: reading frames, {len(api.scan(flight_dir()).jpegs)} files"
+    assert steps[-1] == "Mosaic step 5 of 5: writing, 2 files"
+    assert sum("aligning (round" in line for line in steps) == 6     # pairs, then solve steps, for 3 rounds
+
+
+@pytest.mark.flight
+def test_flight_quiet_prints_the_results_without_progress(tmp_path):
+    proc = _cli("process", "--input-dir", flight_dir(), "--output-dir", tmp_path, "--mosaic", "--no-mosaic-align", "--quiet")
+    assert proc.returncode == 0, proc.stderr
+    assert "Mosaic step" not in proc.stderr + proc.stdout
+    assert "mosaic_preview.png  (ironred, " in proc.stdout
 
 
 def test_alignment_recovers_boresight(monkeypatch):
@@ -271,3 +283,32 @@ def test_frame_offsets_normalize(synthetic):
     assert not m.report["frame_offsets"]["normalized"]
     h = mosaic.build(shifted, align=False, check_misalignment=False, normalize=True)
     assert h.report["radiometric_seams"]["median_abs_c"] < 0.5 * m.report["radiometric_seams"]["median_abs_c"]
+
+
+def test_build_reports_each_stage_counting_up_to_its_total(synthetic):
+    """build() reports alignment (pairs, then solve steps, per round), compositing and the
+    alignment check, each from 0 up to its total, and the mosaic is the same as without progress."""
+    frames, _ = synthetic
+    events = []
+    m = mosaic.build(frames, progress=lambda stage, done, total, unit, **extra: events.append((stage, unit, done, total, extra)))
+    runs = {}
+    for stage, unit, done, total, extra in events:
+        runs.setdefault((stage, unit, extra.get("round")), []).append((done, total))
+    assert list(dict.fromkeys(s for s, *_ in events)) == ["align", "composite", "check"]
+    assert {r for s, _, r in runs if s == "align"} == {1, 2, 3}
+    assert all(extra == {"round": extra["round"], "rounds": 3} for s, *_, extra in events if s == "align")
+    assert runs[("composite", "frames", None)][-1] == (6, 6)
+    assert runs[("align", "solve steps", 1)] == [(i, 8) for i in range(9)]
+    for counts in runs.values():
+        done = [d for d, _ in counts]
+        assert done[0] == 0 and done[-1] == counts[0][1] and done == sorted(done)
+    plain = mosaic.build(frames)
+    np.testing.assert_array_equal(m.temperature, plain.temperature)
+    assert m.report == plain.report
+
+
+def test_build_without_alignment_reports_no_align_stage(synthetic):
+    frames, _ = synthetic
+    stages = []
+    mosaic.build(frames, align=False, progress=lambda stage, *a, **k: stages.append(stage))
+    assert list(dict.fromkeys(stages)) == ["composite", "check"]
