@@ -148,7 +148,7 @@ dji-thermal-cli process --input-dir /path/to/flight --output-dir out --mosaic
 ```
 
 While it works, it shows its progress on stderr, one stage at a time
-(`Mosaic step 3 of 5: aligning (round 2/3), 812/1840 pairs`). On a terminal that is one line
+(`Mosaic step 2 of 5: aligning (round 2/3), 812/1840 pairs`). On a terminal that is one line
 updated in place; in a log or a pipe, a line as each stage starts. `--quiet` (`-q`) hides it;
 results, skipped files and errors still print.
 
