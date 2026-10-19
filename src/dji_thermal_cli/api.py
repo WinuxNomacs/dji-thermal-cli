@@ -212,7 +212,18 @@ class Event:
 
     kind: "unreadable" (path, detail = reason), "non_jpeg" (data["count"]), "file" (one file
     done: path, data["result"]), "note" (path, detail), "normalize" (data["ambient_c"],
-    data["reflected_c"]), "mosaic_skip" (path, detail).
+    data["reflected_c"]), "mosaic_skip" (path, detail), "mosaic" (a mosaic's progress, below).
+
+    A mosaic (make_mosaic, or normalization for process(normalize=...)) goes through stages,
+    each counted in its own unit; data = {"stage", "step", "steps", "done", "total", "unit"},
+    step being the stage's place among the run's steps (1-based). The stages, in order:
+    "ambient" (files: the embedded ambient temperatures read, when normalizing without
+    them given), "frames" (files measured), "align" (per round, data["round"] of
+    data["rounds"]: the overlapping pairs measured, counted by the area they overlap so the
+    count moves evenly, then the solve's reweighting steps, unit "solve steps"),
+    "composite" (frames), "check" (pairs, the misalignment report; make_mosaic only) and
+    "write" (files; make_mosaic only). Each stage starts with done = 0. There is no overall
+    percentage: the stages' costs vary with the flight.
     """
 
     kind: str
@@ -224,6 +235,19 @@ class Event:
 def _emit(progress: ProgressFn | None, *args, **kwargs) -> None:
     if progress:
         progress(Event(*args, **kwargs))
+
+
+def _stages(progress: ProgressFn | None, stages: list[str]):
+    """A mosaic progress reporter, report(stage, done, total, unit, **extra), sending "mosaic"
+    events numbered among stages; None without a progress callback."""
+    if not progress:
+        return None
+
+    def report(stage: str, done: int, total: int, unit: str, **extra) -> None:
+        progress(Event("mosaic", data={"stage": stage, "step": stages.index(stage) + 1, "steps": len(stages),
+                                       "done": done, "total": total, "unit": unit, **extra}))
+
+    return report
 
 
 # --- datasets -------------------------------------------------------------------------------
@@ -434,17 +458,25 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
     out.mkdir(parents=True, exist_ok=True)
     src_root = root if root.is_dir() else root.parent
     adj = settings.adjustments()
+    report = _stages(progress, _build_stages(settings, options, options.normalize, check=True) + ["write"])
     frames, palettes, counts, overrides, normalized = _mosaic_frames(
-        found, src_root, settings, options, adj, options.normalize, jobs, progress)
+        found, src_root, settings, options, adj, options.normalize, jobs, progress, report)
     if not frames:
         raise MosaicError("No frames to mosaic.", counts)
     try:
-        m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=options.normalize)
+        m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=options.normalize, progress=report)
     except ValueError as e:
         raise MosaicError(f"Mosaic failed: {e}", counts) from None
     m.report["adjustments"] = adjust.describe(adj)
-    files = [_mosaic.write(m, out / f"mosaic_temp_{u.lower()}.tif", compression, u, located=not adj.strip_location)
-             for u in options.units]
+    writes = len(options.units) + 1                     # each unit's GeoTIFF (+ sidecar), then the preview
+    if report:
+        report("write", 0, writes, "files")
+    files = []
+    for u in options.units:
+        files.append(_mosaic.write(m, out / f"mosaic_temp_{u.lower()}.tif", compression, u,
+                                   located=not adj.strip_location))
+        if report:
+            report("write", len(files), writes, "files")
     lut, palette_name = None, "grayscale"
     if palettes:
         index = settings.palette if settings.palette is not None else Counter(p for p, _ in palettes).most_common(1)[0][0]
@@ -453,6 +485,8 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
             lut, palette_name = luts[:, index, :].T, PALETTES[index]
     lo, hi = settings.range_c()
     preview, low, high = _mosaic.write_preview(m, out / "mosaic_preview.png", lut, lo, hi)
+    if report:
+        report("write", writes, writes, "files")
     return MosaicReport(m, files, preview, palette_name, (low, high), normalize_ambient_c=normalized, **counts)
 
 
@@ -489,11 +523,14 @@ def normalization(path: str | os.PathLike, settings: Settings = Settings(), opti
     src_root = root if root.is_dir() else root.parent
     adj = dataclasses.replace(settings.adjustments(), replace_above=None, replace_above_value=None,
                               replace_below=None, replace_below_value=None)
-    frames, _, counts, overrides, _ = _mosaic_frames(found, src_root, settings, options, adj, True, jobs, progress)
+    report = _stages(progress, _build_stages(settings, options, True, check=False))
+    frames, _, counts, overrides, _ = _mosaic_frames(found, src_root, settings, options, adj, True, jobs, progress,
+                                                     report)
     if not frames:
         raise MosaicError("No frames to compare for normalization.", counts)
     try:
-        m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=False, check_misalignment=False)
+        m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=False, check_misalignment=False,
+                          progress=report)
     except ValueError as e:
         raise MosaicError(f"Normalization failed: {e}", counts) from None
     offsets = {src_root / row["file"]: float(row["temperature_offset_c"]) for row in m.frames}
@@ -502,14 +539,34 @@ def normalization(path: str | os.PathLike, settings: Settings = Settings(), opti
                          thermal - len(offsets), m.report["frame_offsets"])
 
 
+def _build_stages(settings: Settings, options: MosaicOptions, median_ambient: bool, check: bool) -> list[str]:
+    """The stages of a mosaic run up to its compositing (and check), as Event describes them."""
+    return ((["ambient"] if _reads_ambient(settings, median_ambient) else []) + ["frames"]
+            + (["align"] if options.align else []) + ["composite"] + (["check"] if check else []))
+
+
+def _reads_ambient(settings: Settings, median_ambient: bool) -> bool:
+    overrides = settings.overrides()
+    return median_ambient and (overrides.ambient_temp is None or overrides.reflection is None)
+
+
 def _mosaic_frames(found: dataset.Scan, src_root: Path, settings: Settings, options: MosaicOptions,
-                   adj: adjust.Adjustments, median_ambient: bool, jobs: int | None, progress: ProgressFn | None):
+                   adj: adjust.Adjustments, median_ambient: bool, jobs: int | None, progress: ProgressFn | None,
+                   report=None):
     """Every placeable frame measured for a mosaic: (frames, palettes, counts, overrides,
-    (ambient, reflected) when median_ambient filled them in)."""
+    (ambient, reflected) when median_ambient filled them in). report: see _stages."""
     overrides = settings.overrides()
     normalized = None
-    if median_ambient and (overrides.ambient_temp is None or overrides.reflection is None):
-        embedded = [p for _, ok, p in _run_all(core.embedded_ambient, [(s,) for s in found.jpegs], jobs) if ok and p]
+    total = len(found.jpegs)
+    if _reads_ambient(settings, median_ambient):
+        if report:
+            report("ambient", 0, total, "files")
+        embedded = []
+        for done, (_, ok, p) in enumerate(_run_all(core.embedded_ambient, [(s,) for s in found.jpegs], jobs), 1):
+            if ok and p:
+                embedded.append(p)
+            if report:
+                report("ambient", done, total, "files")
         if embedded:
             amb, refl = (float(v) for v in np.median(np.array(embedded), axis=0))
             overrides = dataclasses.replace(
@@ -519,7 +576,9 @@ def _mosaic_frames(found: dataset.Scan, src_root: Path, settings: Settings, opti
             _emit(progress, "normalize", data={"ambient_c": normalized[0], "reflected_c": normalized[1]})
     frames, palettes, unusable, oblique, other = [], [], 0, 0, 0
     arglist = [(src, src_root, overrides, options.max_pitch, adj) for src in found.jpegs]
-    for i, ok, payload in _run_all(core.mosaic_frame, arglist, jobs):
+    if report:
+        report("frames", 0, total, "files")
+    for done, (i, ok, payload) in enumerate(_run_all(core.mosaic_frame, arglist, jobs), 1):
         src = found.jpegs[i]
         if ok and "frame" in payload:
             frames.append(payload["frame"])
@@ -534,6 +593,8 @@ def _mosaic_frames(found: dataset.Scan, src_root: Path, settings: Settings, opti
         else:
             unusable += 1
             _emit(progress, "mosaic_skip", src, payload["reason"] if ok else payload)
+        if report:
+            report("frames", done, total, "files")
     frames.sort(key=lambda f: f.name)
     counts = {"frames": len(frames), "oblique": oblique, "unusable": unusable, "not_thermal": other}
     return frames, palettes, counts, overrides, normalized

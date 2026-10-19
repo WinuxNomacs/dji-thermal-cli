@@ -147,6 +147,11 @@ behaviour untouched:
 dji-thermal-cli process --input-dir /path/to/flight --output-dir out --mosaic
 ```
 
+While it works, it shows its progress on stderr, one stage at a time
+(`Mosaic step 3 of 5: aligning (round 2/3), 812/1840 pairs`). On a terminal that is one line
+updated in place; in a log or a pipe, a line as each stage starts. `--quiet` (`-q`) hides it;
+results, skipped files and errors still print.
+
 It writes three files to the output directory:
 
 - **`mosaic_temp_c.tif`:** a GeoTIFF in the flight's UTM zone (WGS84) with three float32
@@ -438,6 +443,21 @@ dtc.make_mosaic("flight/", "out/", settings, dtc.MosaicOptions(normalize=True, u
   `MosaicError`, and `describe` of a non-thermal file raises `FileProblem`. Within a dataset a
   bad file never raises: it is reported in the result and the rest carries on.
 - **Progress:** pass `progress=callback` to receive an `Event` per file as the work happens.
+  A mosaic (`make_mosaic`, or `process(normalize=True)`) also sends `"mosaic"` events, one
+  stage at a time, each counted in its own unit:
+
+  ```python
+  def progress(event):
+      if event.kind == "mosaic":
+          d = event.data   # {"stage": "align", "step": 2, "steps": 5, "done": 812, "total": 1840,
+                           #  "unit": "pairs", "round": 1, "rounds": 3}
+          print(f"step {d['step']}/{d['steps']} {d['stage']}: {d['done']}/{d['total']} {d['unit']}")
+  ```
+
+  The stages, in order and each only when it runs: `ambient` (files), `frames` (files),
+  `align` (per round: `pairs`, then `solve steps`), `composite` (frames), `check` (pairs),
+  `write` (files). Each starts at `done = 0` and ends at its total. There is no overall
+  percentage, as the stages' share of the time varies with the flight.
 - **Parallelism:** `jobs` as on the command line (`1` runs in the calling process).
 - The API never prints or exits. The command line is a thin layer over it and writes
   byte-identical files.

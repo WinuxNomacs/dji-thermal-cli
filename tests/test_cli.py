@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import subprocess
 import sys
@@ -11,7 +12,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from dji_thermal_cli.cli import _palette
+from dji_thermal_cli import api
+from dji_thermal_cli.cli import _MosaicProgress, _palette
 
 from .conftest import SAMPLES, native_measure, native_process, sample_files
 
@@ -101,3 +103,55 @@ def test_palette_name_same_as_number(tmp_path):
         assert proc.returncode == 0, proc.stderr
         made.append(np.asarray(Image.open(next(out.rglob("*_pseudo.png")))))
     np.testing.assert_array_equal(*made)
+
+
+class _Stream(io.StringIO):
+    def __init__(self, tty):
+        super().__init__()
+        self.tty = tty
+
+    def isatty(self):
+        return self.tty
+
+
+def _mosaic_event(stage, step, done, total, unit, **extra):
+    return api.Event("mosaic", data={"stage": stage, "step": step, "steps": 3, "done": done, "total": total,
+                                     "unit": unit, **extra})
+
+
+_EVENTS = [_mosaic_event("frames", 1, 0, 2, "files"), _mosaic_event("frames", 1, 1, 2, "files"),
+           _mosaic_event("frames", 1, 2, 2, "files"),
+           _mosaic_event("align", 2, 0, 5, "pairs", round=1, rounds=3), _mosaic_event("align", 2, 5, 5, "pairs", round=1, rounds=3),
+           _mosaic_event("align", 2, 0, 8, "solve steps", round=1, rounds=3)]
+
+
+def test_mosaic_progress_in_a_log_prints_one_line_per_stage():
+    out, shown = _Stream(tty=False), []
+    show = _MosaicProgress(shown.append, out)
+    for e in _EVENTS:
+        show(e)
+    assert out.getvalue().splitlines() == ["Mosaic step 1 of 3: reading frames, 2 files",
+                                           "Mosaic step 2 of 3: aligning (round 1/3), 5 pairs",
+                                           "Mosaic step 2 of 3: aligning (round 1/3), 8 solve steps"]
+    assert shown == []
+
+
+def test_mosaic_progress_on_a_terminal_rewrites_one_line_and_clears_it_for_other_output():
+    out, shown = _Stream(tty=True), []
+    show = _MosaicProgress(lambda e: shown.append(out.getvalue()), out)
+    for e in _EVENTS[:2]:
+        show(e)
+    assert out.getvalue() == "\rMosaic step 1 of 3: reading frames, 0/2 files" \
+                             "\rMosaic step 1 of 3: reading frames, 1/2 files"
+    show(api.Event("note", "x.jpg"))
+    assert shown[0].endswith("\r" + " " * len("Mosaic step 1 of 3: reading frames, 1/2 files") + "\r")
+    show.clear()
+    assert out.getvalue() == shown[0]
+
+
+def test_mosaic_progress_quiet_prints_no_progress_but_passes_other_events_on():
+    out, shown = _Stream(tty=True), []
+    show = _MosaicProgress(shown.append, out, quiet=True)
+    for e in _EVENTS + [api.Event("note", "x.jpg")]:
+        show(e)
+    assert out.getvalue() == "" and [e.kind for e in shown] == ["note"]

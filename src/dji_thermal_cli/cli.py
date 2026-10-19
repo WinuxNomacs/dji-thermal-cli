@@ -180,6 +180,7 @@ def _build_parser() -> argparse.ArgumentParser:
     proc.add_argument("--mosaic-gsd", type=float, default=None, metavar="METRES", help="Mosaic pixel size (default: the frames' median ground sample distance)")
     proc.add_argument("--compression", choices=outputs.COMPRESSIONS, default="deflate", help="TIFF/EXR compression: deflate = lossless Deflate (EXR: ZIP), the default; none = uncompressed. PNG is always compressed")
     proc.add_argument("--jobs", "-j", type=_positive_int, default=None, help="Worker processes (default: min(CPU count, 8); 1 = in this process)")
+    proc.add_argument("--quiet", "-q", action="store_true", help="Don't show the mosaic's progress (--mosaic, --normalize) on stderr; results, skipped files and errors are still printed")
 
     lst = sub.add_parser("list", help="Describe every thermal R-JPEG: thermal parameters, temperature stats, position, attitude, camera, EXIF",
                          description="Describe every thermal R-JPEG in a dataset without writing anything. Groups: file, camera, thermal (measurement parameters and ranges, palette, colour bar, ND filter), temperature (stats), geospatial (position, RTK, rangefinder), attitude (gimbal, aircraft), and with --exif all every raw EXIF/XMP tag. Files are found by content, not extension.")
@@ -271,6 +272,46 @@ def _printer(out=None, mosaic_only: bool = False):
     return show
 
 
+class _MosaicProgress:
+    """The mosaic's progress on stderr: on a terminal one line, rewritten as the work goes
+    ("Mosaic step 3 of 6: aligning (round 2/3), 812/1840 pairs"); otherwise (a log, a pipe)
+    one line as each stage starts. Other events go to show, clearing the line first."""
+
+    STAGES = {"ambient": "reading ambient temperatures", "frames": "reading frames", "align": "aligning",
+              "composite": "compositing", "check": "checking alignment", "write": "writing"}
+
+    def __init__(self, show, out=None, quiet: bool = False):
+        self.show, self.out, self.quiet = show, out or sys.stderr, quiet
+        self.tty = self.out.isatty()
+        self.width = 0
+        self.started = None
+
+    def __call__(self, event: api.Event) -> None:
+        if event.kind != "mosaic":
+            self.clear()
+            self.show(event)
+            return
+        if self.quiet:
+            return
+        d = event.data
+        head = f"Mosaic step {d['step']} of {d['steps']}: {self.STAGES.get(d['stage'], d['stage'])}"
+        if "round" in d:
+            head += f" (round {d['round']}/{d['rounds']})"
+        if self.tty:
+            line = f"{head}, {d['done']}/{d['total']} {d['unit']}"
+            print("\r" + line.ljust(self.width), end="", file=self.out, flush=True)
+            self.width = len(line)
+        elif (d["stage"], d.get("round"), d["unit"]) != self.started:
+            self.started = (d["stage"], d.get("round"), d["unit"])
+            print(f"{head}, {d['total']} {d['unit']}", file=self.out, flush=True)
+
+    def clear(self) -> None:
+        """Remove the terminal's progress line, before anything else is printed."""
+        if self.width:
+            print("\r" + " " * self.width + "\r", end="", file=self.out, flush=True)
+            self.width = 0
+
+
 def _cmd_process(args: argparse.Namespace) -> None:
     settings = _settings(args)
     if args.outputs:
@@ -283,12 +324,15 @@ def _cmd_process(args: argparse.Namespace) -> None:
                                     units=tuple(u for group in (args.mosaic_units or [["C"]]) for u in group))
     except api.SettingsError as e:
         _fail(e)
-    show = _printer()
+    show = _MosaicProgress(_printer(), quiet=args.quiet)
     report = None
     try:
         if wanted:
-            report = api.process(args.input_dir, args.output_dir, settings, wanted, args.compression, args.jobs, show,
-                                 normalize=args.normalize, max_pitch=args.max_pitch, mosaic_options=options)
+            try:
+                report = api.process(args.input_dir, args.output_dir, settings, wanted, args.compression, args.jobs,
+                                     show, normalize=args.normalize, max_pitch=args.max_pitch, mosaic_options=options)
+            finally:
+                show.clear()
             print(f"\nDone. {report.processed}/{len(report.results)} candidate files processed.")
             if report.normalization:
                 n = report.normalization
@@ -298,9 +342,13 @@ def _cmd_process(args: argparse.Namespace) -> None:
                       f"(oblique, unplaceable or not overlapping)" if values else "Normalized: no frame offsets found")
         if args.mosaic:
             # the scan was reported by process() already
-            quiet = show if not wanted else (lambda e: e.kind in ("unreadable", "non_jpeg") or show(e))
-            _print_mosaic(api.make_mosaic(args.input_dir, args.output_dir, settings, options, args.compression,
-                                     args.jobs, quiet), settings, args.mosaic_max_pitch)
+            unreported = show if not wanted else (lambda e: e.kind in ("unreadable", "non_jpeg") or show(e))
+            try:
+                rep = api.make_mosaic(args.input_dir, args.output_dir, settings, options, args.compression,
+                                      args.jobs, unreported)
+            finally:
+                show.clear()
+            _print_mosaic(rep, settings, args.mosaic_max_pitch)
     except (FileNotFoundError, api.MosaicError) as e:
         if isinstance(e, api.MosaicError) and e.counts:
             _print_mosaic_counts(e.counts, args.mosaic_max_pitch)

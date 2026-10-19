@@ -122,6 +122,25 @@ def test_make_mosaic(tmp_path):
     np.testing.assert_allclose(k[ok], report.mosaic.temperature[ok] + 273.15, atol=3e-5)
 
 
+@pytest.mark.flight
+def test_make_mosaic_reports_its_stages_in_order(tmp_path):
+    """Each "mosaic" event names its stage and its place among the stages, and counts up to
+    the stage's total: every JPEG read (visual ones are opened and left out too), the frames
+    composited, the files written."""
+    events = []
+    dtc.make_mosaic(flight_dir(), tmp_path, dtc.Settings(), dtc.MosaicOptions(align=False, units=("c", "k")),
+                    progress=lambda e: e.kind == "mosaic" and events.append(e.data))
+    stages = list(dict.fromkeys(d["stage"] for d in events))
+    assert stages == ["frames", "composite", "check", "write"]
+    assert all(d["steps"] == 4 and d["step"] == stages.index(d["stage"]) + 1 for d in events)
+    last = {d["stage"]: d for d in events}
+    nadir, _ = flight_counts()
+    assert (last["frames"]["done"], last["frames"]["unit"]) == (len(dtc.scan(flight_dir()).jpegs), "files")
+    assert (last["composite"]["done"], last["composite"]["total"]) == (nadir, nadir)
+    assert (last["write"]["done"], last["write"]["total"]) == (3, 3)
+    assert all(d["done"] == d["total"] for d in last.values())
+
+
 @pytest.mark.samples
 def test_make_mosaic_without_pose(tmp_path):
     with pytest.raises(dtc.MosaicError, match="No frames to mosaic") as e:
