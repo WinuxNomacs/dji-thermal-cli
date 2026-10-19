@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-19
+
 dji-thermal-cli is now in maintenance. Releases from here on bring bug fixes and quality-of-life
 improvements to the command line and the Python SDK, kept in step with each other, as they are
 needed. No support for newer camera models or newer DJI Thermal SDK versions is planned: the
@@ -58,7 +60,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/WinuxNomacs/dji-thermal-cli/releases/tag/v1.0.0
 [0.1.0rc1]: https://github.com/WinuxNomacs/dji-thermal-cli/releases/tag/v0.1.0rc1
