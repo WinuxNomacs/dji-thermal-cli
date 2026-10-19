@@ -6,6 +6,11 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+dji-thermal-cli is now in maintenance. Releases from here on bring bug fixes and quality-of-life
+improvements to the command line and the Python SDK, kept in step with each other, as they are
+needed. No support for newer camera models or newer DJI Thermal SDK versions is planned: the
+cameras and the SDK v1.8 behaviour supported in 1.1.0 are what the package covers.
+
 - The mosaic no longer fails on super-resolution frames (M4T: a 1280x1024 JPEG over 640x512
   measurements). Frames are placed at the size they measure, and `check --webodm` gives
   their ground sample distance at that size.
