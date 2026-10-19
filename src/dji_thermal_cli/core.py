@@ -297,7 +297,7 @@ def mosaic_frame(src: Path, src_root: Path, overrides: MeasurementOverrides, max
         rj = tsdk.open(data)
     except tsdk.RJpegError as e:
         return {"reason": explain(e), "not_thermal": not isinstance(e, tsdk.UnsupportedRJpeg)}
-    pose, why = mosaic.read_pose(data)
+    pose, why = mosaic.read_pose(data, (rj.width, rj.height))
     if pose is None:
         return {"reason": why}
     for axis, value in adj.gimbal().items():                 # the override decides placement too

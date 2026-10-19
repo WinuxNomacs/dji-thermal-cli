@@ -31,7 +31,7 @@ from xml.sax.saxutils import escape
 import numpy as np
 from PIL import Image
 
-from . import djixmp, files, geo, tiffout, units
+from . import djixmp, files, geo, tiffout, tsdk, units
 
 FULL_FRAME_DIAGONAL_MM = math.hypot(36.0, 24.0)
 DEFAULT_MAX_PITCH = -80.0
@@ -98,8 +98,10 @@ def _exif_number(value) -> float | None:
     return f if math.isfinite(f) and f > 0 else None
 
 
-def read_pose(data: bytes) -> tuple[Pose | None, str | None]:
-    """The frame's camera pose from its DJI XMP and EXIF, or (None, why not)."""
+def read_pose(data: bytes, size: tuple[int, int] | None = None) -> tuple[Pose | None, str | None]:
+    """The frame's camera pose from its DJI XMP and EXIF, or (None, why not), for an image of
+    the frame's measured size (width, height): its R-JPEG's, read when not given. That differs
+    from the JPEG's in super-resolution images (M4T: a 1280x1024 JPEG over 640x512 measurements)."""
     f = djixmp.fields(data)
     need = ("GpsLatitude", "GpsLongitude", "AbsoluteAltitude", "GimbalYawDegree", "GimbalPitchDegree",
             "GimbalRollDegree")
@@ -108,7 +110,13 @@ def read_pose(data: bytes) -> tuple[Pose | None, str | None]:
     if missing:
         return None, f"no camera pose in the DJI XMP (missing {', '.join(missing)})"
     image = Image.open(io.BytesIO(data))
-    width, height = image.size
+    if size is None:
+        try:
+            rj = tsdk.open(data)
+            size = rj.width, rj.height
+        except tsdk.RJpegError:
+            size = image.size
+    width, height = size
     exif = image.getexif()
     lens = exif.get_ifd(0x8769)
     model = str(exif.get(272, "")).strip("\0 ")

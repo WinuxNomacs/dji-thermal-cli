@@ -6,6 +6,10 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- The mosaic no longer fails on super-resolution frames (M4T: a 1280x1024 JPEG over 640x512
+  measurements). Frames are placed at the size they measure, and `check --webodm` gives
+  their ground sample distance at that size.
+
 ## [1.1.0] - 2026-10-18
 
 - Python 3.12 and 3.13 are supported, with numpy 1.26 or newer, so the package installs into
