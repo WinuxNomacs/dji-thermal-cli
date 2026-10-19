@@ -19,7 +19,7 @@ cameras and the SDK v1.8 behaviour supported in 1.1.0 are what the package cover
 - A mosaic reports its progress. The Python API sends `"mosaic"` events, one per stage
   (reading frames, aligning, compositing, checking, writing) with a count in the stage's own
   unit and its place among the stages; the command line shows them on stderr
-  (`Mosaic step 3 of 5: aligning (round 2/3), 812/1840 pairs`), updated in place on a terminal.
+  (`Mosaic step 2 of 5: aligning (round 2/3), 812/1840 pairs`), updated in place on a terminal.
 - `process --quiet` (`-q`) hides the progress display; results, skips and errors still print.
 
 ## [1.1.0] - 2026-10-18
