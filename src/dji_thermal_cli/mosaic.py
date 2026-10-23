@@ -454,25 +454,28 @@ def _frame_offsets(temp, second, source, second_source, n: int, max_samples: int
     }
 
 
-def _phase_shift(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float]:
-    """Shift (dy, dx) of b relative to a by phase correlation, and the peak strength."""
-    win = np.outer(np.hanning(a.shape[0]), np.hanning(a.shape[1]))
-    fa = np.fft.fft2((a - a.mean()) * win)
-    fb = np.fft.fft2((b - b.mean()) * win)
+def _phase_shift(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """For stacks of blocks (k, h, w): the shift (dy, dx) of each b relative to its a by phase
+    correlation, and the peak strength."""
+    k, h, w = a.shape
+    win = np.outer(np.hanning(h), np.hanning(w))
+    fa = np.fft.rfft2((a - a.mean(axis=(1, 2), keepdims=True)) * win)
+    fb = np.fft.rfft2((b - b.mean(axis=(1, 2), keepdims=True)) * win)
     cross = fa.conj() * fb
-    corr = np.fft.ifft2(cross / (np.abs(cross) + 1e-12)).real
-    iy, ix = np.unravel_index(np.argmax(corr), corr.shape)
-    peak = float(corr[iy, ix])
+    corr = np.fft.irfft2(cross / (np.abs(cross) + 1e-12), s=(h, w))
+    iy, ix = np.unravel_index(np.argmax(corr.reshape(k, -1), axis=1), (h, w))
+    at = np.arange(k)
+    peak = corr[at, iy, ix]
 
-    def sub(c, i, n):           # parabolic sub-pixel refinement
-        l, r = c[(i - 1) % n], c[(i + 1) % n]
-        den = l - 2 * c[i] + r
-        return i + (0.5 * (l - r) / den if den else 0.0)
+    def sub(c, l, r, i):        # parabolic sub-pixel refinement
+        den = l - 2 * c + r
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return i + np.where(den != 0, 0.5 * (l - r) / den, 0.0)
 
-    dy = sub(corr[:, ix], iy, corr.shape[0])
-    dx = sub(corr[iy, :], ix, corr.shape[1])
-    dy = dy - corr.shape[0] if dy > corr.shape[0] / 2 else dy
-    dx = dx - corr.shape[1] if dx > corr.shape[1] / 2 else dx
+    dy = sub(peak, corr[at, (iy - 1) % h, ix], corr[at, (iy + 1) % h, ix], iy)
+    dx = sub(peak, corr[at, iy, (ix - 1) % w], corr[at, iy, (ix + 1) % w], ix)
+    dy = np.where(dy > h / 2, dy - h, dy)
+    dx = np.where(dx > w / 2, dx - w, dx)
     return dy, dx, peak
 
 
@@ -521,23 +524,32 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
             if last[k] == i:
                 del renders[k]
         both = va & vb
-        for y in range(0, both.shape[0] - block + 1, step):
-            for x in range(0, both.shape[1] - block + 1, step):
-                if not both[y:y + block, x:x + block].all():
-                    continue
-                ga = np.hypot(*np.gradient(ta[y:y + block, x:x + block].astype(np.float64)))
-                gb = np.hypot(*np.gradient(tb[y:y + block, x:x + block].astype(np.float64)))
-                dy, dx, peak = _phase_shift(ga, gb)
-                if peak >= min_peak:
-                    e = grid.e0 + (cols.start + x + block / 2) * grid.gsd
-                    n = grid.n0 - (rows.start + y + block / 2) * grid.gsd
-                    obs.append((a, b, e, n, dx * grid.gsd, -dy * grid.gsd))
+        # blocks fully covered by both frames, from a summed-area table of the uncovered pixels
+        gaps = np.zeros((both.shape[0] + 1, both.shape[1] + 1), np.int64)
+        gaps[1:, 1:] = (~both).cumsum(0).cumsum(1)
+        ys = np.arange(0, both.shape[0] - block + 1, step)
+        xs = np.arange(0, both.shape[1] - block + 1, step)
+        y, x = (g.ravel() for g in np.meshgrid(ys, xs, indexing="ij"))
+        full = (gaps[y + block, x + block] - gaps[y, x + block] - gaps[y + block, x] + gaps[y, x]) == 0
+        y, x = y[full], x[full]
+        if y.size:
+            win = np.lib.stride_tricks.sliding_window_view
+            sa = win(ta, (block, block))[y, x].astype(np.float64)
+            sb = win(tb, (block, block))[y, x].astype(np.float64)
+            ga = np.hypot(*np.gradient(sa, axis=(1, 2)))
+            gb = np.hypot(*np.gradient(sb, axis=(1, 2)))
+            dy, dx, peak = _phase_shift(ga, gb)
+            keep = peak >= min_peak
+            e = grid.e0 + (cols.start + x[keep] + block / 2) * grid.gsd
+            n = grid.n0 - (rows.start + y[keep] + block / 2) * grid.gsd
+            obs.append(np.column_stack([np.full(e.size, a), np.full(e.size, b), e, n,
+                                        dx[keep] * grid.gsd, -dy[keep] * grid.gsd]))
         if report:
             sampled += (rows.stop - rows.start) * (cols.stop - cols.start)
             if (now := len(overlaps) * sampled // area) != done:
                 done = now
                 report(done, len(overlaps))
-    return np.array(obs, dtype=np.float64).reshape(-1, 6)
+    return np.concatenate(obs).astype(np.float64) if obs else np.zeros((0, 6))
 
 
 def _summary(obs: np.ndarray, grid: Grid) -> dict:
