@@ -440,6 +440,10 @@ dtc.make_mosaic("flight/", "out/", settings, dtc.MosaicOptions(normalize=True, u
 - **Functions:** `scan`, `classify`, `describe`, `list_dataset`, `check`, `measure`, `process`,
   `make_mosaic`. Each returns a result object (`ListResult`, `CheckResult`, `Measurement`,
   `ProcessReport`, `MosaicReport`).
+- **Both mosaics from one build:** `make_mosaic(..., as_converted_dir="out-raw/")`, with
+  `normalize=True`, also writes the mosaic without the normalization there, laid out and
+  checked once for both (`report.as_converted` is its report). It is laid out from the
+  normalized frames, so it can differ slightly from a separate `normalize=False` mosaic.
 - **Errors:** a missing path raises `FileNotFoundError`, a mosaic that can't be built raises
   `MosaicError`, and `describe` of a non-thermal file raises `FileProblem`. Within a dataset a
   bad file never raises: it is reported in the result and the rest carries on.

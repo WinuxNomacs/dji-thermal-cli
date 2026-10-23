@@ -21,6 +21,7 @@ image shift between overlapping frames found by phase correlation (geometric err
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import io
 import json
@@ -301,8 +302,53 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
     progress: called as progress(stage, done, total, unit, **extra) as the "align",
     "composite" and "check" stages go (see api.Event); it doesn't change the result. jobs:
     threads matching overlaps (see _measure_blocks); nor does it."""
-    def report(stage, unit, **extra):
-        return (lambda done, total: progress(stage, done, total, unit, **extra)) if progress else None
+    layout = _layout(frames, gsd, ground_alt, align, progress, jobs)
+    composite = _reporter(progress, "composite", "frames")
+    if composite:
+        composite(0, len(layout.placed))
+    m = _composite(layout, layout.placed, normalize, composite, 0, len(layout.placed))
+    m.report["misalignment"] = _check(layout, check_misalignment, progress, jobs)
+    return m
+
+
+def build_both(frames: list[Frame], as_converted: list[Frame], gsd: float | None = None,
+               ground_alt: float | None = None, check_misalignment: bool = True, align: bool = True,
+               progress: Callable[..., None] | None = None, jobs: int = 1) -> tuple[Mosaic, Mosaic]:
+    """The normalized mosaic of frames (as build(normalize=True)) and the mosaic of the same
+    frames measured another way (as_converted, matched by name), laid out once: the second
+    gets the first's placement, alignment and misalignment check, and only its compositing
+    is its own (a frame missing from as_converted is left out of it)."""
+    layout = _layout(frames, gsd, ground_alt, align, progress, jobs)
+    by_name = {f.name: f for f in as_converted}
+    other = [dataclasses.replace(pl, frame=by_name[pl.frame.name]) for pl in layout.placed
+             if pl.frame.name in by_name]
+    total = len(layout.placed) + len(other)
+    composite = _reporter(progress, "composite", "frames")
+    if composite:
+        composite(0, total)
+    normalized = _composite(layout, layout.placed, True, composite, 0, total)
+    converted = _composite(layout, other, False, composite, len(layout.placed), total)
+    normalized.report["misalignment"] = _check(layout, check_misalignment, progress, jobs)
+    converted.report["misalignment"] = copy.deepcopy(normalized.report["misalignment"])
+    return normalized, converted
+
+
+@dataclasses.dataclass
+class _Layout:
+    placed: list[_Placed]
+    dropped: list[str]          # frames with no ground footprint
+    grid: Grid
+    alignment: dict | None
+    ground_alt: float
+    ground_source: str
+
+
+def _reporter(progress, stage, unit, **extra):
+    return (lambda done, total: progress(stage, done, total, unit, **extra)) if progress else None
+
+
+def _layout(frames, gsd, ground_alt, align, progress, jobs) -> _Layout:
+    """The frames placed over the ground plane (and aligned) and the grid they cover."""
     if not frames:
         raise ValueError("no frames to mosaic")
     lat = float(np.mean([f.pose.lat for f in frames]))
@@ -334,7 +380,23 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
     if align:
         placed, alignment = _align(frames, placed, grid, ground_alt, zone, north, progress=progress, jobs=jobs)
         grid = _grid(placed, gsd, zone, north)
+    return _Layout(placed, dropped, grid, alignment, ground_alt, ground_source)
 
+
+def _check(layout: _Layout, check_misalignment: bool, progress, jobs) -> dict | None:
+    """How well the laid-out frames still agree where they overlap (the "check" stage)."""
+    if not check_misalignment:
+        return None
+    return _summary(_measure_blocks(layout.placed, layout.grid, report=_reporter(progress, "check", "pairs"),
+                                    jobs=jobs), layout.grid)
+
+
+def _composite(layout: _Layout, placed: list[_Placed], normalize: bool, composite, done: int,
+               total: int) -> Mosaic:
+    """Each mosaic pixel from the frame seeing it closest to nadir (the runner-up kept for the
+    seams and offsets), without the misalignment check. composite: reported as (done + frames
+    composited, total)."""
+    grid = layout.grid
     shape = (grid.height, grid.width)
     best_angle = np.full(shape, np.inf, np.float32)
     second_angle = np.full(shape, np.inf, np.float32)
@@ -342,9 +404,6 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
     second = np.full(shape, np.nan, np.float32)
     source = np.full(shape, -1, np.int32)
     second_source = np.full(shape, -1, np.int32)
-    composite = report("composite", "frames")
-    if composite:
-        composite(0, len(placed))
     for k, pl in enumerate(placed):
         rows, cols = _window(pl, grid)
         t, angle, valid = _sample(pl, grid, rows, cols)
@@ -360,7 +419,7 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
         bt[:] = np.where(better, t, bt)
         bs[:] = np.where(better, k, bs)
         if composite:
-            composite(k + 1, len(placed))
+            composite(done + k + 1, total)
 
     covered = source >= 0
     offsets, radiometry = _frame_offsets(temp, second, source, second_source, len(placed))
@@ -387,16 +446,16 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
     report = {
         "frames_used": len(placed),
         "frames_contributing": int((used > 0).sum()),
-        "frames_dropped_no_ground_footprint": dropped,
+        "frames_dropped_no_ground_footprint": layout.dropped,
         "radiometric_seams": _seam_stats(temp, second, covered),
         "frame_offsets": radiometry,
-        "alignment": alignment,
-        "misalignment": (_summary(_measure_blocks(placed, grid, report=report("check", "pairs"), jobs=jobs), grid)
-                         if check_misalignment else None),
+        "alignment": layout.alignment,
+        "misalignment": None,
     }
     return Mosaic(
         grid, temp, np.where(covered, source, np.nan).astype(np.float32),
-        np.where(covered, best_angle, np.nan).astype(np.float32), table, ground_alt, ground_source, report,
+        np.where(covered, best_angle, np.nan).astype(np.float32), table, layout.ground_alt, layout.ground_source,
+        report,
     )
 
 

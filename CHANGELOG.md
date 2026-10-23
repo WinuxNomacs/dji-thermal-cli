@@ -6,6 +6,13 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- The mosaic builds faster: each frame is rendered once per matching pass instead of once per
+  overlapping pair, a pair's blocks are matched in one batch of real FFTs, and the overlaps
+  are matched in `--jobs` threads. The mosaic is the same as before.
+- `make_mosaic(..., as_converted_dir=...)` (with `MosaicOptions(normalize=True)`) also writes
+  the mosaic without the normalization, from the same alignment and misalignment check, in
+  about the time of one mosaic instead of two. Its report is `MosaicReport.as_converted`.
+
 ## [1.2.0] - 2026-10-19
 
 dji-thermal-cli is now in maintenance. Releases from here on bring bug fixes and quality-of-life

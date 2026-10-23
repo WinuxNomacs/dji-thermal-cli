@@ -141,6 +141,33 @@ def test_make_mosaic_reports_its_stages_in_order(tmp_path):
     assert all(d["done"] == d["total"] for d in last.values())
 
 
+
+@pytest.mark.flight
+def test_make_mosaic_writes_the_as_converted_mosaic_from_the_same_build(tmp_path):
+    """With as_converted_dir, the normalized mosaic is the one make_mosaic writes alone, the
+    as-converted one goes to its own folder, and the frames and write stages count both."""
+    options = dtc.MosaicOptions(align=False, normalize=True, units=("c",))
+    alone = dtc.make_mosaic(flight_dir(), tmp_path / "alone", dtc.Settings(), options)
+    events = []
+    both = dtc.make_mosaic(flight_dir(), tmp_path / "normalized", dtc.Settings(), options,
+                           progress=lambda e: e.kind == "mosaic" and events.append(e.data),
+                           as_converted_dir=tmp_path / "converted")
+    np.testing.assert_array_equal(both.mosaic.temperature, alone.mosaic.temperature)
+    assert both.normalize_ambient_c == alone.normalize_ambient_c is not None
+    converted = both.as_converted
+    assert converted.normalize_ambient_c is None and converted.as_converted is None
+    assert [p.parent.name for p, _ in converted.files] == ["converted"]
+    assert not converted.mosaic.report["frame_offsets"]["normalized"]
+    assert (converted.frames, converted.oblique) == flight_counts()
+    last = {d["stage"]: d for d in events}
+    assert last["frames"]["done"] == last["frames"]["total"] == 2 * len(dtc.scan(flight_dir()).jpegs)
+    assert last["composite"]["total"] == 2 * flight_counts()[0]
+    assert (last["write"]["done"], last["write"]["total"]) == (4, 4)
+    with pytest.raises(dtc.SettingsError, match="normalize"):
+        dtc.make_mosaic(flight_dir(), tmp_path / "x", dtc.Settings(), dtc.MosaicOptions(align=False),
+                        as_converted_dir=tmp_path / "y")
+
+
 @pytest.mark.samples
 def test_make_mosaic_without_pose(tmp_path):
     with pytest.raises(dtc.MosaicError, match="No frames to mosaic") as e:
