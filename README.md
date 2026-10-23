@@ -152,7 +152,7 @@ While it works, it shows its progress on stderr, one stage at a time
 updated in place; in a log or a pipe, a line as each stage starts. `--quiet` (`-q`) hides it;
 results, skipped files and errors still print.
 
-It writes three files to the output directory:
+It writes these files to the output directory:
 
 - **`mosaic_temp_c.tif`:** a GeoTIFF in the flight's UTM zone (WGS84) with three float32
   bands. NaN marks ground no frame covers.
@@ -167,6 +167,9 @@ It writes three files to the output directory:
 - **`mosaic_preview.png`:** a quick look in the files' own palette (or `--palette`), with
   one colour scale for the whole mosaic: `--range-min`/`--range-max`, or else the 2nd to
   98th percentile of its temperatures. Uncovered areas are transparent.
+- **`mosaic_heights.tif`:** the surface the frames were projected onto (see Heights below),
+  as one float32 band of altitudes in metres on the height cells, NaN where no frame covers
+  a cell. Not written when the frames were projected onto the ground plane.
 
 Per-frame files are written as well only for the `--output` options you give.
 
@@ -176,8 +179,9 @@ How it works:
   position, gimbal attitude, and a pinhole lens. The lens's focal length in pixels is the
   EXIF focal length divided by the sensor's pixel pitch from DJI's specs (12 µm for every
   supported camera but the XT S, 17 µm). For other cameras it falls back to the EXIF 35
-  mm-equivalent focal length, which is rounded to a whole millimetre. Its rays are intersected with a horizontal ground plane at the median rangefinder
-  target altitude (or the take-off altitude).
+  mm-equivalent focal length, which is rounded to a whole millimetre. Its rays are
+  intersected with the surface (see Heights below): a horizontal ground plane at the median
+  rangefinder target altitude (or the take-off altitude), plus the heights above it.
 - **Alignment (on by default; `--no-mosaic-align` turns it off):**
   - The frames' placement is corrected from their overlaps. Image offsets between
     overlapping frames are measured block by block, by phase correlation of their thermal
@@ -189,6 +193,32 @@ How it works:
   - Blocks whose offsets disagree, usually parallax from roofs and trees, are down-weighted.
   - The fitted corrections are in the per-frame table, and the boresight and before/after
     offsets are in the report.
+- **Heights (`--mosaic-heights auto`, the default):**
+  - A plane can't represent roofs and trees: a frame seeing a roof from the side places it
+    off where the frame beside it does, so a straight roof bends into a crescent or steps at
+    the seams.
+  - While aligning, the mosaic is divided into cells (`--mosaic-height-cell`, 64 mosaic
+    pixels, about 1.3 m on a 21 m flight) and a height above the plane is fitted per cell
+    from the parallax between the overlapping frames, anchored to each frame's rangefinder
+    reading and kept smooth between neighbouring cells.
+  - Cells that no pair of frames sees are left on the plane. With fewer than 4 observed
+    cells, or a surface that comes within 1 m of a camera, the whole mosaic falls back to the
+    plane, and the report says why.
+  - `--mosaic-heights plane` projects onto the plane, as before 1.3.0.
+  - Heights need the alignment: with `--no-mosaic-align` the frames go onto the plane.
+- **Surface model (`--mosaic-dsm PATH`, optional):**
+  - A DSM you already have, e.g. ODM's `dsm.tif`, replaces the estimated heights. It is a
+    GeoTIFF in WGS84 UTM or latitude/longitude, with altitudes in metres. The mosaic never
+    needs one.
+  - It is resampled onto the height cells (the median of the DSM pixels in each). Cells it
+    doesn't cover stay on the plane.
+  - A DSM's altitudes are often on another datum than the drone's. They are shifted to
+    match by the median difference between the rangefinder targets and the DSM, or by
+    `--mosaic-dsm-offset METRES` when you know it.
+  - The alignment then corrects only the frames' placement, not the surface. It also works
+    with `--no-mosaic-align`.
+- The report's `heights` entry says which surface was used, its range, the cell size, how
+  many cells were observed, and how well it matches the rangefinder (`anchor_residual_m`).
 - **Frame temperature offsets (`--mosaic-normalize`, off by default):**
   - Uncooled thermal cameras drift between their periodic shutter recalibrations: a frame's
     readings creep up, then snap back at each recalibration.
@@ -211,8 +241,13 @@ Accuracy on a 21 m M4T flight over a house (42 nadir frames):
 | | Median offset between overlapping frames | 90th percentile | Seam temperature difference (median) |
 |---|---|---|---|
 | Placement only | 38 cm | 71 cm | 0.44 °C |
-| With alignment | 8 cm | 48 cm | 0.36 °C |
-| With alignment and `--mosaic-normalize` | 8 cm | 48 cm | 0.30 °C |
+| With alignment, on the plane | 6 cm | 60 cm | 0.37 °C |
+| With alignment and heights (default) | 1 cm | 5 cm | 0.32 °C |
+| With heights and `--mosaic-normalize` | 1 cm | 4 cm | 0.25 °C |
+
+The estimated heights range from -0.5 to 5.9 m, which matches the roof. On a 327-frame M4T
+flight with oblique frames, the plane bent the house's straight roof into a crescent; the
+heights straighten it (median offset 0.4 cm, 90th percentile 1.5 cm).
 
 Taking the focal length from the pixel pitch (1000 px) rather than the rounded 35 mm
 equivalent (985 px) improved the unfitted placement (39 → 38 cm median, 77 → 71 cm p90) and
@@ -230,9 +265,9 @@ On that flight, the frame offsets followed a recalibration sawtooth, from -0.8 t
 Removing them takes the median temperature difference between overlapping frames from
 0.31 to 0.24 °C.
 
-What remains is mostly parallax. The ground plane can't represent objects above it, so a
-roof about 6 m high still steps at the seams. Lens distortion isn't modelled. Removing the
-parallax needs a surface model (level 3). Alignment adds about a minute for 42 frames.
+What the heights leave is mostly at roof edges and walls, which a cell of about a metre
+can't follow, and lens distortion, which isn't modelled. The whole mosaic takes about 20 s
+for 42 frames (14 s on the plane) and about 2.5 minutes for 327.
 
 The frames must carry DJI XMP position and attitude (e.g. the M4T); the older cameras'
 samples don't.
@@ -431,6 +466,7 @@ m.temperature                                       # float32 kelvin array, noth
 
 dtc.process("flight/", "out/", settings, outputs=["temp_c:tiff", "temp_f:exr"])
 dtc.make_mosaic("flight/", "out/", settings, dtc.MosaicOptions(normalize=True, units=("C", "K")))
+dtc.make_mosaic("flight/", "out-dsm/", settings, dtc.MosaicOptions(dsm="odm/dsm.tif"))
 ```
 
 - **Settings** holds what the `process` options set: measurement parameters, `unit` (the unit
@@ -440,6 +476,8 @@ dtc.make_mosaic("flight/", "out/", settings, dtc.MosaicOptions(normalize=True, u
 - **Functions:** `scan`, `classify`, `describe`, `list_dataset`, `check`, `measure`, `process`,
   `make_mosaic`. Each returns a result object (`ListResult`, `CheckResult`, `Measurement`,
   `ProcessReport`, `MosaicReport`).
+- **MosaicOptions** holds what the `--mosaic-*` options set: `heights` (`"auto"` or
+  `"plane"`), `height_cell`, `dsm` and `dsm_offset` among them.
 - **Both mosaics from one build:** `make_mosaic(..., as_converted_dir="out-raw/")`, with
   `normalize=True`, also writes the mosaic without the normalization there, laid out and
   checked once for both (`report.as_converted` is its report). It is laid out from the

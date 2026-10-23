@@ -476,7 +476,7 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
            as_converted_dir: str | os.PathLike | None = None) -> MosaicReport:
     """Stitch a dataset's nadir frames into one georeferenced mosaic in output_dir:
     mosaic_temp_<unit>.tif (+ .json) per unit, mosaic_preview.png and, when the frames were
-    projected onto estimated heights, mosaic_heights.tif.
+    projected onto estimated heights or a DSM, mosaic_heights.tif.
 
     as_converted_dir (with options.normalize): also write the mosaic without the normalization
     there, from the same layout (alignment and misalignment check), in about the time of one
