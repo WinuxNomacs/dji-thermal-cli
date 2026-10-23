@@ -164,7 +164,9 @@ class Settings:
 class MosaicOptions:
     """How to build the mosaic. units: one GeoTIFF per unit (C, F, K). heights: "auto" projects
     the frames onto the surface estimated from their parallax (with align; see mosaic._align),
-    on cells height_cell mosaic pixels wide; "plane" onto the flat ground."""
+    on cells height_cell mosaic pixels wide; "plane" onto the flat ground. dsm: a surface model
+    GeoTIFF (WGS84 UTM or lat/lon, metres) to project onto instead, with dsm_offset metres added
+    to its altitudes (None: estimated from the rangefinder; see mosaic._dsm_surface)."""
 
     max_pitch: float = _mosaic.DEFAULT_MAX_PITCH
     align: bool = True
@@ -173,6 +175,8 @@ class MosaicOptions:
     units: tuple[str, ...] = ("C",)
     heights: str = "auto"
     height_cell: int = _mosaic.HEIGHT_CELL_PX
+    dsm: Path | None = None
+    dsm_offset: float | None = None
 
     def __post_init__(self):
         chosen = tuple(dict.fromkeys(str(u).upper() for u in self.units))
@@ -185,6 +189,14 @@ class MosaicOptions:
             raise SettingsError(f"heights must be 'auto' or 'plane', not {self.heights!r}")
         if not 8 <= self.height_cell <= 1024:
             raise SettingsError("height_cell must be 8-1024 pixels")
+        if self.dsm is not None:
+            object.__setattr__(self, "dsm", Path(self.dsm))
+            if self.heights == "plane":
+                raise SettingsError("dsm needs heights 'auto': 'plane' projects onto the flat ground")
+            if not self.dsm.is_file():
+                raise SettingsError(f"dsm: no such file {self.dsm}")
+        elif self.dsm_offset is not None:
+            raise SettingsError("dsm_offset needs a dsm")
 
 
 def palette_index(palette: int | str) -> int:
@@ -505,7 +517,14 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
 
 
 def _height_options(options: MosaicOptions) -> dict:
-    return {"heights": options.heights, "height_cell": options.height_cell}
+    dsm = None
+    if options.dsm is not None:
+        try:
+            dsm = _mosaic.read_dsm(options.dsm)
+        except ValueError as e:
+            raise SettingsError(f"dsm: {e}") from e
+    return {"heights": options.heights, "height_cell": options.height_cell, "dsm": dsm,
+            "dsm_offset": options.dsm_offset}
 
 
 def _share(report, stage: str, part: int, parts: int):

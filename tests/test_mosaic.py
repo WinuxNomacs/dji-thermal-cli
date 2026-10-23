@@ -152,7 +152,7 @@ def test_heights_geotiff_holds_the_surface_altitudes_on_its_cells(synthetic, tmp
     temperature = m.temperature.copy()
     temperature[:step, :step] = np.nan              # a cell no frame covers
     m = dataclasses.replace(m, temperature=temperature, heights=mosaic.Heights(g.e0, g.n0, step * g.gsd, z),
-                            report={**m.report, "alignment": {"heights": {"method": "parallax", "cell_m": step * g.gsd}}})
+                            report={**m.report, "heights": {"method": "parallax", "cell_m": step * g.gsd}})
     tif = mosaic.write_heights(m, tmp_path / "mosaic_heights.tif")
     with tifffile.TiffFile(tif) as tf:
         page = tf.pages[0]
@@ -274,6 +274,13 @@ def test_flight(tmp_path):
     steps = [line for line in proc.stderr.splitlines() if line.startswith("Mosaic step ")]
     assert steps[0] == f"Mosaic step 1 of 5: reading frames, {len(api.scan(flight_dir()).jpegs)} files"
     assert steps[-1] == "Mosaic step 5 of 5: writing, 3 files"
+    # the heights written are a DSM the next run can project onto
+    again = _cli("process", "--input-dir", flight_dir(), "--output-dir", tmp_path / "dsm", "--mosaic", "--quiet",
+                 "--no-mosaic-align", "--mosaic-dsm", tmp_path / "mosaic_heights.tif")
+    assert again.returncode == 0, again.stderr
+    info = json.loads((tmp_path / "dsm" / "mosaic_temp_c.json").read_text())["report"]["heights"]
+    assert info["method"] == "DSM" and info["file"] == "mosaic_heights.tif" and info["observed_cells"] > 0
+    assert abs(info["offset_m"]) < 0.5 and "rangefinder" in info["offset_source"]
     rounds = collections.Counter(re.search(r"aligning \(round (\d+)/(\d+)\)", line).groups()
                                  for line in steps if "aligning (round" in line)
     assert rounds and set(rounds.values()) == {2}     # pairs, then solve steps, for each round
@@ -344,6 +351,106 @@ def test_alignment_recovers_a_roof_from_parallax():
     assert on_roof == pytest.approx(2.5, abs=0.5)
     assert abs(beside) < 0.4
     assert m.report["misalignment"]["median_m"] < 0.5 * plane.report["misalignment"]["median_m"]
+
+
+def test_utm_inverse_returns_the_latitude_and_longitude():
+    lat = np.array([LAT, -33.9, 0.0, 71.2, -60.5])
+    lon = np.array([LON, 18.4, 2.9, 25.7, -64.1])
+    for la, lo in zip(lat, lon):
+        zone, north = geo.utm_zone(la, lo)
+        # out to the zone's edges, where the series need most terms
+        for d in (0.0, 2.9, -2.9):
+            e, n = geo.utm(la, lo + d, zone, north)
+            got = geo.utm_inverse(e, n, zone, north)
+            np.testing.assert_allclose(got, (la, lo + d), atol=1e-9)
+
+
+def _write_dsm(path, z, x0, y0, dx, dy, epsg, point=False, nodata="-9999"):
+    """A north-up GeoTIFF as GDAL writes one: z's pixel (0, 0) has its top-left (or with point,
+    its centre) at (x0, y0)."""
+    geographic = epsg == 4326
+    keys = [1, 1, 0, 4, 1024, 0, 1, 2 if geographic else 1, 1025, 0, 1, 2 if point else 1,
+            2048 if geographic else 3072, 0, 1, epsg, 4099 if geographic else 3076, 0, 1, 9102 if geographic else 9001]
+    tifffile.imwrite(path, np.asarray(z, np.float32), extratags=[
+        (33550, 12, 3, (dx, dy, 0.0)), (33922, 12, 6, (0.0, 0.0, 0.0, x0, y0, 0.0)),
+        (34735, 3, len(keys), keys), (42113, 2, 0, nodata)])
+    return path
+
+
+def test_dsm_is_read_from_utm_and_latitude_longitude_geotiffs(tmp_path):
+    zone, north = geo.utm_zone(LAT, LON)
+    e0, n0 = (round(v) for v in geo.utm(LAT, LON, zone, north))
+    z = np.arange(12.0).reshape(3, 4) + 200
+    z[2, 3] = -9999
+    dsm = mosaic.read_dsm(_write_dsm(tmp_path / "utm.tif", z, e0, n0, 0.5, 0.5, geo.epsg(zone, north)))
+    assert (dsm.epsg, dsm.x0, dsm.y0, dsm.dx) == (32616, e0, n0, 0.5) and np.isnan(dsm.z[2, 3])
+    got = dsm.at_utm(np.array([e0 + 0.25, e0 + 1.75, e0 - 0.1]), np.array([n0 - 0.25, n0 - 0.75, n0 - 0.25]), zone, north)
+    np.testing.assert_array_equal(got[:2], [200, 207])
+    assert np.isnan(got[2])
+    # PixelIsPoint: the tiepoint is pixel (0, 0)'s centre
+    point = mosaic.read_dsm(_write_dsm(tmp_path / "point.tif", z, e0, n0, 0.5, 0.5, 32616, point=True))
+    assert (point.x0, point.y0) == (e0 - 0.25, n0 + 0.25)
+    # lat/lon: the same altitudes found through the inverse projection
+    step = 1e-5
+    lonlat = mosaic.read_dsm(_write_dsm(tmp_path / "ll.tif", z, LON - 2 * step, LAT + 1.5 * step, step, step, 4326))
+    e, n = geo.utm(np.array([LAT + step, LAT - step]), np.array([LON - 1.5 * step, LON + 0.5 * step]), zone, north)
+    np.testing.assert_array_equal(lonlat.at_utm(e, n, zone, north), [200, 210])
+    assert lonlat.pixel_m() == pytest.approx(step * 111320 * math.cos(math.radians(LAT)), rel=1e-3)
+    tifffile.imwrite(tmp_path / "plain.tif", z.astype(np.float32))
+    with pytest.raises(ValueError, match="no georeference"):
+        mosaic.read_dsm(tmp_path / "plain.tif")
+    with pytest.raises(ValueError, match="CRS must be"):
+        mosaic.read_dsm(_write_dsm(tmp_path / "web.tif", z, 0, 0, 1, 1, 3857))
+
+
+def test_frames_are_projected_onto_a_dsm_with_its_offset_estimated_from_the_rangefinder(tmp_path):
+    """The roof of test_alignment_recovers_a_roof_from_parallax, given as a DSM whose altitudes
+    are 3 m above the frames' (another vertical datum): the offset is found from the
+    rangefinder, the frames are projected onto the roof and line up as with parallax heights."""
+    zone, north = geo.utm_zone(LAT, LON)
+    centre = np.array(geo.utm(LAT - 5.0 / 111132.0, LON + 5.0 / (111320.0 * math.cos(math.radians(LAT))), zone, north))
+
+    def roof(e, n):
+        def edge(x):
+            return 0.5 * (np.tanh((x + 4.0) / 0.5) - np.tanh((x - 4.0) / 0.5))
+        return 2.5 * edge(e - centre[0]) * edge(n - centre[1])
+
+    frames = [_frame(f"f{i}", 5.0 * (i % 3), -5.0 * (i // 3), yaw=5.4 if (i // 3) % 2 == 0 else -174.6,
+                     roll=180.0, size=(640, 512), surface=roof) for i in range(9)]
+    px, x0, y0 = 0.1, centre[0] - 20, centre[1] + 20
+    e, n = np.meshgrid(x0 + (np.arange(400) + 0.5) * px, y0 - (np.arange(400) + 0.5) * px)
+    path = _write_dsm(tmp_path / "dsm.tif", GROUND + 3.0 + roof(e, n), x0, y0, px, px, geo.epsg(zone, north))
+    dsm = mosaic.read_dsm(path)
+    plane = mosaic.build(frames, heights="plane")
+    m = mosaic.build(frames, dsm=dsm)
+    h = m.report["heights"]
+    assert h["method"] == "DSM" and h["file"] == "dsm.tif" and h["anchors"] == 9
+    assert h["offset_m"] == pytest.approx(-3.0, abs=0.05) and h["anchor_residual_m"] < 0.1
+    assert m.report["alignment"]["heights"] == h
+    on_roof, beside = m.heights.at_points(centre[0] + np.array([-1.0, 9.0]), centre[1] + np.array([1.0, 9.0]))
+    assert on_roof == pytest.approx(2.5, abs=0.3) and abs(beside) < 0.1
+    assert m.report["misalignment"]["median_m"] < 0.5 * plane.report["misalignment"]["median_m"]
+    # an offset given is used as it is, and without alignment the report is still there
+    given = mosaic.build(frames, align=False, dsm=dsm, dsm_offset=-2.0)
+    assert given.report["alignment"] is None
+    assert given.report["heights"]["offset_m"] == -2.0 and given.report["heights"]["offset_source"] == "given"
+    assert given.heights.at_points(centre[0:1] - 1.0, centre[1:2] + 1.0)[0] == pytest.approx(3.5, abs=0.3)
+    far = mosaic.read_dsm(_write_dsm(tmp_path / "far.tif", np.zeros((2, 2)), x0 + 1000, y0, px, px, 32616))
+    with pytest.raises(ValueError, match="does not cover the flight"):
+        mosaic.build(frames, align=False, dsm=far)
+
+
+def test_dsm_options_are_checked(tmp_path):
+    with pytest.raises(api.SettingsError, match="dsm needs heights 'auto'"):
+        api.MosaicOptions(dsm=tmp_path, heights="plane")
+    with pytest.raises(api.SettingsError, match="no such file"):
+        api.MosaicOptions(dsm=tmp_path / "missing.tif")
+    with pytest.raises(api.SettingsError, match="dsm_offset needs a dsm"):
+        api.MosaicOptions(dsm_offset=1.0)
+    (tmp_path / "x.tif").write_bytes(b"not a tiff")
+    assert api.MosaicOptions(dsm=str(tmp_path / "x.tif")).dsm == tmp_path / "x.tif"
+    with pytest.raises(api.SettingsError, match="dsm: .*not a readable GeoTIFF"):
+        api._height_options(api.MosaicOptions(dsm=tmp_path / "x.tif"))
 
 
 def test_heights_interpolate_bilinearly_between_cell_centres():

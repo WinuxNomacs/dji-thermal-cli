@@ -27,6 +27,7 @@ import io
 import json
 import math
 import threading
+import warnings
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -284,6 +285,133 @@ class Heights:
         return (self.z.ravel()[idx] * w).sum(1)
 
 
+@dataclasses.dataclass(frozen=True)
+class Dsm:
+    """A surface model read from a GeoTIFF (see read_dsm): altitudes in metres on a north-up
+    raster, pixel (i, j) centred at (x0 + (j + 0.5) dx, y0 - (i + 0.5) dy) in its CRS, which
+    is WGS84 UTM (epsg 326zz/327zz: x, y = easting, northing) or WGS84 lat/lon (epsg 4326:
+    x, y = longitude, latitude). NaN where it has no data."""
+    path: Path
+    z: np.ndarray               # (rows, cols) float64
+    x0: float
+    y0: float
+    dx: float
+    dy: float
+    epsg: int
+
+    def pixel_m(self) -> float:
+        """The pixel size in metres (roughly, for lat/lon)."""
+        if self.epsg != 4326:
+            return self.dx
+        lat = self.y0 - self.z.shape[0] * self.dy / 2
+        return self.dx * 111_320.0 * max(math.cos(math.radians(lat)), 0.01)
+
+    def at_utm(self, e: np.ndarray, n: np.ndarray, zone: int, north: bool) -> np.ndarray:
+        """The altitude at UTM points (nearest pixel), NaN off the raster."""
+        if self.epsg == geo.epsg(zone, north):
+            x, y = e, n
+        else:
+            lat, lon = geo.utm_inverse(e, n, zone, north)
+            if self.epsg == 4326:
+                x, y = lon, lat
+            else:
+                x, y = geo.utm(lat, lon, self.epsg % 100, self.epsg < 32700)
+        j = np.floor((np.asarray(x) - self.x0) / self.dx).astype(np.intp)
+        i = np.floor((self.y0 - np.asarray(y)) / self.dy).astype(np.intp)
+        rows, cols = self.z.shape
+        inside = (i >= 0) & (i < rows) & (j >= 0) & (j < cols)
+        return np.where(inside, self.z[np.clip(i, 0, rows - 1), np.clip(j, 0, cols - 1)], np.nan)
+
+
+def read_dsm(path: Path) -> Dsm:
+    """A DSM GeoTIFF's first band, as written by ODM, GDAL and the like: north-up (ModelPixelScale +
+    one ModelTiepoint), in WGS84 UTM or lat/lon, altitudes in metres, GDAL_NODATA for no data."""
+    import tifffile
+
+    path = Path(path)
+    try:
+        with tifffile.TiffFile(path) as tif:
+            page = tif.pages[0]
+            tags = {t.code: t.value for t in page.tags.values()}
+            z = page.asarray()
+    except (OSError, ValueError, tifffile.TiffFileError) as exc:
+        raise ValueError(f"{path}: not a readable GeoTIFF ({exc})") from exc
+    if 33550 not in tags or 33922 not in tags:
+        raise ValueError(f"{path}: no georeference (ModelPixelScale and ModelTiepoint): a transformed "
+                         "(rotated) raster is not supported")
+    if z.ndim == 3:
+        z = z[..., 0] if page.planarconfig == 1 else z[0]      # contiguous: (rows, cols, bands)
+    z = z.astype(np.float64)
+    dx, dy = float(tags[33550][0]), float(tags[33550][1])
+    tie = [float(v) for v in tags[33922][:6]]
+    keys = {}
+    gk = list(tags.get(34735, ()))
+    for k in range(4, 4 + 4 * int(gk[3]) if len(gk) >= 4 else 4, 4):
+        keys[gk[k]] = gk[k + 3] if gk[k + 1] == 0 else None
+    if keys.get(1024) == 2 and keys.get(2048) == 4326:
+        epsg = 4326
+    elif keys.get(1024) == 1 and keys.get(3072) and 32601 <= keys[3072] <= 32760 and keys[3072] % 100 <= 60 \
+            and keys[3072] // 100 in (326, 327):
+        epsg = int(keys[3072])
+    else:
+        raise ValueError(f"{path}: the DSM's CRS must be WGS84 UTM (EPSG:326zz/327zz) or WGS84 lat/lon (EPSG:4326)")
+    # the tiepoint maps raster (i, j) to model (x, y); PixelIsPoint puts it at the pixel's centre
+    half = 0.5 if keys.get(1025) == 2 else 0.0
+    x0, y0 = tie[3] - (tie[0] + half) * dx, tie[4] + (tie[1] + half) * dy
+    nodata = tags.get(42113)
+    if nodata not in (None, ""):
+        try:
+            z[z == float(str(nodata).strip("\x00 "))] = np.nan
+        except ValueError:
+            pass
+    z[~np.isfinite(z)] = np.nan
+    return Dsm(path, z, x0, y0, dx, dy, epsg)
+
+
+def _dsm_surface(dsm: Dsm, placed: list[_Placed], grid: Grid, cell: float, ground: float,
+                 offset: float | None) -> tuple[Heights, dict]:
+    """The DSM on the height cells, as heights above the ground plane, and its report. Each
+    cell is the median of the DSM over the cell (sampled on a sub-grid about as fine as the
+    DSM's pixels, 2-8 per side); cells the DSM doesn't cover are the plane. offset: added to
+    the DSM's altitudes to bring them to the frames' (None: the median of the rangefinder
+    targets' altitudes minus the DSM there; 0 without a rangefinder)."""
+    surface = Heights.flat(grid, cell)
+    rows, cols = surface.z.shape
+    sub = int(np.clip(round(cell / dsm.pixel_m()), 2, 8))
+    f = (np.arange(sub) + 0.5) / sub
+    e = surface.e0 + (np.arange(cols)[:, None] + f).ravel() * cell
+    n = surface.n0 - (np.arange(rows)[:, None] + f).ravel() * cell
+    ee, nn = np.meshgrid(e, n)
+    alt = dsm.at_utm(ee, nn, grid.zone, grid.north).reshape(rows, sub, cols, sub)
+    with warnings.catch_warnings():       # cells off the DSM: all-NaN slices
+        warnings.simplefilter("ignore", RuntimeWarning)
+        cells = np.nanmedian(alt.transpose(0, 2, 1, 3).reshape(rows, cols, sub * sub), axis=2)
+    covered = np.isfinite(cells)
+    if not covered.any():
+        raise ValueError(f"{dsm.path}: the DSM does not cover the flight")
+    anchors = _anchors(placed, ground)
+    at_anchors = dsm.at_utm(anchors[:, 0], anchors[:, 1], grid.zone, grid.north) if len(anchors) else np.zeros(0)
+    on_dsm = np.isfinite(at_anchors)
+    if offset is not None:
+        source = "given"
+    elif on_dsm.any():
+        offset = float(np.median(anchors[on_dsm, 2] + ground - at_anchors[on_dsm]))
+        source = f"median rangefinder target altitude minus the DSM, at {int(on_dsm.sum())} targets"
+    else:
+        offset, source = 0.0, "none: no rangefinder targets on the DSM, its altitudes taken as the frames'"
+    z = np.where(covered, cells + offset - ground, 0.0)
+    surface = dataclasses.replace(surface, z=z)
+    resid = surface.at_points(anchors[on_dsm, 0], anchors[on_dsm, 1]) - anchors[on_dsm, 2] if on_dsm.any() else None
+    report = {
+        "method": "DSM", "file": dsm.path.name, "offset_m": round(offset, 3) + 0.0, "offset_source": source,
+        "cell_m": round(cell, 3), "cells": int(z.size), "observed_cells": int(covered.sum()),
+        "range_m": [round(float(z[covered].min()), 2) + 0.0, round(float(z[covered].max()), 2) + 0.0],
+        "anchors": int(on_dsm.sum()),
+        "anchor_residual_m": round(float(np.median(np.abs(resid))), 3) if resid is not None else None,
+    }
+    return surface, report
+
+
 def _sample(pl: _Placed, grid: Grid, rows: slice, cols: slice, bilinear: bool = False):
     """For grid pixels in rows x cols: (temperature, off-nadir angle in degrees, valid mask).
     Nearest neighbour, so mosaic values are the frames' own; bilinear is for measuring
@@ -358,16 +486,17 @@ def _grid(placed: list[_Placed], gsd: float, zone: int, north: bool) -> Grid:
 def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | None = None,
           check_misalignment: bool = True, align: bool = True, normalize: bool = False,
           progress: Callable[..., None] | None = None, jobs: int = 1, heights: str = "auto",
-          height_cell: int = HEIGHT_CELL_PX) -> Mosaic:
+          height_cell: int = HEIGHT_CELL_PX, dsm: Dsm | None = None, dsm_offset: float | None = None) -> Mosaic:
     """Composite the frames, projected onto the ground plane. align: first correct the
     frames' placement from their overlaps (see _align), and with heights="auto" estimate the
     surface's heights above the plane (roofs, trees) on cells height_cell pixels wide and
-    project onto that instead ("plane": the plane only). normalize:
+    project onto that instead ("plane": the plane only). dsm: project onto this surface model
+    instead (then alignment only corrects the frames; see _dsm_surface for dsm_offset). normalize:
     remove each frame's temperature offset against its neighbours (see _frame_offsets).
     progress: called as progress(stage, done, total, unit, **extra) as the "align",
     "composite" and "check" stages go (see api.Event); it doesn't change the result. jobs:
     threads matching overlaps (see _measure_blocks); nor does it."""
-    layout = _layout(frames, gsd, ground_alt, align, progress, jobs, heights, height_cell)
+    layout = _layout(frames, gsd, ground_alt, align, progress, jobs, heights, height_cell, dsm, dsm_offset)
     composite = _reporter(progress, "composite", "frames")
     if composite:
         composite(0, len(layout.placed))
@@ -379,12 +508,13 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
 def build_both(frames: list[Frame], as_converted: list[Frame], gsd: float | None = None,
                ground_alt: float | None = None, check_misalignment: bool = True, align: bool = True,
                progress: Callable[..., None] | None = None, jobs: int = 1, heights: str = "auto",
-               height_cell: int = HEIGHT_CELL_PX) -> tuple[Mosaic, Mosaic]:
+               height_cell: int = HEIGHT_CELL_PX, dsm: Dsm | None = None,
+               dsm_offset: float | None = None) -> tuple[Mosaic, Mosaic]:
     """The normalized mosaic of frames (as build(normalize=True)) and the mosaic of the same
     frames measured another way (as_converted, matched by name), laid out once: the second
     gets the first's placement, alignment and misalignment check, and only its compositing
     is its own (a frame missing from as_converted is left out of it)."""
-    layout = _layout(frames, gsd, ground_alt, align, progress, jobs, heights, height_cell)
+    layout = _layout(frames, gsd, ground_alt, align, progress, jobs, heights, height_cell, dsm, dsm_offset)
     by_name = {f.name: f for f in as_converted}
     other = [dataclasses.replace(pl, frame=by_name[pl.frame.name]) for pl in layout.placed
              if pl.frame.name in by_name]
@@ -408,13 +538,15 @@ class _Layout:
     ground_alt: float
     ground_source: str
     heights: Heights | None = None
+    heights_report: dict | None = None
 
 
 def _reporter(progress, stage, unit, **extra):
     return (lambda done, total: progress(stage, done, total, unit, **extra)) if progress else None
 
 
-def _layout(frames, gsd, ground_alt, align, progress, jobs, heights="auto", height_cell=HEIGHT_CELL_PX) -> _Layout:
+def _layout(frames, gsd, ground_alt, align, progress, jobs, heights="auto", height_cell=HEIGHT_CELL_PX,
+            dsm=None, dsm_offset=None) -> _Layout:
     """The frames placed over the ground plane (and aligned) and the grid they cover."""
     if not frames:
         raise ValueError("no frames to mosaic")
@@ -443,12 +575,21 @@ def _layout(frames, gsd, ground_alt, align, progress, jobs, heights="auto", heig
         gsd = max(round(gsd, 3), 0.001)
     grid = _grid(placed, gsd, zone, north)
 
-    alignment = surface = None
+    alignment = surface = heights_report = None
+    if dsm is not None:
+        surface, heights_report = _dsm_surface(dsm, placed, grid, height_cell * gsd, ground_alt, dsm_offset)
+        for pl in placed:
+            pl.heights = surface
+    elif not align:
+        heights_report = {"method": "plane", "reason": "the heights are estimated when aligning"}
     if align:
         placed, surface, alignment = _align(frames, placed, grid, ground_alt, zone, north, progress=progress,
-                                            jobs=jobs, heights=heights, height_cell=height_cell)
+                                            jobs=jobs, heights=heights, height_cell=height_cell, fixed=surface)
+        if heights_report:
+            alignment["heights"] = heights_report
+        heights_report = alignment["heights"]
         grid = _grid(placed, gsd, zone, north)
-    return _Layout(placed, dropped, grid, alignment, ground_alt, ground_source, surface)
+    return _Layout(placed, dropped, grid, alignment, ground_alt, ground_source, surface, heights_report)
 
 
 def _check(layout: _Layout, check_misalignment: bool, progress, jobs) -> dict | None:
@@ -518,6 +659,7 @@ def _composite(layout: _Layout, placed: list[_Placed], normalize: bool, composit
         "radiometric_seams": _seam_stats(temp, second, covered),
         "frame_offsets": radiometry,
         "alignment": layout.alignment,
+        "heights": layout.heights_report,
         "misalignment": None,
     }
     return Mosaic(
@@ -741,7 +883,7 @@ HEIGHT_PRIOR_M = 5.0            # weak pull of unobserved cells to the plane
 
 def _align(frames, placed, grid, ground, zone, north, iterations: int | None = None,
            progress: Callable[..., None] | None = None, jobs: int = 1, heights: str = "auto",
-           height_cell: int = HEIGHT_CELL_PX):
+           height_cell: int = HEIGHT_CELL_PX, fixed: Heights | None = None):
     """Self-calibrate the flight from its overlaps.
 
     Unknowns: one boresight (camera-body pitch and yaw) for the whole flight, the angle between where the
@@ -759,14 +901,15 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
     flight, fitting half of the overlapping pairs cut the other half's median offset from
     0.37 m to 0.12 m.) When the heights can't be estimated (too few cells seen by two
     frames, or a surface reaching the cameras) the flight is aligned on the plane instead,
-    and the report says why.
+    and the report says why. fixed: a surface (from a DSM) the frames are projected onto
+    throughout, the heights not estimated (the report's "heights" left to the caller).
     progress: as build's, for the "align" stage: per round, the pairs measured, then the
     solve's reweighting steps.
     Returns the placed frames, their heights (None on the plane) and the report.
     """
     if heights not in ("auto", "plane"):
         raise ValueError(f"heights must be 'auto' or 'plane', not {heights!r}")
-    use_heights = heights == "auto"
+    use_heights = heights == "auto" and fixed is None
     if iterations is None:
         iterations = 4 if use_heights else 3
     by_name = {f.name: f for f in frames}
@@ -774,7 +917,7 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
     bias = np.zeros(2)
     shifts = np.zeros((n, 2))
     rots = np.zeros(n)
-    surface = Heights.flat(grid, height_cell * grid.gsd) if use_heights else None
+    surface = Heights.flat(grid, height_cell * grid.gsd) if use_heights else fixed
     observed = None
     failed = None
     before = None
@@ -789,7 +932,8 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
             before = _summary(obs, grid)
         if len(obs) < 3:
             break
-        step, inliers, observed = _solve(placed, obs, grid.gsd, bias, report("solve steps"), surface,
+        step, inliers, observed = _solve(placed, obs, grid.gsd, bias, report("solve steps"),
+                                         surface if use_heights else None,
                                          _anchors(placed, ground) if use_heights else None)
         if not np.isfinite(step).all():
             failed = "the solve diverged"
@@ -797,7 +941,7 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
         bias += step[3 * n:3 * n + 2]
         shifts += step[:3 * n].reshape(n, 3)[:, :2]
         rots += step[:3 * n].reshape(n, 3)[:, 2]
-        if surface is not None:
+        if use_heights:
             surface = dataclasses.replace(surface, z=surface.z + step[3 * n + 2:].reshape(surface.z.shape))
         replaced = [_place(by_name[pl.frame.name], ground, zone, north, tuple(bias)) for pl in placed]
         for k, pl in enumerate(replaced):
@@ -1031,7 +1175,9 @@ def write(m: Mosaic, path: Path, compression: str = "deflate", unit: str = "C",
     metres east and south of the mosaic's top-left corner."""
     g = m.grid
     bands = ((f"temperature_{unit.lower()}", units.SYMBOLS[unit]),) + BANDS[1:]
-    onto = "a horizontal plane" if m.heights is None else "the surface estimated from parallax (see write_heights)"
+    onto = ("a horizontal plane" if m.heights is None else "a surface model (see write_heights)"
+            if (m.report.get("heights") or {}).get("method") == "DSM"
+            else "the surface estimated from parallax (see write_heights)")
     if located:
         info = {
             "method": f"direct georeferencing onto {onto}; one frame per pixel (most nadir), nearest neighbour",
@@ -1082,15 +1228,23 @@ def write_heights(m: Mosaic, path: Path, compression: str = "deflate", located: 
     if h is None:
         return None
     g = m.grid
-    step = max(1, round(h.cell / g.gsd))
     rows, cols = h.z.shape
+    # the cell each mosaic row and column falls in (the grid may have moved since the cells were laid)
+    ci = np.floor((h.n0 - (g.n0 - (np.arange(g.height) + 0.5) * g.gsd)) / h.cell).astype(np.intp)
+    cj = np.floor(((g.e0 + (np.arange(g.width) + 0.5) * g.gsd) - h.e0) / h.cell).astype(np.intp)
+    seen_cols = np.zeros((rows, g.width), bool)
     seen = np.isfinite(m.temperature)
-    seen = np.pad(seen, ((0, rows * step - g.height), (0, cols * step - g.width)))
-    covered = seen.reshape(rows, step, cols, step).any(axis=(1, 3))
+    for i in range(rows):
+        if (ci == i).any():
+            seen_cols[i] = seen[ci == i].any(axis=0)
+    covered = np.zeros((rows, cols), bool)
+    for j in range(cols):
+        if (cj == j).any():
+            covered[:, j] = seen_cols[:, cj == j].any(axis=1)
     z = h.z + (m.ground_alt if located else 0.0)
     pixels = np.where(covered, z, np.nan).astype(np.float32)
     name, unit = ("altitude_m", "m") if located else ("height_above_plane_m", "m")
-    info = {**m.report["alignment"]["heights"], "interpolation": "bilinear between cell centres"}
+    info = {**m.report["heights"], "interpolation": "bilinear between cell centres"}
     if located:
         info.update({"crs": f"EPSG:{g.epsg}", "origin_utm": [h.e0, h.n0], "ground_alt_m": round(m.ground_alt, 3)})
     items = [f'<Item name="DESCRIPTION" sample="0" role="description">{name}</Item>'

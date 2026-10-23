@@ -1,7 +1,7 @@
 """WGS84 geodesy for the mosaic: UTM projection and local metric frames.
 
 utm() is the transverse Mercator projection by Krueger's series (Karney 2011, terms to
-n^3: sub-millimetre within a UTM zone). local_to_utm() gives the affine map from a local
+n^3: sub-millimetre within a UTM zone), utm_inverse() its inverse. local_to_utm() gives the affine map from a local
 east/north frame in metres (true north) at a point to UTM there; it carries the meridian
 convergence (grid north vs true north) and the projection's scale factor.
 """
@@ -20,6 +20,7 @@ K0 = 0.9996
 _N = F / (2 - F)
 _A_RECT = A / (1 + _N) * (1 + _N ** 2 / 4 + _N ** 4 / 64)
 _ALPHA = (_N / 2 - 2 * _N ** 2 / 3 + 5 * _N ** 3 / 16, 13 * _N ** 2 / 48 - 3 * _N ** 3 / 5, 61 * _N ** 3 / 240)
+_BETA = (_N / 2 - 2 * _N ** 2 / 3 + 37 * _N ** 3 / 96, _N ** 2 / 48 + _N ** 3 / 15, 17 * _N ** 3 / 480)
 _E = math.sqrt(E2)
 
 
@@ -45,6 +46,24 @@ def utm(lat, lon, zone: int, north: bool):
         x = x + a * np.cos(2 * j * xi) * np.sinh(2 * j * eta)
         y = y + a * np.sin(2 * j * xi) * np.cosh(2 * j * eta)
     return 500000.0 + K0 * _A_RECT * x, (0.0 if north else 10000000.0) + K0 * _A_RECT * y
+
+
+def utm_inverse(e, n, zone: int, north: bool):
+    """(lat, lon) in degrees of UTM easting/northing in metres (scalars or arrays) in a zone."""
+    xi = (np.asarray(n, dtype=float) - (0.0 if north else 10000000.0)) / (K0 * _A_RECT)
+    eta = (np.asarray(e, dtype=float) - 500000.0) / (K0 * _A_RECT)
+    x, y = eta.copy(), xi.copy()
+    for j, b in enumerate(_BETA, start=1):
+        x = x - b * np.cos(2 * j * xi) * np.sinh(2 * j * eta)
+        y = y - b * np.sin(2 * j * xi) * np.cosh(2 * j * eta)
+    lam = np.arctan2(np.sinh(x), np.cos(y))
+    conformal = np.sin(y) / np.hypot(np.sinh(x), np.cos(y))        # tan of the conformal latitude
+    tau = conformal.copy()
+    for _ in range(5):                                              # Newton on Karney's (2011) eq. 7
+        sigma = np.sinh(_E * np.arctanh(_E * tau / np.sqrt(1 + tau * tau)))
+        t = tau * np.sqrt(1 + sigma * sigma) - sigma * np.sqrt(1 + tau * tau)
+        tau = tau + (conformal - t) / np.sqrt(1 + t * t) * (1 + (1 - E2) * tau * tau) / ((1 - E2) * np.sqrt(1 + tau * tau))
+    return np.degrees(np.arctan(tau)), np.degrees(lam) + (zone * 6 - 183)
 
 
 def local_to_utm(lat: float, lon: float, zone: int, north: bool) -> np.ndarray:
