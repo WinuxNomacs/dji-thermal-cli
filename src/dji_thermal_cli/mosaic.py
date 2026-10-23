@@ -560,8 +560,9 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
             if rows.stop - rows.start >= block and cols.stop - cols.start >= block:
                 overlaps.append((a, b, rows, cols))
     area = sum((r.stop - r.start) * (c.stop - c.start) for _, _, r, c in overlaps)
-    # each frame is rendered once, over its window, by the first pair that needs it, and its
-    # pairs' overlaps are cut from that; a render is dropped once all its pairs are measured
+    # each frame is rendered once, over its window, by the first pair that needs it, as the
+    # gradient magnitude that blocks are matched on, and its pairs' overlaps are cut from that;
+    # a render is dropped once all its pairs are measured
     uses = {}
     for a, b, _, _ in overlaps:
         uses[a] = uses.get(a, 0) + 1
@@ -578,7 +579,8 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
             wr, wc = windows[k]
             try:
                 t, _, valid = _sample(placed[k], grid, wr, wc, bilinear=True)
-                fut.set_result((wr.start, wc.start, t, valid))
+                gy, gx = np.gradient(t.astype(np.float64))
+                fut.set_result((wr.start, wc.start, np.sqrt(gy * gy + gx * gx), valid))
             except BaseException as e:
                 fut.set_exception(e)
         return fut.result()
@@ -590,15 +592,15 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
                 del renders[k]
 
     def cut(k, rows, cols):
-        r0, c0, t, valid = render(k)
+        r0, c0, g, valid = render(k)
         rs, cs = slice(rows.start - r0, rows.stop - r0), slice(cols.start - c0, cols.stop - c0)
-        return t[rs, cs], valid[rs, cs]
+        return g[rs, cs], valid[rs, cs]
 
     def measure(pair):
         a, b, rows, cols = pair
         try:
-            ta, va = cut(a, rows, cols)
-            tb, vb = cut(b, rows, cols)
+            ga, va = cut(a, rows, cols)
+            gb, vb = cut(b, rows, cols)
         finally:
             release(a)
             release(b)
@@ -614,11 +616,7 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
         if not y.size:
             return None
         win = np.lib.stride_tricks.sliding_window_view
-        sa = win(ta, (block, block))[y, x].astype(np.float64)
-        sb = win(tb, (block, block))[y, x].astype(np.float64)
-        ga = np.hypot(*np.gradient(sa, axis=(1, 2)))
-        gb = np.hypot(*np.gradient(sb, axis=(1, 2)))
-        dy, dx, peak = _phase_shift(ga, gb)
+        dy, dx, peak = _phase_shift(win(ga, (block, block))[y, x], win(gb, (block, block))[y, x])
         keep = peak >= min_peak
         e = grid.e0 + (cols.start + x[keep] + block / 2) * grid.gsd
         n = grid.n0 - (rows.start + y[keep] + block / 2) * grid.gsd
