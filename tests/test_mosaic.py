@@ -312,3 +312,11 @@ def test_build_without_alignment_reports_no_align_stage(synthetic):
     stages = []
     mosaic.build(frames, align=False, progress=lambda stage, *a, **k: stages.append(stage))
     assert list(dict.fromkeys(stages)) == ["composite", "check"]
+
+
+def test_build_in_several_threads_gives_the_same_mosaic(synthetic):
+    frames, _ = synthetic
+    one = mosaic.build(frames, jobs=1)
+    four = mosaic.build(frames, jobs=4)
+    np.testing.assert_array_equal(one.temperature, four.temperature)
+    assert one.report == four.report

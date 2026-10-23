@@ -382,7 +382,8 @@ The run summary says where each file's distance came from, and `list` shows the
 rangefinder reading in its `lrf_m` column.
 
 Files are processed in parallel by a pool of worker processes (`--jobs N`, default
-`min(CPU count, 8)`; `--jobs 1` runs them one at a time in the same process). Files that
+`min(CPU count, 8)`; `--jobs 1` runs them one at a time in the same process); a mosaic
+matches its frames' overlaps in as many threads. Files that
 can't be converted are listed as `[skip, <reason>]` and the rest of the batch continues.
 
 Run `dji-thermal-cli process --help` / `... list --help` for the full

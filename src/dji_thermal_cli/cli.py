@@ -36,7 +36,7 @@ the few color settings the SDK itself doesn't handle (it reads uninitialised
 memory there), are reported with the reason.
 
 Files are processed in parallel by --jobs worker processes (--jobs 1: one at a
-time, in this process). A file that can't be converted is reported and skipped;
+time, in this process), and the mosaic matches its overlaps in as many threads. A file that can't be converted is reported and skipped;
 the rest of the batch goes on.
 """
 
@@ -179,7 +179,7 @@ def _build_parser() -> argparse.ArgumentParser:
     proc.add_argument("--mosaic-unit", action="append", type=_units, dest="mosaic_units", metavar="UNIT[,UNIT]", help="Temperature unit(s) of the mosaic, C, F and/or K; repeat or comma-separate for one mosaic_temp_<unit>.tif each (default: C)")
     proc.add_argument("--mosaic-gsd", type=float, default=None, metavar="METRES", help="Mosaic pixel size (default: the frames' median ground sample distance)")
     proc.add_argument("--compression", choices=outputs.COMPRESSIONS, default="deflate", help="TIFF/EXR compression: deflate = lossless Deflate (EXR: ZIP), the default; none = uncompressed. PNG is always compressed")
-    proc.add_argument("--jobs", "-j", type=_positive_int, default=None, help="Worker processes (default: min(CPU count, 8); 1 = in this process)")
+    proc.add_argument("--jobs", "-j", type=_positive_int, default=None, help="Worker processes, and the mosaic's matching threads (default: min(CPU count, 8); 1 = in this process)")
     proc.add_argument("--quiet", "-q", action="store_true", help="Don't show the mosaic's progress (--mosaic, --normalize) on stderr; results, skipped files and errors are still printed")
 
     lst = sub.add_parser("list", help="Describe every thermal R-JPEG: thermal parameters, temperature stats, position, attitude, camera, EXIF",

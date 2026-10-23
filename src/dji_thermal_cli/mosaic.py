@@ -25,7 +25,9 @@ import dataclasses
 import io
 import json
 import math
+import threading
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -292,12 +294,13 @@ def _grid(placed: list[_Placed], gsd: float, zone: int, north: bool) -> Grid:
 
 def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | None = None,
           check_misalignment: bool = True, align: bool = True, normalize: bool = False,
-          progress: Callable[..., None] | None = None) -> Mosaic:
+          progress: Callable[..., None] | None = None, jobs: int = 1) -> Mosaic:
     """Composite the frames (all assumed to look down at the same ground plane). align:
     first correct the frames' placement from their overlaps (see _align). normalize:
     remove each frame's temperature offset against its neighbours (see _frame_offsets).
     progress: called as progress(stage, done, total, unit, **extra) as the "align",
-    "composite" and "check" stages go (see api.Event); it doesn't change the result."""
+    "composite" and "check" stages go (see api.Event); it doesn't change the result. jobs:
+    threads matching overlaps (see _measure_blocks); nor does it."""
     def report(stage, unit, **extra):
         return (lambda done, total: progress(stage, done, total, unit, **extra)) if progress else None
     if not frames:
@@ -329,7 +332,7 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
 
     alignment = None
     if align:
-        placed, alignment = _align(frames, placed, grid, ground_alt, zone, north, progress=progress)
+        placed, alignment = _align(frames, placed, grid, ground_alt, zone, north, progress=progress, jobs=jobs)
         grid = _grid(placed, gsd, zone, north)
 
     shape = (grid.height, grid.width)
@@ -388,7 +391,7 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
         "radiometric_seams": _seam_stats(temp, second, covered),
         "frame_offsets": radiometry,
         "alignment": alignment,
-        "misalignment": (_summary(_measure_blocks(placed, grid, report=report("check", "pairs")), grid)
+        "misalignment": (_summary(_measure_blocks(placed, grid, report=report("check", "pairs"), jobs=jobs), grid)
                          if check_misalignment else None),
     }
     return Mosaic(
@@ -480,13 +483,13 @@ def _phase_shift(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
 
 
 def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_peak: float = 0.1,
-                    report: Callable[[int, int], None] | None = None) -> np.ndarray:
+                    report: Callable[[int, int], None] | None = None, jobs: int = 1) -> np.ndarray:
     """Misalignment between overlapping frames, in blocks (half-overlapping) fully covered by
     both frames of a pair. Rows: (a, b, block centre E, N, shift E, N), the shift being where
     frame b shows the block's content relative to frame a, in metres. report(done, total):
     the overlapping pairs measured, counted by the overlap area each samples so that the
-    count moves evenly."""
-    obs = []
+    count moves evenly. jobs: threads matching pairs at once (numpy's FFTs and array work
+    release the GIL); the result is the same for any number."""
     step = block // 2
     windows = [_window(pl, grid) for pl in placed]
     overlaps = []
@@ -498,31 +501,48 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
             if rows.stop - rows.start >= block and cols.stop - cols.start >= block:
                 overlaps.append((a, b, rows, cols))
     area = sum((r.stop - r.start) * (c.stop - c.start) for _, _, r, c in overlaps)
-    # each frame is rendered once, over its window, and its pairs' overlaps are cut from that;
-    # a render is dropped after the last pair that uses it
-    last = {}
-    for i, (a, b, _, _) in enumerate(overlaps):
-        last[a] = last[b] = i
-    renders = {}
+    # each frame is rendered once, over its window, by the first pair that needs it, and its
+    # pairs' overlaps are cut from that; a render is dropped once all its pairs are measured
+    uses = {}
+    for a, b, _, _ in overlaps:
+        uses[a] = uses.get(a, 0) + 1
+        uses[b] = uses.get(b, 0) + 1
+    renders, lock = {}, threading.Lock()
+
+    def render(k):
+        with lock:
+            fut = renders.get(k)
+            mine = fut is None
+            if mine:
+                fut = renders[k] = Future()
+        if mine:
+            wr, wc = windows[k]
+            try:
+                t, _, valid = _sample(placed[k], grid, wr, wc, bilinear=True)
+                fut.set_result((wr.start, wc.start, t, valid))
+            except BaseException as e:
+                fut.set_exception(e)
+        return fut.result()
+
+    def release(k):
+        with lock:
+            uses[k] -= 1
+            if not uses[k]:
+                del renders[k]
 
     def cut(k, rows, cols):
-        if k not in renders:
-            wr, wc = windows[k]
-            t, _, valid = _sample(placed[k], grid, wr, wc, bilinear=True)
-            renders[k] = (wr.start, wc.start, t, valid)
-        r0, c0, t, valid = renders[k]
+        r0, c0, t, valid = render(k)
         rs, cs = slice(rows.start - r0, rows.stop - r0), slice(cols.start - c0, cols.stop - c0)
         return t[rs, cs], valid[rs, cs]
 
-    sampled, done = 0, 0
-    if report:
-        report(0, len(overlaps))
-    for i, (a, b, rows, cols) in enumerate(overlaps):
-        ta, va = cut(a, rows, cols)
-        tb, vb = cut(b, rows, cols)
-        for k in (a, b):
-            if last[k] == i:
-                del renders[k]
+    def measure(pair):
+        a, b, rows, cols = pair
+        try:
+            ta, va = cut(a, rows, cols)
+            tb, vb = cut(b, rows, cols)
+        finally:
+            release(a)
+            release(b)
         both = va & vb
         # blocks fully covered by both frames, from a summed-area table of the uncovered pixels
         gaps = np.zeros((both.shape[0] + 1, both.shape[1] + 1), np.int64)
@@ -532,23 +552,39 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
         y, x = (g.ravel() for g in np.meshgrid(ys, xs, indexing="ij"))
         full = (gaps[y + block, x + block] - gaps[y, x + block] - gaps[y + block, x] + gaps[y, x]) == 0
         y, x = y[full], x[full]
-        if y.size:
-            win = np.lib.stride_tricks.sliding_window_view
-            sa = win(ta, (block, block))[y, x].astype(np.float64)
-            sb = win(tb, (block, block))[y, x].astype(np.float64)
-            ga = np.hypot(*np.gradient(sa, axis=(1, 2)))
-            gb = np.hypot(*np.gradient(sb, axis=(1, 2)))
-            dy, dx, peak = _phase_shift(ga, gb)
-            keep = peak >= min_peak
-            e = grid.e0 + (cols.start + x[keep] + block / 2) * grid.gsd
-            n = grid.n0 - (rows.start + y[keep] + block / 2) * grid.gsd
-            obs.append(np.column_stack([np.full(e.size, a), np.full(e.size, b), e, n,
-                                        dx[keep] * grid.gsd, -dy[keep] * grid.gsd]))
-        if report:
-            sampled += (rows.stop - rows.start) * (cols.stop - cols.start)
-            if (now := len(overlaps) * sampled // area) != done:
-                done = now
-                report(done, len(overlaps))
+        if not y.size:
+            return None
+        win = np.lib.stride_tricks.sliding_window_view
+        sa = win(ta, (block, block))[y, x].astype(np.float64)
+        sb = win(tb, (block, block))[y, x].astype(np.float64)
+        ga = np.hypot(*np.gradient(sa, axis=(1, 2)))
+        gb = np.hypot(*np.gradient(sb, axis=(1, 2)))
+        dy, dx, peak = _phase_shift(ga, gb)
+        keep = peak >= min_peak
+        e = grid.e0 + (cols.start + x[keep] + block / 2) * grid.gsd
+        n = grid.n0 - (rows.start + y[keep] + block / 2) * grid.gsd
+        return np.column_stack([np.full(e.size, a), np.full(e.size, b), e, n,
+                                dx[keep] * grid.gsd, -dy[keep] * grid.gsd])
+
+    obs, sampled, done = [], 0, 0
+    if report:
+        report(0, len(overlaps))
+    jobs = max(1, min(jobs, len(overlaps)))
+    pool = ThreadPoolExecutor(jobs) if jobs > 1 else None
+    try:
+        # the workers take the pairs in order, so renders live about as long as measured one by one
+        results = pool.map(measure, overlaps) if pool else map(measure, overlaps)
+        for (_, _, rows, cols), m in zip(overlaps, results):
+            if m is not None:
+                obs.append(m)
+            if report:
+                sampled += (rows.stop - rows.start) * (cols.stop - cols.start)
+                if (now := len(overlaps) * sampled // area) != done:
+                    done = now
+                    report(done, len(overlaps))
+    finally:
+        if pool:
+            pool.shutdown(cancel_futures=True)
     return np.concatenate(obs).astype(np.float64) if obs else np.zeros((0, 6))
 
 
@@ -576,7 +612,7 @@ OBS_SIGMA_PX = 2.0
 
 
 def _align(frames, placed, grid, ground, zone, north, iterations: int = 3,
-           progress: Callable[..., None] | None = None):
+           progress: Callable[..., None] | None = None, jobs: int = 1):
     """Self-calibrate the flight from its overlaps.
 
     Unknowns: one boresight (camera-body pitch and yaw) for the whole flight, the angle between where the
@@ -604,7 +640,7 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int = 3,
         def report(unit, it=it):
             return ((lambda done, total: progress("align", done, total, unit, round=it + 1, rounds=iterations))
                     if progress else None)
-        obs = _measure_blocks(placed, grid, report=report("pairs"))
+        obs = _measure_blocks(placed, grid, report=report("pairs"), jobs=jobs)
         if it == 0:
             before = _summary(obs, grid)
         if len(obs) < 3:

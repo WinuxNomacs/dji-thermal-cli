@@ -464,7 +464,8 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
     if not frames:
         raise MosaicError("No frames to mosaic.", counts)
     try:
-        m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=options.normalize, progress=report)
+        m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=options.normalize, progress=report,
+                          jobs=worker_count(jobs, len(frames)))
     except ValueError as e:
         raise MosaicError(f"Mosaic failed: {e}", counts) from None
     m.report["adjustments"] = adjust.describe(adj)
@@ -530,7 +531,7 @@ def normalization(path: str | os.PathLike, settings: Settings = Settings(), opti
         raise MosaicError("No frames to compare for normalization.", counts)
     try:
         m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=False, check_misalignment=False,
-                          progress=report)
+                          progress=report, jobs=worker_count(jobs, len(frames)))
     except ValueError as e:
         raise MosaicError(f"Normalization failed: {e}", counts) from None
     offsets = {src_root / row["file"]: float(row["temperature_offset_c"]) for row in m.frames}
@@ -626,7 +627,8 @@ def _scan(path, progress: ProgressFn | None) -> dataset.Scan:
 
 
 def worker_count(requested: int | None, n_jobs: int) -> int:
-    """Worker processes for n_jobs files: requested, else min(CPU count, 8); at least 1."""
+    """Workers for n_jobs items (processes for files, threads for the mosaic's matching):
+    requested, else min(CPU count, 8); at least 1."""
     n = requested if requested else min(os.cpu_count() or 1, DEFAULT_MAX_WORKERS)
     return max(1, min(n, n_jobs))
 
