@@ -6,6 +6,19 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- The mosaic projects its frames onto the heights it estimates from the parallax between
+  overlapping frames, anchored to the rangefinder, instead of a flat ground plane
+  (`--mosaic-heights auto`, the default; `plane` keeps the old projection). Roofs and trees
+  no longer bend or step at the seams: on a 327-frame M4T flight with oblique frames the
+  house's straight roof is straight again. The surface is written to `mosaic_heights.tif`,
+  and the report's `heights` entry says which surface was used and how well it fits. With
+  too few observed cells, or a surface too near a camera, the mosaic falls back to the plane
+  and says why.
+- A DSM can replace the estimated heights (`--mosaic-dsm PATH`, `--mosaic-dsm-offset METRES`;
+  `MosaicOptions(dsm=..., dsm_offset=...)`). It is optional: the mosaic never needs one.
+- Per-file jobs run in the calling process when it is daemonic, such as a Celery worker's
+  (which cannot start processes), so callers there no longer need `jobs=1`; the mosaic's
+  alignment still uses its threads.
 - The mosaic builds faster: each frame is rendered once per matching pass instead of once per
   overlapping pair, blocks are matched on a gradient computed once per rendering instead of
   once per block, a pair's blocks are matched in one batch of real FFTs, the overlaps are

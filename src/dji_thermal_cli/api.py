@@ -22,6 +22,7 @@ layer only converts units, applies the dataset-wide settings and writes files.
 from __future__ import annotations
 
 import dataclasses
+import multiprocessing
 import os
 from collections import Counter
 from collections.abc import Callable, Iterable
@@ -162,13 +163,21 @@ class Settings:
 
 @dataclasses.dataclass(frozen=True)
 class MosaicOptions:
-    """How to build the mosaic. units: one GeoTIFF per unit (C, F, K)."""
+    """How to build the mosaic. units: one GeoTIFF per unit (C, F, K). heights: "auto" projects
+    the frames onto the surface estimated from their parallax (with align; see mosaic._align),
+    on cells height_cell mosaic pixels wide; "plane" onto the flat ground. dsm: a surface model
+    GeoTIFF (WGS84 UTM or lat/lon, metres) to project onto instead, with dsm_offset metres added
+    to its altitudes (None: estimated from the rangefinder; see mosaic._dsm_surface)."""
 
     max_pitch: float = _mosaic.DEFAULT_MAX_PITCH
     align: bool = True
     normalize: bool = False
     gsd: float | None = None
     units: tuple[str, ...] = ("C",)
+    heights: str = "auto"
+    height_cell: int = _mosaic.HEIGHT_CELL_PX
+    dsm: Path | None = None
+    dsm_offset: float | None = None
 
     def __post_init__(self):
         chosen = tuple(dict.fromkeys(str(u).upper() for u in self.units))
@@ -177,6 +186,18 @@ class MosaicOptions:
         object.__setattr__(self, "units", chosen)
         if self.gsd is not None and self.gsd <= 0:
             raise SettingsError("gsd must be positive")
+        if self.heights not in ("auto", "plane"):
+            raise SettingsError(f"heights must be 'auto' or 'plane', not {self.heights!r}")
+        if not 8 <= self.height_cell <= 1024:
+            raise SettingsError("height_cell must be 8-1024 pixels")
+        if self.dsm is not None:
+            object.__setattr__(self, "dsm", Path(self.dsm))
+            if self.heights == "plane":
+                raise SettingsError("dsm needs heights 'auto': 'plane' projects onto the flat ground")
+            if not self.dsm.is_file():
+                raise SettingsError(f"dsm: no such file {self.dsm}")
+        elif self.dsm_offset is not None:
+            raise SettingsError("dsm_offset needs a dsm")
 
 
 def palette_index(palette: int | str) -> int:
@@ -446,6 +467,7 @@ class MosaicReport:
     unusable: int
     not_thermal: int
     normalize_ambient_c: tuple[float, float] | None   # (ambient, reflected) when normalize set them
+    heights: Path | None = None                 # mosaic_heights.tif (None on the plane)
     as_converted: MosaicReport | None = None    # the mosaic written to as_converted_dir
 
 
@@ -454,7 +476,8 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
            jobs: int | None = None, progress: ProgressFn | None = None,
            as_converted_dir: str | os.PathLike | None = None) -> MosaicReport:
     """Stitch a dataset's nadir frames into one georeferenced mosaic in output_dir:
-    mosaic_temp_<unit>.tif (+ .json) per unit and mosaic_preview.png.
+    mosaic_temp_<unit>.tif (+ .json) per unit, mosaic_preview.png and, when the frames were
+    projected onto estimated heights or a DSM, mosaic_heights.tif.
 
     as_converted_dir (with options.normalize): also write the mosaic without the normalization
     there, from the same layout (alignment and misalignment check), in about the time of one
@@ -479,10 +502,10 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
     try:
         if as_converted_dir is None:
             m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=options.normalize,
-                              progress=report, jobs=worker_count(jobs, len(frames)))
+                              progress=report, jobs=worker_count(jobs, len(frames)), **_height_options(options))
         else:
             m, mc = _mosaic.build_both(frames, converted, gsd=options.gsd, align=options.align, progress=report,
-                                       jobs=worker_count(jobs, len(frames)))
+                                       jobs=worker_count(jobs, len(frames)), **_height_options(options))
     except ValueError as e:
         raise MosaicError(f"Mosaic failed: {e}", counts) from None
     result = _write_mosaic(m, out, settings, options, compression, adj, palettes, _share(report, "write", 0, parts),
@@ -492,6 +515,17 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
                                             _share(report, "write", 1, parts), normalize_ambient_c=None,
                                             **converted_counts)
     return result
+
+
+def _height_options(options: MosaicOptions) -> dict:
+    dsm = None
+    if options.dsm is not None:
+        try:
+            dsm = _mosaic.read_dsm(options.dsm)
+        except ValueError as e:
+            raise SettingsError(f"dsm: {e}") from e
+    return {"heights": options.heights, "height_cell": options.height_cell, "dsm": dsm,
+            "dsm_offset": options.dsm_offset}
 
 
 def _share(report, stage: str, part: int, parts: int):
@@ -512,7 +546,7 @@ def _write_mosaic(m: _mosaic.Mosaic, out: Path, settings: Settings, options: Mos
     """Write a built mosaic's GeoTIFFs and preview in out (the "write" stage)."""
     out.mkdir(parents=True, exist_ok=True)
     m.report["adjustments"] = adjust.describe(adj)
-    writes = len(options.units) + 1                     # each unit's GeoTIFF (+ sidecar), then the preview
+    writes = len(options.units) + 1 + (m.heights is not None)   # each unit's GeoTIFF (+ sidecar), the heights, the preview
     if report:
         report("write", 0, writes, "files")
     files = []
@@ -528,10 +562,13 @@ def _write_mosaic(m: _mosaic.Mosaic, out: Path, settings: Settings, options: Mos
         if 0 <= index < luts.shape[1]:
             lut, palette_name = luts[:, index, :].T, PALETTES[index]
     lo, hi = settings.range_c()
+    heights = _mosaic.write_heights(m, out / "mosaic_heights.tif", compression, located=not adj.strip_location)
+    if heights and report:
+        report("write", len(files) + 1, writes, "files")
     preview, low, high = _mosaic.write_preview(m, out / "mosaic_preview.png", lut, lo, hi)
     if report:
         report("write", writes, writes, "files")
-    return MosaicReport(m, files, preview, palette_name, (low, high), **fields)
+    return MosaicReport(m, files, preview, palette_name, (low, high), heights=heights, **fields)
 
 
 @dataclasses.dataclass
@@ -574,7 +611,7 @@ def normalization(path: str | os.PathLike, settings: Settings = Settings(), opti
         raise MosaicError("No frames to compare for normalization.", counts)
     try:
         m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=False, check_misalignment=False,
-                          progress=report, jobs=worker_count(jobs, len(frames)))
+                          progress=report, jobs=worker_count(jobs, len(frames)), **_height_options(options))
     except ValueError as e:
         raise MosaicError(f"Normalization failed: {e}", counts) from None
     offsets = {src_root / row["file"]: float(row["temperature_offset_c"]) for row in m.frames}
@@ -678,10 +715,11 @@ def worker_count(requested: int | None, n_jobs: int) -> int:
 
 def _run_all(fn, arglist: list[tuple], jobs: int | None):
     """Yield (index, ok, result or error text) for fn(*args) over arglist, as each finishes,
-    in jobs worker processes (1: in this process). An unexpected exception only fails its
-    own item."""
+    in jobs worker processes (1: in this process). A daemonic process (a Celery worker's, a
+    multiprocessing pool's) cannot start processes, so it runs them in this process. An
+    unexpected exception only fails its own item."""
     workers = worker_count(jobs, len(arglist))
-    if workers <= 1:
+    if workers <= 1 or multiprocessing.current_process().daemon:
         for i, a in enumerate(arglist):
             try:
                 yield i, True, fn(*a)

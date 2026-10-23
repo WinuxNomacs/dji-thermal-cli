@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import multiprocessing
+import os
+
 import numpy as np
 import pytest
 import tifffile
 
 import dji_thermal_cli as dtc
-from dji_thermal_cli import checks, core, djixmp, tsdk
+from dji_thermal_cli import api, checks, core, djixmp, tsdk
 
 from .conftest import flight_counts, flight_dir, flight_files, flight_visual, samples_dir
 from .test_cli import _cli
@@ -173,6 +176,20 @@ def test_make_mosaic_without_pose(tmp_path):
     with pytest.raises(dtc.MosaicError, match="No frames to mosaic") as e:
         dtc.make_mosaic(samples_dir("M30T"), tmp_path, jobs=1)
     assert e.value.counts["frames"] == 0 and e.value.counts["unusable"] > 0
+
+
+def _pids_in_a_daemon(queue):
+    queue.put([r for _, _, r in api._run_all(os.getpid, [()] * 4, 4)] + [os.getpid()])
+
+
+def test_jobs_in_a_daemonic_process_run_in_that_process():
+    queue = multiprocessing.get_context("fork").Queue()
+    worker = multiprocessing.get_context("fork").Process(target=_pids_in_a_daemon, args=(queue,), daemon=True)
+    worker.start()
+    pids = queue.get(timeout=60)
+    worker.join(60)
+    assert worker.exitcode == 0
+    assert set(pids) == {worker.pid}
 
 
 def test_missing_path(tmp_path):
