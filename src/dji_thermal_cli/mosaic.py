@@ -495,12 +495,31 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
             if rows.stop - rows.start >= block and cols.stop - cols.start >= block:
                 overlaps.append((a, b, rows, cols))
     area = sum((r.stop - r.start) * (c.stop - c.start) for _, _, r, c in overlaps)
+    # each frame is rendered once, over its window, and its pairs' overlaps are cut from that;
+    # a render is dropped after the last pair that uses it
+    last = {}
+    for i, (a, b, _, _) in enumerate(overlaps):
+        last[a] = last[b] = i
+    renders = {}
+
+    def cut(k, rows, cols):
+        if k not in renders:
+            wr, wc = windows[k]
+            t, _, valid = _sample(placed[k], grid, wr, wc, bilinear=True)
+            renders[k] = (wr.start, wc.start, t, valid)
+        r0, c0, t, valid = renders[k]
+        rs, cs = slice(rows.start - r0, rows.stop - r0), slice(cols.start - c0, cols.stop - c0)
+        return t[rs, cs], valid[rs, cs]
+
     sampled, done = 0, 0
     if report:
         report(0, len(overlaps))
-    for a, b, rows, cols in overlaps:
-        ta, _, va = _sample(placed[a], grid, rows, cols, bilinear=True)
-        tb, _, vb = _sample(placed[b], grid, rows, cols, bilinear=True)
+    for i, (a, b, rows, cols) in enumerate(overlaps):
+        ta, va = cut(a, rows, cols)
+        tb, vb = cut(b, rows, cols)
+        for k in (a, b):
+            if last[k] == i:
+                del renders[k]
         both = va & vb
         for y in range(0, both.shape[0] - block + 1, step):
             for x in range(0, both.shape[1] - block + 1, step):
