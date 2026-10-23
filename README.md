@@ -382,7 +382,8 @@ The run summary says where each file's distance came from, and `list` shows the
 rangefinder reading in its `lrf_m` column.
 
 Files are processed in parallel by a pool of worker processes (`--jobs N`, default
-`min(CPU count, 8)`; `--jobs 1` runs them one at a time in the same process). Files that
+`min(CPU count, 8)`; `--jobs 1` runs them one at a time in the same process); a mosaic
+matches its frames' overlaps in as many threads. Files that
 can't be converted are listed as `[skip, <reason>]` and the rest of the batch continues.
 
 Run `dji-thermal-cli process --help` / `... list --help` for the full
@@ -439,6 +440,10 @@ dtc.make_mosaic("flight/", "out/", settings, dtc.MosaicOptions(normalize=True, u
 - **Functions:** `scan`, `classify`, `describe`, `list_dataset`, `check`, `measure`, `process`,
   `make_mosaic`. Each returns a result object (`ListResult`, `CheckResult`, `Measurement`,
   `ProcessReport`, `MosaicReport`).
+- **Both mosaics from one build:** `make_mosaic(..., as_converted_dir="out-raw/")`, with
+  `normalize=True`, also writes the mosaic without the normalization there, laid out and
+  checked once for both (`report.as_converted` is its report). It is laid out from the
+  normalized frames, so it can differ slightly from a separate `normalize=False` mosaic.
 - **Errors:** a missing path raises `FileNotFoundError`, a mosaic that can't be built raises
   `MosaicError`, and `describe` of a non-thermal file raises `FileProblem`. Within a dataset a
   bad file never raises: it is reported in the result and the rest carries on.

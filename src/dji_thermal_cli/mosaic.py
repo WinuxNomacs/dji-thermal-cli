@@ -21,11 +21,14 @@ image shift between overlapping frames found by phase correlation (geometric err
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import io
 import json
 import math
+import threading
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -292,14 +295,60 @@ def _grid(placed: list[_Placed], gsd: float, zone: int, north: bool) -> Grid:
 
 def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | None = None,
           check_misalignment: bool = True, align: bool = True, normalize: bool = False,
-          progress: Callable[..., None] | None = None) -> Mosaic:
+          progress: Callable[..., None] | None = None, jobs: int = 1) -> Mosaic:
     """Composite the frames (all assumed to look down at the same ground plane). align:
     first correct the frames' placement from their overlaps (see _align). normalize:
     remove each frame's temperature offset against its neighbours (see _frame_offsets).
     progress: called as progress(stage, done, total, unit, **extra) as the "align",
-    "composite" and "check" stages go (see api.Event); it doesn't change the result."""
-    def report(stage, unit, **extra):
-        return (lambda done, total: progress(stage, done, total, unit, **extra)) if progress else None
+    "composite" and "check" stages go (see api.Event); it doesn't change the result. jobs:
+    threads matching overlaps (see _measure_blocks); nor does it."""
+    layout = _layout(frames, gsd, ground_alt, align, progress, jobs)
+    composite = _reporter(progress, "composite", "frames")
+    if composite:
+        composite(0, len(layout.placed))
+    m = _composite(layout, layout.placed, normalize, composite, 0, len(layout.placed))
+    m.report["misalignment"] = _check(layout, check_misalignment, progress, jobs)
+    return m
+
+
+def build_both(frames: list[Frame], as_converted: list[Frame], gsd: float | None = None,
+               ground_alt: float | None = None, check_misalignment: bool = True, align: bool = True,
+               progress: Callable[..., None] | None = None, jobs: int = 1) -> tuple[Mosaic, Mosaic]:
+    """The normalized mosaic of frames (as build(normalize=True)) and the mosaic of the same
+    frames measured another way (as_converted, matched by name), laid out once: the second
+    gets the first's placement, alignment and misalignment check, and only its compositing
+    is its own (a frame missing from as_converted is left out of it)."""
+    layout = _layout(frames, gsd, ground_alt, align, progress, jobs)
+    by_name = {f.name: f for f in as_converted}
+    other = [dataclasses.replace(pl, frame=by_name[pl.frame.name]) for pl in layout.placed
+             if pl.frame.name in by_name]
+    total = len(layout.placed) + len(other)
+    composite = _reporter(progress, "composite", "frames")
+    if composite:
+        composite(0, total)
+    normalized = _composite(layout, layout.placed, True, composite, 0, total)
+    converted = _composite(layout, other, False, composite, len(layout.placed), total)
+    normalized.report["misalignment"] = _check(layout, check_misalignment, progress, jobs)
+    converted.report["misalignment"] = copy.deepcopy(normalized.report["misalignment"])
+    return normalized, converted
+
+
+@dataclasses.dataclass
+class _Layout:
+    placed: list[_Placed]
+    dropped: list[str]          # frames with no ground footprint
+    grid: Grid
+    alignment: dict | None
+    ground_alt: float
+    ground_source: str
+
+
+def _reporter(progress, stage, unit, **extra):
+    return (lambda done, total: progress(stage, done, total, unit, **extra)) if progress else None
+
+
+def _layout(frames, gsd, ground_alt, align, progress, jobs) -> _Layout:
+    """The frames placed over the ground plane (and aligned) and the grid they cover."""
     if not frames:
         raise ValueError("no frames to mosaic")
     lat = float(np.mean([f.pose.lat for f in frames]))
@@ -329,9 +378,25 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
 
     alignment = None
     if align:
-        placed, alignment = _align(frames, placed, grid, ground_alt, zone, north, progress=progress)
+        placed, alignment = _align(frames, placed, grid, ground_alt, zone, north, progress=progress, jobs=jobs)
         grid = _grid(placed, gsd, zone, north)
+    return _Layout(placed, dropped, grid, alignment, ground_alt, ground_source)
 
+
+def _check(layout: _Layout, check_misalignment: bool, progress, jobs) -> dict | None:
+    """How well the laid-out frames still agree where they overlap (the "check" stage)."""
+    if not check_misalignment:
+        return None
+    return _summary(_measure_blocks(layout.placed, layout.grid, report=_reporter(progress, "check", "pairs"),
+                                    jobs=jobs), layout.grid)
+
+
+def _composite(layout: _Layout, placed: list[_Placed], normalize: bool, composite, done: int,
+               total: int) -> Mosaic:
+    """Each mosaic pixel from the frame seeing it closest to nadir (the runner-up kept for the
+    seams and offsets), without the misalignment check. composite: reported as (done + frames
+    composited, total)."""
+    grid = layout.grid
     shape = (grid.height, grid.width)
     best_angle = np.full(shape, np.inf, np.float32)
     second_angle = np.full(shape, np.inf, np.float32)
@@ -339,9 +404,6 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
     second = np.full(shape, np.nan, np.float32)
     source = np.full(shape, -1, np.int32)
     second_source = np.full(shape, -1, np.int32)
-    composite = report("composite", "frames")
-    if composite:
-        composite(0, len(placed))
     for k, pl in enumerate(placed):
         rows, cols = _window(pl, grid)
         t, angle, valid = _sample(pl, grid, rows, cols)
@@ -357,7 +419,7 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
         bt[:] = np.where(better, t, bt)
         bs[:] = np.where(better, k, bs)
         if composite:
-            composite(k + 1, len(placed))
+            composite(done + k + 1, total)
 
     covered = source >= 0
     offsets, radiometry = _frame_offsets(temp, second, source, second_source, len(placed))
@@ -384,16 +446,16 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
     report = {
         "frames_used": len(placed),
         "frames_contributing": int((used > 0).sum()),
-        "frames_dropped_no_ground_footprint": dropped,
+        "frames_dropped_no_ground_footprint": layout.dropped,
         "radiometric_seams": _seam_stats(temp, second, covered),
         "frame_offsets": radiometry,
-        "alignment": alignment,
-        "misalignment": (_summary(_measure_blocks(placed, grid, report=report("check", "pairs")), grid)
-                         if check_misalignment else None),
+        "alignment": layout.alignment,
+        "misalignment": None,
     }
     return Mosaic(
         grid, temp, np.where(covered, source, np.nan).astype(np.float32),
-        np.where(covered, best_angle, np.nan).astype(np.float32), table, ground_alt, ground_source, report,
+        np.where(covered, best_angle, np.nan).astype(np.float32), table, layout.ground_alt, layout.ground_source,
+        report,
     )
 
 
@@ -454,36 +516,39 @@ def _frame_offsets(temp, second, source, second_source, n: int, max_samples: int
     }
 
 
-def _phase_shift(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float]:
-    """Shift (dy, dx) of b relative to a by phase correlation, and the peak strength."""
-    win = np.outer(np.hanning(a.shape[0]), np.hanning(a.shape[1]))
-    fa = np.fft.fft2((a - a.mean()) * win)
-    fb = np.fft.fft2((b - b.mean()) * win)
+def _phase_shift(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """For stacks of blocks (k, h, w): the shift (dy, dx) of each b relative to its a by phase
+    correlation, and the peak strength."""
+    k, h, w = a.shape
+    win = np.outer(np.hanning(h), np.hanning(w))
+    fa = np.fft.rfft2((a - a.mean(axis=(1, 2), keepdims=True)) * win)
+    fb = np.fft.rfft2((b - b.mean(axis=(1, 2), keepdims=True)) * win)
     cross = fa.conj() * fb
-    corr = np.fft.ifft2(cross / (np.abs(cross) + 1e-12)).real
-    iy, ix = np.unravel_index(np.argmax(corr), corr.shape)
-    peak = float(corr[iy, ix])
+    corr = np.fft.irfft2(cross / (np.abs(cross) + 1e-12), s=(h, w))
+    iy, ix = np.unravel_index(np.argmax(corr.reshape(k, -1), axis=1), (h, w))
+    at = np.arange(k)
+    peak = corr[at, iy, ix]
 
-    def sub(c, i, n):           # parabolic sub-pixel refinement
-        l, r = c[(i - 1) % n], c[(i + 1) % n]
-        den = l - 2 * c[i] + r
-        return i + (0.5 * (l - r) / den if den else 0.0)
+    def sub(c, l, r, i):        # parabolic sub-pixel refinement
+        den = l - 2 * c + r
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return i + np.where(den != 0, 0.5 * (l - r) / den, 0.0)
 
-    dy = sub(corr[:, ix], iy, corr.shape[0])
-    dx = sub(corr[iy, :], ix, corr.shape[1])
-    dy = dy - corr.shape[0] if dy > corr.shape[0] / 2 else dy
-    dx = dx - corr.shape[1] if dx > corr.shape[1] / 2 else dx
+    dy = sub(peak, corr[at, (iy - 1) % h, ix], corr[at, (iy + 1) % h, ix], iy)
+    dx = sub(peak, corr[at, iy, (ix - 1) % w], corr[at, iy, (ix + 1) % w], ix)
+    dy = np.where(dy > h / 2, dy - h, dy)
+    dx = np.where(dx > w / 2, dx - w, dx)
     return dy, dx, peak
 
 
 def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_peak: float = 0.1,
-                    report: Callable[[int, int], None] | None = None) -> np.ndarray:
+                    report: Callable[[int, int], None] | None = None, jobs: int = 1) -> np.ndarray:
     """Misalignment between overlapping frames, in blocks (half-overlapping) fully covered by
     both frames of a pair. Rows: (a, b, block centre E, N, shift E, N), the shift being where
     frame b shows the block's content relative to frame a, in metres. report(done, total):
     the overlapping pairs measured, counted by the overlap area each samples so that the
-    count moves evenly."""
-    obs = []
+    count moves evenly. jobs: threads matching pairs at once (numpy's FFTs and array work
+    release the GIL); the result is the same for any number."""
     step = block // 2
     windows = [_window(pl, grid) for pl in placed]
     overlaps = []
@@ -495,30 +560,89 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
             if rows.stop - rows.start >= block and cols.stop - cols.start >= block:
                 overlaps.append((a, b, rows, cols))
     area = sum((r.stop - r.start) * (c.stop - c.start) for _, _, r, c in overlaps)
-    sampled, done = 0, 0
+    # each frame is rendered once, over its window, by the first pair that needs it, as the
+    # gradient magnitude that blocks are matched on, and its pairs' overlaps are cut from that;
+    # a render is dropped once all its pairs are measured
+    uses = {}
+    for a, b, _, _ in overlaps:
+        uses[a] = uses.get(a, 0) + 1
+        uses[b] = uses.get(b, 0) + 1
+    renders, lock = {}, threading.Lock()
+
+    def render(k):
+        with lock:
+            fut = renders.get(k)
+            mine = fut is None
+            if mine:
+                fut = renders[k] = Future()
+        if mine:
+            wr, wc = windows[k]
+            try:
+                t, _, valid = _sample(placed[k], grid, wr, wc, bilinear=True)
+                gy, gx = np.gradient(t.astype(np.float64))
+                fut.set_result((wr.start, wc.start, np.sqrt(gy * gy + gx * gx), valid))
+            except BaseException as e:
+                fut.set_exception(e)
+        return fut.result()
+
+    def release(k):
+        with lock:
+            uses[k] -= 1
+            if not uses[k]:
+                del renders[k]
+
+    def cut(k, rows, cols):
+        r0, c0, g, valid = render(k)
+        rs, cs = slice(rows.start - r0, rows.stop - r0), slice(cols.start - c0, cols.stop - c0)
+        return g[rs, cs], valid[rs, cs]
+
+    def measure(pair):
+        a, b, rows, cols = pair
+        try:
+            ga, va = cut(a, rows, cols)
+            gb, vb = cut(b, rows, cols)
+        finally:
+            release(a)
+            release(b)
+        both = va & vb
+        # blocks fully covered by both frames, from a summed-area table of the uncovered pixels
+        gaps = np.zeros((both.shape[0] + 1, both.shape[1] + 1), np.int64)
+        gaps[1:, 1:] = (~both).cumsum(0).cumsum(1)
+        ys = np.arange(0, both.shape[0] - block + 1, step)
+        xs = np.arange(0, both.shape[1] - block + 1, step)
+        y, x = (g.ravel() for g in np.meshgrid(ys, xs, indexing="ij"))
+        full = (gaps[y + block, x + block] - gaps[y, x + block] - gaps[y + block, x] + gaps[y, x]) == 0
+        y, x = y[full], x[full]
+        if not y.size:
+            return None
+        win = np.lib.stride_tricks.sliding_window_view
+        dy, dx, peak = _phase_shift(win(ga, (block, block))[y, x], win(gb, (block, block))[y, x])
+        keep = peak >= min_peak
+        e = grid.e0 + (cols.start + x[keep] + block / 2) * grid.gsd
+        n = grid.n0 - (rows.start + y[keep] + block / 2) * grid.gsd
+        return np.column_stack([np.full(e.size, a), np.full(e.size, b), e, n,
+                                dx[keep] * grid.gsd, -dy[keep] * grid.gsd])
+
+    obs, sampled, done = [], 0, 0
     if report:
         report(0, len(overlaps))
-    for a, b, rows, cols in overlaps:
-        ta, _, va = _sample(placed[a], grid, rows, cols, bilinear=True)
-        tb, _, vb = _sample(placed[b], grid, rows, cols, bilinear=True)
-        both = va & vb
-        for y in range(0, both.shape[0] - block + 1, step):
-            for x in range(0, both.shape[1] - block + 1, step):
-                if not both[y:y + block, x:x + block].all():
-                    continue
-                ga = np.hypot(*np.gradient(ta[y:y + block, x:x + block].astype(np.float64)))
-                gb = np.hypot(*np.gradient(tb[y:y + block, x:x + block].astype(np.float64)))
-                dy, dx, peak = _phase_shift(ga, gb)
-                if peak >= min_peak:
-                    e = grid.e0 + (cols.start + x + block / 2) * grid.gsd
-                    n = grid.n0 - (rows.start + y + block / 2) * grid.gsd
-                    obs.append((a, b, e, n, dx * grid.gsd, -dy * grid.gsd))
-        if report:
-            sampled += (rows.stop - rows.start) * (cols.stop - cols.start)
-            if (now := len(overlaps) * sampled // area) != done:
-                done = now
-                report(done, len(overlaps))
-    return np.array(obs, dtype=np.float64).reshape(-1, 6)
+    jobs = max(1, min(jobs, len(overlaps)))
+    pool = ThreadPoolExecutor(jobs) if jobs > 1 else None
+    try:
+        # the workers take the pairs in order, so renders live about as long as measured one by one
+        results = pool.map(measure, overlaps) if pool else map(measure, overlaps)
+        for (_, _, rows, cols), m in zip(overlaps, results):
+            if m is not None:
+                obs.append(m)
+            if report:
+                sampled += (rows.stop - rows.start) * (cols.stop - cols.start)
+                if (now := len(overlaps) * sampled // area) != done:
+                    done = now
+                    report(done, len(overlaps))
+    finally:
+        if pool:
+            pool.shutdown(cancel_futures=True)
+    return np.concatenate(obs).astype(np.float64) if obs else np.zeros((0, 6))
 
 
 def _summary(obs: np.ndarray, grid: Grid) -> dict:
@@ -545,7 +669,7 @@ OBS_SIGMA_PX = 2.0
 
 
 def _align(frames, placed, grid, ground, zone, north, iterations: int = 3,
-           progress: Callable[..., None] | None = None):
+           progress: Callable[..., None] | None = None, jobs: int = 1):
     """Self-calibrate the flight from its overlaps.
 
     Unknowns: one boresight (camera-body pitch and yaw) for the whole flight, the angle between where the
@@ -573,7 +697,7 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int = 3,
         def report(unit, it=it):
             return ((lambda done, total: progress("align", done, total, unit, round=it + 1, rounds=iterations))
                     if progress else None)
-        obs = _measure_blocks(placed, grid, report=report("pairs"))
+        obs = _measure_blocks(placed, grid, report=report("pairs"), jobs=jobs)
         if it == 0:
             before = _summary(obs, grid)
         if len(obs) < 3:
@@ -619,40 +743,47 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
             moved = dataclasses.replace(pl, r_t=(pl.r_t.T @ _boresight(*d)).T)
             cols.append((_centre_ground(moved) - _centre_ground(pl)) / eps)
         g.append(np.column_stack(cols))
-    blocks = {}
-    for a, b in obs[:, :2]:
-        blocks[(int(a), int(b))] = blocks.get((int(a), int(b)), 0) + 1
-    rows, rhs, pair_w = [], [], []
-    for a, b, e, nn, se, sn in obs:
-        a, b = int(a), int(b)
-        for comp, target in ((0, -se), (1, -sn)):
-            row = np.zeros(3 * n + n_global)
-            for k, sign in ((b, 1.0), (a, -1.0)):
-                ve, vn = e - placed[k].c[0], nn - placed[k].c[1]
-                row[3 * k + comp] = -sign                               # -t
-                row[3 * k + 2] = sign * (vn if comp == 0 else -ve)       # -r perp(v): (r vn, -r ve)
-                row[3 * n:] += sign * g[k][comp]
-            rows.append(row)
-            rhs.append(target)
-            pair_w.append(1 / math.sqrt(blocks[(a, b)]))
-    a_obs, b_obs = np.array(rows), np.array(rhs)
+    # each observation row touches 8 unknowns: [t comp, r] of frames a and b, and the boresight
+    a, b = obs[:, 0].astype(int), obs[:, 1].astype(int)
+    _, pair, count = np.unique(obs[:, :2].astype(int), axis=0, return_inverse=True, return_counts=True)
+    c = np.array([pl.c for pl in placed])
+    g = np.array(g)
+    idx, val, rhs = [], [], []
+    for comp, target in ((0, -obs[:, 4]), (1, -obs[:, 5])):
+        cols, vals = [], []
+        for k, sign in ((b, 1.0), (a, -1.0)):
+            ve, vn = obs[:, 2] - c[k, 0], obs[:, 3] - c[k, 1]
+            cols += [3 * k + comp, 3 * k + 2]
+            vals += [np.full(len(k), -sign), sign * (vn if comp == 0 else -ve)]   # -t, -r perp(v): (r vn, -r ve)
+        cols += [np.full(len(a), 3 * n), np.full(len(a), 3 * n + 1)]
+        vals += list((g[b, comp] - g[a, comp]).T)
+        idx.append(np.column_stack(cols))
+        val.append(np.column_stack(vals))
+        rhs.append(target)
+    idx = np.stack(idx, 1).reshape(-1, 6)                                     # rows in (block, comp) order
+    val = np.stack(val, 1).reshape(-1, 6)
+    b_obs = np.stack(rhs, 1).ravel()
+    pair_w = np.repeat(1 / np.sqrt(count[pair.ravel()]), 2)
+    m = 3 * n + n_global
+    outer = (idx[:, :, None] * m + idx[:, None, :]).ravel()
     prior = np.concatenate([np.tile([1 / PRIOR_SHIFT_M, 1 / PRIOR_SHIFT_M, 1 / math.radians(PRIOR_ROT_DEG)], n),
                             np.full(2, 1 / math.radians(PRIOR_BORESIGHT_DEG))])
     current = np.concatenate([np.column_stack([np.array([pl.shift for pl in placed]),
                                                [pl.rot for pl in placed]]).ravel(), bias])
     sigma = OBS_SIGMA_PX * gsd
     w = np.ones(len(b_obs))
-    x = np.zeros(3 * n + n_global)
-    pair_w = np.array(pair_w)
+    x = np.zeros(m)
     steps = 8
     if report:
         report(0, steps)
     for i in range(steps):
-        ww = w * pair_w / sigma
-        lhs = np.vstack([a_obs * ww[:, None], np.diag(prior)])
-        y = np.concatenate([b_obs * ww, -current * prior])             # priors act on the total correction
-        x = np.linalg.lstsq(lhs, y, rcond=None)[0]
-        r = np.abs(a_obs @ x - b_obs) / sigma
+        ww = (w * pair_w / sigma) ** 2
+        # the normal equations of the weighted rows and the priors, which act on the total correction
+        normal = np.bincount(outer, (ww[:, None, None] * val[:, :, None] * val[:, None, :]).ravel(),
+                             minlength=m * m).reshape(m, m) + np.diag(prior ** 2)
+        y = np.bincount(idx.ravel(), (val * (ww * b_obs)[:, None]).ravel(), minlength=m) - current * prior ** 2
+        x = np.linalg.solve(normal, y)
+        r = np.abs((val * x[idx]).sum(1) - b_obs) / sigma
         w = np.where(r <= 2.0, 1.0, np.sqrt(2.0 / np.maximum(r, 1e-12)))   # Huber, k = 2
         if report:
             report(i + 1, steps)

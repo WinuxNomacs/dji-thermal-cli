@@ -312,3 +312,45 @@ def test_build_without_alignment_reports_no_align_stage(synthetic):
     stages = []
     mosaic.build(frames, align=False, progress=lambda stage, *a, **k: stages.append(stage))
     assert list(dict.fromkeys(stages)) == ["composite", "check"]
+
+
+def test_build_in_several_threads_gives_the_same_mosaic(synthetic):
+    frames, _ = synthetic
+    one = mosaic.build(frames, jobs=1)
+    four = mosaic.build(frames, jobs=4)
+    np.testing.assert_array_equal(one.temperature, four.temperature)
+    assert one.report == four.report
+
+
+
+def test_build_both_gives_the_normalized_and_the_as_converted_mosaic_from_one_layout(synthetic):
+    """build_both gives the normalized mosaic of build(normalize=True), and the other frames
+    composited as they are over the same layout (as build(normalize=False) without alignment);
+    a frame the other set lacks is left out of its mosaic only."""
+    frames, _ = synthetic
+    drift = [0.0, 0.8, -0.8, 0.4, 0.0, -0.4]
+    other = [mosaic.Frame(f.name, f.temperature + np.float32(d), f.pose) for f, d in zip(frames, drift)]
+    for align in (False, True):
+        normalized, converted = mosaic.build_both(frames, other, align=align)
+        alone = mosaic.build(frames, align=align, normalize=True)
+        np.testing.assert_array_equal(normalized.temperature, alone.temperature)
+        assert normalized.report == alone.report
+        assert converted.report["misalignment"] == normalized.report["misalignment"]
+        assert not converted.report["frame_offsets"]["normalized"]
+    normalized, converted = mosaic.build_both(frames, other, align=False)
+    as_built = mosaic.build(other, align=False)
+    np.testing.assert_array_equal(converted.temperature, as_built.temperature)
+    assert converted.frames == as_built.frames
+    _, partial = mosaic.build_both(frames, other[:5], align=False)
+    assert [f["file"] for f in partial.frames] == [f.name for f in frames[:5]]
+
+
+def test_build_both_reports_compositing_both_mosaics_as_one_stage(synthetic):
+    frames, _ = synthetic
+    events = []
+    mosaic.build_both(frames, frames, align=False,
+                      progress=lambda stage, done, total, unit, **extra: events.append((stage, done, total)))
+    assert list(dict.fromkeys(s for s, *_ in events)) == ["composite", "check"]
+    composite = [(d, t) for s, d, t in events if s == "composite"]
+    assert composite[0] == (0, 12) and composite[-1] == (12, 12)
+    assert [d for d, _ in composite] == sorted(d for d, _ in composite)

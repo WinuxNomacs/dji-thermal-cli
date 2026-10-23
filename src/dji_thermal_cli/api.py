@@ -222,7 +222,8 @@ class Event:
     data["rounds"]: the overlapping pairs measured, counted by the area they overlap so the
     count moves evenly, then the solve's reweighting steps, unit "solve steps"),
     "composite" (frames), "check" (pairs, the misalignment report; make_mosaic only) and
-    "write" (files; make_mosaic only). Each stage starts with done = 0. There is no overall
+    "write" (files; make_mosaic only). With make_mosaic's as_converted_dir, "frames",
+    "composite" and "write" count both mosaics. Each stage starts with done = 0. There is no overall
     percentage: the stages' costs vary with the flight.
     """
 
@@ -445,13 +446,21 @@ class MosaicReport:
     unusable: int
     not_thermal: int
     normalize_ambient_c: tuple[float, float] | None   # (ambient, reflected) when normalize set them
+    as_converted: MosaicReport | None = None    # the mosaic written to as_converted_dir
 
 
 def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings: Settings = Settings(),
            options: MosaicOptions = MosaicOptions(), compression: str = "deflate",
-           jobs: int | None = None, progress: ProgressFn | None = None) -> MosaicReport:
+           jobs: int | None = None, progress: ProgressFn | None = None,
+           as_converted_dir: str | os.PathLike | None = None) -> MosaicReport:
     """Stitch a dataset's nadir frames into one georeferenced mosaic in output_dir:
-    mosaic_temp_<unit>.tif (+ .json) per unit and mosaic_preview.png."""
+    mosaic_temp_<unit>.tif (+ .json) per unit and mosaic_preview.png.
+
+    as_converted_dir (with options.normalize): also write the mosaic without the normalization
+    there, from the same layout (alignment and misalignment check), in about the time of one
+    mosaic instead of two; the frames, composite and write stages then count both."""
+    if as_converted_dir is not None and not options.normalize:
+        raise SettingsError("as_converted_dir needs options.normalize")
     root = _existing(path)
     found = _scan(root, progress)
     out = Path(output_dir)
@@ -459,14 +468,49 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
     src_root = root if root.is_dir() else root.parent
     adj = settings.adjustments()
     report = _stages(progress, _build_stages(settings, options, options.normalize, check=True) + ["write"])
+    parts = 1 if as_converted_dir is None else 2
     frames, palettes, counts, overrides, normalized = _mosaic_frames(
-        found, src_root, settings, options, adj, options.normalize, jobs, progress, report)
+        found, src_root, settings, options, adj, options.normalize, jobs, progress, _share(report, "frames", 0, parts))
     if not frames:
         raise MosaicError("No frames to mosaic.", counts)
+    if as_converted_dir is not None:
+        converted, _, converted_counts, _, _ = _mosaic_frames(
+            found, src_root, settings, options, adj, False, jobs, progress, _share(report, "frames", 1, parts))
     try:
-        m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=options.normalize, progress=report)
+        if as_converted_dir is None:
+            m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=options.normalize,
+                              progress=report, jobs=worker_count(jobs, len(frames)))
+        else:
+            m, mc = _mosaic.build_both(frames, converted, gsd=options.gsd, align=options.align, progress=report,
+                                       jobs=worker_count(jobs, len(frames)))
     except ValueError as e:
         raise MosaicError(f"Mosaic failed: {e}", counts) from None
+    result = _write_mosaic(m, out, settings, options, compression, adj, palettes, _share(report, "write", 0, parts),
+                           normalize_ambient_c=normalized, **counts)
+    if as_converted_dir is not None:
+        result.as_converted = _write_mosaic(mc, Path(as_converted_dir), settings, options, compression, adj, palettes,
+                                            _share(report, "write", 1, parts), normalize_ambient_c=None,
+                                            **converted_counts)
+    return result
+
+
+def _share(report, stage: str, part: int, parts: int):
+    """report with stage counted as part (0-based) of parts equal runs of it."""
+    if not report or parts == 1:
+        return report
+
+    def shared(s: str, done: int, total: int, unit: str, **extra) -> None:
+        if s == stage:
+            done, total = done + part * total, parts * total
+        report(s, done, total, unit, **extra)
+
+    return shared
+
+
+def _write_mosaic(m: _mosaic.Mosaic, out: Path, settings: Settings, options: MosaicOptions, compression: str,
+                  adj: adjust.Adjustments, palettes, report, **fields) -> MosaicReport:
+    """Write a built mosaic's GeoTIFFs and preview in out (the "write" stage)."""
+    out.mkdir(parents=True, exist_ok=True)
     m.report["adjustments"] = adjust.describe(adj)
     writes = len(options.units) + 1                     # each unit's GeoTIFF (+ sidecar), then the preview
     if report:
@@ -487,7 +531,7 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
     preview, low, high = _mosaic.write_preview(m, out / "mosaic_preview.png", lut, lo, hi)
     if report:
         report("write", writes, writes, "files")
-    return MosaicReport(m, files, preview, palette_name, (low, high), normalize_ambient_c=normalized, **counts)
+    return MosaicReport(m, files, preview, palette_name, (low, high), **fields)
 
 
 @dataclasses.dataclass
@@ -530,7 +574,7 @@ def normalization(path: str | os.PathLike, settings: Settings = Settings(), opti
         raise MosaicError("No frames to compare for normalization.", counts)
     try:
         m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=False, check_misalignment=False,
-                          progress=report)
+                          progress=report, jobs=worker_count(jobs, len(frames)))
     except ValueError as e:
         raise MosaicError(f"Normalization failed: {e}", counts) from None
     offsets = {src_root / row["file"]: float(row["temperature_offset_c"]) for row in m.frames}
@@ -626,7 +670,8 @@ def _scan(path, progress: ProgressFn | None) -> dataset.Scan:
 
 
 def worker_count(requested: int | None, n_jobs: int) -> int:
-    """Worker processes for n_jobs files: requested, else min(CPU count, 8); at least 1."""
+    """Workers for n_jobs items (processes for files, threads for the mosaic's matching):
+    requested, else min(CPU count, 8); at least 1."""
     n = requested if requested else min(os.cpu_count() or 1, DEFAULT_MAX_WORKERS)
     return max(1, min(n, n_jobs))
 
