@@ -663,7 +663,7 @@ def _summary(obs: np.ndarray, grid: Grid) -> dict:
 # --- alignment (level 2) -----------------------------------------------------------------
 
 PRIOR_SHIFT_M = 0.15            # per-frame placement error expected from RTK + gimbal attitude
-PRIOR_ROT_DEG = 1.0
+PRIOR_ROT_DEG = 0.25            # tight: looser, frame rotations absorb roof parallax and bend straight edges
 PRIOR_BORESIGHT_DEG = 3.0
 OBS_SIGMA_PX = 2.0
 
