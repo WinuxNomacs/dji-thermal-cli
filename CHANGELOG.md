@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-23
+
 - The mosaic projects its frames onto the heights it estimates from the parallax between
   overlapping frames, anchored to the rangefinder, instead of a flat ground plane
   (`--mosaic-heights auto`, the default; `plane` keeps the old projection). Roofs and trees
@@ -83,7 +85,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/WinuxNomacs/dji-thermal-cli/releases/tag/v1.0.0
