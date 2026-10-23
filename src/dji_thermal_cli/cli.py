@@ -177,6 +177,8 @@ def _build_parser() -> argparse.ArgumentParser:
     proc.add_argument("--mosaic-align", action=argparse.BooleanOptionalAction, default=True, help="Correct the frames' placement from their overlaps before compositing: a flight-wide camera boresight plus a small shift and rotation per frame (default: on)")
     proc.add_argument("--mosaic-normalize", action="store_true", help="Make the frames' temperatures consistent before compositing: measure every frame with the flight's median embedded ambient/reflected temperature (unless --ambient-temp/--reflected-temp are given), then remove each frame's offset against its overlapping neighbours (camera drift between shutter recalibrations). Changes the measured values; the offsets are always reported")
     proc.add_argument("--mosaic-unit", action="append", type=_units, dest="mosaic_units", metavar="UNIT[,UNIT]", help="Temperature unit(s) of the mosaic, C, F and/or K; repeat or comma-separate for one mosaic_temp_<unit>.tif each (default: C)")
+    proc.add_argument("--mosaic-heights", choices=("auto", "plane"), default="auto", help="Surface the frames are projected onto: auto = heights estimated from the frames' parallax on a grid of cells, anchored to the rangefinder, written to mosaic_heights.tif (the plane when too little overlaps); plane = a horizontal ground plane (default: %(default)s)")
+    proc.add_argument("--mosaic-height-cell", type=int, default=mosaic.HEIGHT_CELL_PX, metavar="PIXELS", help="Size of the height cells, in mosaic pixels (default: %(default)d)")
     proc.add_argument("--mosaic-gsd", type=float, default=None, metavar="METRES", help="Mosaic pixel size (default: the frames' median ground sample distance)")
     proc.add_argument("--compression", choices=outputs.COMPRESSIONS, default="deflate", help="TIFF/EXR compression: deflate = lossless Deflate (EXR: ZIP), the default; none = uncompressed. PNG is always compressed")
     proc.add_argument("--jobs", "-j", type=_positive_int, default=None, help="Worker processes, and the mosaic's matching threads (default: min(CPU count, 8); 1 = in this process)")
@@ -218,6 +220,7 @@ _FLAGS = {"replace_above_value": "--replace-above-value", "replace_below_value":
           "replace_above": "--replace-above", "replace_below": "--replace-below", "reflected_temp": "--reflected-temp",
           "ambient_temp": "--ambient-temp", "range_min": "--range-min", "range_max": "--range-max",
           "unit": "--input-unit", "units": "--mosaic-unit", "gsd": "--mosaic-gsd", "palette": "--palette",
+          "heights": "--mosaic-heights", "height_cell": "--mosaic-height-cell",
           "distance": "--distance"}
 
 
@@ -321,6 +324,7 @@ def _cmd_process(args: argparse.Namespace) -> None:
     try:
         options = api.MosaicOptions(max_pitch=args.mosaic_max_pitch, align=args.mosaic_align,
                                     normalize=args.mosaic_normalize, gsd=args.mosaic_gsd,
+                                    heights=args.mosaic_heights, height_cell=args.mosaic_height_cell,
                                     units=tuple(u for group in (args.mosaic_units or [["C"]]) for u in group))
     except api.SettingsError as e:
         _fail(e)
@@ -393,6 +397,10 @@ def _print_mosaic(rep: api.MosaicReport, settings: api.Settings, max_pitch: floa
     span = "--range-min/--range-max" if settings.range_min is not None else "2nd-98th percentile"
     low, high = rep.preview_range_c
     print(f"  {rep.preview}  ({rep.palette}, {low:.1f} to {high:.1f} C, {span})")
+    if rep.heights:
+        hr = r["alignment"]["heights"]
+        low_h, high_h = hr["range_m"]
+        print(f"  {rep.heights}  ({hr['cell_m'] * 100:.0f} cm cells, {low_h:+.1f} to {high_h:+.1f} m above the ground plane)")
     ground = f"from the {m.ground_alt_source}" if settings.strip_location else f"{m.ground_alt:.2f} m ({m.ground_alt_source})"
     print(f"  ground plane {ground}; {r['frames_contributing']}/{r['frames_used']} frames contribute")
     seams, mis, ali = r["radiometric_seams"], r["misalignment"], r["alignment"]

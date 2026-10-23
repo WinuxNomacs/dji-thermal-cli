@@ -3,9 +3,12 @@ temperature field, GeoTIFF tags, and the command line."""
 
 from __future__ import annotations
 
+import collections
+import dataclasses
 import io
 import json
 import math
+import re
 
 import numpy as np
 import pytest
@@ -47,8 +50,10 @@ def _field(e, n):
     return t.astype(np.float32)
 
 
-def _frame(name, east_m, north_m, yaw, roll=0.0, alt=21.0, size=(320, 256), focal=500.0):
-    """A synthetic nadir frame seeing _field, from local offsets around LAT/LON."""
+def _frame(name, east_m, north_m, yaw, roll=0.0, alt=21.0, size=(320, 256), focal=500.0, surface=None):
+    """A synthetic nadir frame seeing _field, from local offsets around LAT/LON; on the ground
+    plane, or on surface(e, n) (the height above it, crossed once by each ray), whose height
+    under the frame's centre is what the rangefinder reports."""
     w, h = size
     lat = LAT + north_m / 111132.0
     lon = LON + east_m / (111320.0 * math.cos(math.radians(LAT)))
@@ -58,9 +63,21 @@ def _frame(name, east_m, north_m, yaw, roll=0.0, alt=21.0, size=(320, 256), foca
     r = mosaic.rotation(yaw, -90.0, roll)
     u, v = np.meshgrid(np.arange(w), np.arange(h))
     rays = np.tensordot(r, np.stack([np.ones((h, w)), (u - (w - 1) / 2) / focal, (v - (h - 1) / 2) / focal]), 1)
+    def ground(t):
+        return c[:, None, None] + np.tensordot(j, np.stack([rays[1] * t, rays[0] * t]), 1)
+
     t = alt / rays[2]
-    e, n = c[:, None, None] + np.tensordot(j, np.stack([rays[1] * t, rays[0] * t]), 1)
-    pose = mosaic.Pose(lat, lon, GROUND + alt, yaw, -90.0, roll, focal, w, h, GROUND, None, {})
+    lrf = GROUND
+    if surface is not None:                  # bisect along each ray for where it meets the surface
+        lo, hi = np.zeros_like(t), t
+        for _ in range(40):
+            mid = (lo + hi) / 2
+            above = alt - mid * rays[2] > surface(*ground(mid))
+            lo, hi = np.where(above, mid, lo), np.where(above, hi, mid)
+        t = (lo + hi) / 2
+        lrf = GROUND + float(surface(*c))
+    e, n = ground(t)
+    pose = mosaic.Pose(lat, lon, GROUND + alt, yaw, -90.0, roll, focal, w, h, lrf, None, {})
     return mosaic.Frame(name, _field(e, n), pose)
 
 
@@ -124,6 +141,33 @@ def test_geotiff(synthetic, tmp_path):
         np.testing.assert_array_equal(page.asarray()[..., 0], m.temperature)
     info = json.loads(sidecar.read_text())
     assert [f["file"] for f in info["frames"]] == [f"f{i}" for i in range(6)]
+
+
+def test_heights_geotiff_holds_the_surface_altitudes_on_its_cells(synthetic, tmp_path):
+    _, m = synthetic
+    assert mosaic.write_heights(m, tmp_path / "plane.tif") is None and not (tmp_path / "plane.tif").exists()
+    g, step = m.grid, 8
+    rows, cols = -(-g.height // step), -(-g.width // step)
+    z = np.arange(rows * cols, dtype=float).reshape(rows, cols) / 10
+    temperature = m.temperature.copy()
+    temperature[:step, :step] = np.nan              # a cell no frame covers
+    m = dataclasses.replace(m, temperature=temperature, heights=mosaic.Heights(g.e0, g.n0, step * g.gsd, z),
+                            report={**m.report, "alignment": {"heights": {"method": "parallax", "cell_m": step * g.gsd}}})
+    tif = mosaic.write_heights(m, tmp_path / "mosaic_heights.tif")
+    with tifffile.TiffFile(tif) as tf:
+        page = tf.pages[0]
+        got = page.asarray()
+        assert got.dtype == np.float32 and got.shape == (rows, cols)
+        assert tf.geotiff_metadata["ProjectedCSTypeGeoKey"] == 32616
+        assert page.tags["ModelPixelScaleTag"].value[:2] == (step * g.gsd, step * g.gsd)
+        assert page.tags["ModelTiepointTag"].value[3:5] == (g.e0, g.n0)
+        assert "altitude_m" in page.tags["GDAL_METADATA"].value and "parallax" in page.tags["GDAL_METADATA"].value
+    covered = np.isfinite(got)
+    assert not covered[0, 0] and covered.sum() > 1
+    np.testing.assert_allclose(got[covered], (z + m.ground_alt)[covered], atol=1e-3)
+    with tifffile.TiffFile(mosaic.write_heights(m, tmp_path / "unlocated.tif", located=False)) as tf:
+        assert "ModelTiepointTag" not in tf.pages[0].tags
+        np.testing.assert_allclose(tf.pages[0].asarray()[covered], z[covered], atol=1e-6)
 
 
 @pytest.mark.parametrize("unit, band, convert", [("F", "temperature_f", lambda c: c * 9 / 5 + 32),
@@ -221,14 +265,20 @@ def test_flight(tmp_path):
     assert proc.returncode == 0, proc.stderr
     nadir, oblique = flight_counts()
     assert f"Mosaic: {nadir} nadir frames, {oblique} oblique left out" in proc.stdout
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["mosaic_preview.png", "mosaic_temp_c.json", "mosaic_temp_c.tif"]
+    names = ["mosaic_heights.tif", "mosaic_preview.png", "mosaic_temp_c.json", "mosaic_temp_c.tif"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == names
     assert "mosaic_preview.png  (ironred, " in proc.stdout
+    assert re.search(r"mosaic_heights\.tif  \(\d+ cm cells, [+-]\d+\.\d to [+-]\d+\.\d m above the ground plane\)", proc.stdout)
     with Image.open(tmp_path / "mosaic_preview.png") as im:
         assert im.mode == "RGBA"
     steps = [line for line in proc.stderr.splitlines() if line.startswith("Mosaic step ")]
     assert steps[0] == f"Mosaic step 1 of 5: reading frames, {len(api.scan(flight_dir()).jpegs)} files"
-    assert steps[-1] == "Mosaic step 5 of 5: writing, 2 files"
-    assert sum("aligning (round" in line for line in steps) == 6     # pairs, then solve steps, for 3 rounds
+    assert steps[-1] == "Mosaic step 5 of 5: writing, 3 files"
+    rounds = collections.Counter(re.search(r"aligning \(round (\d+)/(\d+)\)", line).groups()
+                                 for line in steps if "aligning (round" in line)
+    assert rounds and set(rounds.values()) == {2}     # pairs, then solve steps, for each round
+    for total in {t for _, t in rounds}:     # 4 rounds with heights, 3 more on the plane if they fall back
+        assert {int(r) for r, t in rounds if t == total} == set(range(1, int(total) + 1))
 
 
 @pytest.mark.flight
@@ -271,6 +321,58 @@ def test_alignment_recovers_boresight(monkeypatch):
     assert field_error(aligned) < 0.25 * field_error(plain)
 
 
+def test_alignment_recovers_a_roof_from_parallax():
+    """M4T-sized frames over a 2.5 m high, 8 m wide block: on the ground plane the roof's parallax
+    misaligns them; with heights, alignment finds the block's height from that parallax,
+    the ground around it stays near the plane, and the frames line up on both."""
+    zone, north = geo.utm_zone(LAT, LON)
+    centre = np.array(geo.utm(LAT - 5.0 / 111132.0, LON + 5.0 / (111320.0 * math.cos(math.radians(LAT))), zone, north))
+
+    def roof(e, n):
+        def edge(x):
+            return 0.5 * (np.tanh((x + 4.0) / 0.5) - np.tanh((x - 4.0) / 0.5))
+        return 2.5 * edge(e - centre[0]) * edge(n - centre[1])
+
+    frames = [_frame(f"f{i}", 5.0 * (i % 3), -5.0 * (i // 3), yaw=5.4 if (i // 3) % 2 == 0 else -174.6,
+                     roll=180.0, size=(640, 512), surface=roof) for i in range(9)]
+    plane = mosaic.build(frames, heights="plane")
+    m = mosaic.build(frames)
+    h = m.report["alignment"]["heights"]
+    assert plane.heights is None and plane.report["alignment"]["heights"] == {"method": "plane", "reason": "not asked for"}
+    assert h["method"].startswith("parallax") and h["anchors"] == 9
+    on_roof, beside = m.heights.at_points(centre[0] + np.array([-1.0, 9.0]), centre[1] + np.array([1.0, 9.0]))
+    assert on_roof == pytest.approx(2.5, abs=0.5)
+    assert abs(beside) < 0.4
+    assert m.report["misalignment"]["median_m"] < 0.5 * plane.report["misalignment"]["median_m"]
+
+
+def test_heights_interpolate_bilinearly_between_cell_centres():
+    """Heights.at and point_weights agree, give each cell's value at its centre, interpolate
+    between centres, and hold the edge value beyond the outer centres."""
+    hs = mosaic.Heights(100.0, 200.0, 2.0, np.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]))
+    e = np.array([101.0, 102.0, 103.0, 99.0, 108.0])     # centres at E 101, 103, 105
+    n = np.array([199.0, 198.0, 197.0, 201.0, 190.0])    # centres at N 199, 197
+    np.testing.assert_allclose(hs.at_points(e, n), [0.0, 2.0, 4.0, 0.0, 5.0])
+    idx, w = hs.point_weights(e, n)
+    np.testing.assert_allclose((hs.z.ravel()[idx] * w).sum(1), hs.at_points(e, n))
+    np.testing.assert_allclose(w.sum(1), 1.0)
+    np.testing.assert_allclose(hs.at(np.array([101.0, 104.0]), np.array([199.0, 198.0])), [[0.0, 1.5], [1.5, 3.0]])
+
+
+def test_conjugate_gradients_solve_the_normal_equations_as_the_dense_solver_does():
+    rng = np.random.default_rng(3)
+    m, rows = 60, 400
+    idx = rng.integers(0, m, (rows, 4))
+    val = rng.normal(size=(rows, 4))
+    ww = rng.uniform(0.2, 2.0, rows)
+    diag = np.full(m, 0.01)
+    y = rng.normal(size=m)
+    a = np.zeros((rows, m))
+    np.add.at(a, (np.repeat(np.arange(rows), 4), idx.ravel()), val.ravel())
+    dense = np.linalg.solve(a.T @ (ww[:, None] * a) + np.diag(diag), y)
+    assert np.allclose(mosaic._cg(idx, val, ww, diag, y, np.zeros(m)), dense, atol=1e-6)
+
+
 def test_frame_offsets_normalize(synthetic):
     """Frames read 0.8 C warm or cold (camera drift between shutter recalibrations): the
     offsets are found, and --mosaic-normalize removes them."""
@@ -295,8 +397,8 @@ def test_build_reports_each_stage_counting_up_to_its_total(synthetic):
     for stage, unit, done, total, extra in events:
         runs.setdefault((stage, unit, extra.get("round")), []).append((done, total))
     assert list(dict.fromkeys(s for s, *_ in events)) == ["align", "composite", "check"]
-    assert {r for s, _, r in runs if s == "align"} == {1, 2, 3}
-    assert all(extra == {"round": extra["round"], "rounds": 3} for s, *_, extra in events if s == "align")
+    assert {r for s, _, r in runs if s == "align"} == {1, 2, 3, 4}
+    assert all(extra == {"round": extra["round"], "rounds": 4} for s, *_, extra in events if s == "align")
     assert runs[("composite", "frames", None)][-1] == (6, 6)
     assert runs[("align", "solve steps", 1)] == [(i, 8) for i in range(9)]
     for counts in runs.values():

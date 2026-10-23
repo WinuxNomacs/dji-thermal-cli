@@ -39,6 +39,7 @@ from . import djixmp, files, geo, tiffout, tsdk, units
 
 FULL_FRAME_DIAGONAL_MM = math.hypot(36.0, 24.0)
 DEFAULT_MAX_PITCH = -80.0
+HEIGHT_CELL_PX = 64             # the cell of the surface heights (see _align), in mosaic pixels
 
 # Thermal sensors by EXIF Model: (native width in pixels, pixel pitch in mm), from DJI's spec
 # pages (enterprise.dji.com/<product>/specs; XT S: its spec sheet). Super-resolution images
@@ -170,10 +171,14 @@ class _Placed:
     footprint: np.ndarray       # (k, 2) UTM outline, before the correction
     shift: np.ndarray = dataclasses.field(default_factory=lambda: np.zeros(2))
     rot: float = 0.0            # radians
+    heights: Heights | None = None      # the surface the frame is projected onto (None: the plane)
 
     def corrected_footprint(self) -> np.ndarray:
-        d = self.footprint - self.c
-        return self.footprint - self.shift - self.rot * np.column_stack([-d[:, 1], d[:, 0]])
+        fp = self.footprint
+        if self.heights is not None and (low := float(self.heights.z.min())) < 0:
+            fp = self.c + (fp - self.c) * self.h / (self.h - low)    # rays reach further below the plane
+        d = fp - self.c
+        return fp - self.shift - self.rot * np.column_stack([-d[:, 1], d[:, 0]])
 
 
 def _boresight(pitch: float, yaw: float) -> np.ndarray:
@@ -226,6 +231,59 @@ class Grid:
         return geo.epsg(self.zone, self.north)
 
 
+@dataclasses.dataclass(frozen=True)
+class Heights:
+    """The surface above (or below) the ground plane, z metres, on a north-up UTM grid of cells:
+    z[i, j] is the height at the cell centre (e0 + (j + 0.5) cell, n0 - (i + 0.5) cell),
+    interpolated bilinearly between centres and held constant beyond the outer ones."""
+    e0: float
+    n0: float
+    cell: float
+    z: np.ndarray               # (rows, cols) float64
+
+    @classmethod
+    def flat(cls, grid: Grid, cell: float) -> Heights:
+        """Zero over the cells covering grid."""
+        return cls(grid.e0, grid.n0, cell, np.zeros((max(1, math.ceil(grid.height * grid.gsd / cell)),
+                                                     max(1, math.ceil(grid.width * grid.gsd / cell)))))
+
+    def _weights(self, coord: np.ndarray, axis: int):
+        """For 1-D coordinates along an axis (0: north, rows; 1: east, columns): the lower cell
+        index and the weight of the upper one."""
+        count = self.z.shape[axis]
+        f = ((coord - self.e0) if axis else (self.n0 - coord)) / self.cell - 0.5
+        f = np.clip(f, 0, count - 1)
+        i0 = np.minimum(np.floor(f), max(count - 2, 0)).astype(np.intp)
+        return i0, f - i0 if count > 1 else np.zeros_like(f)
+
+    def _matrix(self, coord: np.ndarray, axis: int) -> np.ndarray:
+        i0, w = self._weights(coord, axis)
+        m = np.zeros((coord.size, self.z.shape[axis]))
+        at = np.arange(coord.size)
+        m[at, i0] = 1 - w
+        m[at, np.minimum(i0 + 1, self.z.shape[axis] - 1)] += w
+        return m
+
+    def at(self, e: np.ndarray, n: np.ndarray) -> np.ndarray:
+        """The heights at every (n[i], e[j]) for 1-D e and n: an (n.size, e.size) array."""
+        return self._matrix(n, 0) @ self.z @ self._matrix(e, 1).T
+
+    def point_weights(self, e: np.ndarray, n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """For points (e[k], n[k]): the 4 cells (flat indices) their height interpolates and the
+        weights, each (k, 4)."""
+        i0, wi = self._weights(n, 0)
+        j0, wj = self._weights(e, 1)
+        rows, cols = self.z.shape
+        i1, j1 = np.minimum(i0 + 1, rows - 1), np.minimum(j0 + 1, cols - 1)
+        idx = np.column_stack([i0 * cols + j0, i0 * cols + j1, i1 * cols + j0, i1 * cols + j1])
+        w = np.column_stack([(1 - wi) * (1 - wj), (1 - wi) * wj, wi * (1 - wj), wi * wj])
+        return idx, w
+
+    def at_points(self, e: np.ndarray, n: np.ndarray) -> np.ndarray:
+        idx, w = self.point_weights(e, n)
+        return (self.z.ravel()[idx] * w).sum(1)
+
+
 def _sample(pl: _Placed, grid: Grid, rows: slice, cols: slice, bilinear: bool = False):
     """For grid pixels in rows x cols: (temperature, off-nadir angle in degrees, valid mask).
     Nearest neighbour, so mosaic values are the frames' own; bilinear is for measuring
@@ -239,14 +297,17 @@ def _sample(pl: _Placed, grid: Grid, rows: slice, cols: slice, bilinear: bool = 
         de, dn = de + pl.shift[0] - pl.rot * dn, dn + pl.shift[1] + pl.rot * de
     east = pl.j_inv[0, 0] * de + pl.j_inv[0, 1] * dn
     north = pl.j_inv[1, 0] * de + pl.j_inv[1, 1] * dn
+    # the camera's height over the surface at each point (taken where the point is in the
+    # mosaic, before the correction)
+    hz = pl.h if pl.heights is None else np.maximum(pl.h - pl.heights.at(e, n), 0.1)
     rt = pl.r_t
-    fwd = rt[0, 0] * north + rt[0, 1] * east + rt[0, 2] * pl.h
-    right = rt[1, 0] * north + rt[1, 1] * east + rt[1, 2] * pl.h
-    down = rt[2, 0] * north + rt[2, 1] * east + rt[2, 2] * pl.h
+    fwd = rt[0, 0] * north + rt[0, 1] * east + rt[0, 2] * hz
+    right = rt[1, 0] * north + rt[1, 1] * east + rt[1, 2] * hz
+    down = rt[2, 0] * north + rt[2, 1] * east + rt[2, 2] * hz
     with np.errstate(divide="ignore", invalid="ignore"):
         uf = pl.cx + p.focal_px * right / fwd
         vf = pl.cy + p.focal_px * down / fwd
-    angle = np.degrees(np.arctan2(np.hypot(east, north), pl.h)).astype(np.float32)
+    angle = np.degrees(np.arctan2(np.hypot(east, north), hz)).astype(np.float32)
     temperature = pl.frame.temperature
     if bilinear:
         valid = (fwd > 0) & (uf >= 0) & (uf <= p.width - 1) & (vf >= 0) & (vf <= p.height - 1)
@@ -283,6 +344,7 @@ class Mosaic:
     ground_alt: float
     ground_alt_source: str
     report: dict
+    heights: Heights | None = None      # the surface the frames were projected onto (None: the plane)
 
 
 def _grid(placed: list[_Placed], gsd: float, zone: int, north: bool) -> Grid:
@@ -295,14 +357,17 @@ def _grid(placed: list[_Placed], gsd: float, zone: int, north: bool) -> Grid:
 
 def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | None = None,
           check_misalignment: bool = True, align: bool = True, normalize: bool = False,
-          progress: Callable[..., None] | None = None, jobs: int = 1) -> Mosaic:
-    """Composite the frames (all assumed to look down at the same ground plane). align:
-    first correct the frames' placement from their overlaps (see _align). normalize:
+          progress: Callable[..., None] | None = None, jobs: int = 1, heights: str = "auto",
+          height_cell: int = HEIGHT_CELL_PX) -> Mosaic:
+    """Composite the frames, projected onto the ground plane. align: first correct the
+    frames' placement from their overlaps (see _align), and with heights="auto" estimate the
+    surface's heights above the plane (roofs, trees) on cells height_cell pixels wide and
+    project onto that instead ("plane": the plane only). normalize:
     remove each frame's temperature offset against its neighbours (see _frame_offsets).
     progress: called as progress(stage, done, total, unit, **extra) as the "align",
     "composite" and "check" stages go (see api.Event); it doesn't change the result. jobs:
     threads matching overlaps (see _measure_blocks); nor does it."""
-    layout = _layout(frames, gsd, ground_alt, align, progress, jobs)
+    layout = _layout(frames, gsd, ground_alt, align, progress, jobs, heights, height_cell)
     composite = _reporter(progress, "composite", "frames")
     if composite:
         composite(0, len(layout.placed))
@@ -313,12 +378,13 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
 
 def build_both(frames: list[Frame], as_converted: list[Frame], gsd: float | None = None,
                ground_alt: float | None = None, check_misalignment: bool = True, align: bool = True,
-               progress: Callable[..., None] | None = None, jobs: int = 1) -> tuple[Mosaic, Mosaic]:
+               progress: Callable[..., None] | None = None, jobs: int = 1, heights: str = "auto",
+               height_cell: int = HEIGHT_CELL_PX) -> tuple[Mosaic, Mosaic]:
     """The normalized mosaic of frames (as build(normalize=True)) and the mosaic of the same
     frames measured another way (as_converted, matched by name), laid out once: the second
     gets the first's placement, alignment and misalignment check, and only its compositing
     is its own (a frame missing from as_converted is left out of it)."""
-    layout = _layout(frames, gsd, ground_alt, align, progress, jobs)
+    layout = _layout(frames, gsd, ground_alt, align, progress, jobs, heights, height_cell)
     by_name = {f.name: f for f in as_converted}
     other = [dataclasses.replace(pl, frame=by_name[pl.frame.name]) for pl in layout.placed
              if pl.frame.name in by_name]
@@ -341,13 +407,14 @@ class _Layout:
     alignment: dict | None
     ground_alt: float
     ground_source: str
+    heights: Heights | None = None
 
 
 def _reporter(progress, stage, unit, **extra):
     return (lambda done, total: progress(stage, done, total, unit, **extra)) if progress else None
 
 
-def _layout(frames, gsd, ground_alt, align, progress, jobs) -> _Layout:
+def _layout(frames, gsd, ground_alt, align, progress, jobs, heights="auto", height_cell=HEIGHT_CELL_PX) -> _Layout:
     """The frames placed over the ground plane (and aligned) and the grid they cover."""
     if not frames:
         raise ValueError("no frames to mosaic")
@@ -376,11 +443,12 @@ def _layout(frames, gsd, ground_alt, align, progress, jobs) -> _Layout:
         gsd = max(round(gsd, 3), 0.001)
     grid = _grid(placed, gsd, zone, north)
 
-    alignment = None
+    alignment = surface = None
     if align:
-        placed, alignment = _align(frames, placed, grid, ground_alt, zone, north, progress=progress, jobs=jobs)
+        placed, surface, alignment = _align(frames, placed, grid, ground_alt, zone, north, progress=progress,
+                                            jobs=jobs, heights=heights, height_cell=height_cell)
         grid = _grid(placed, gsd, zone, north)
-    return _Layout(placed, dropped, grid, alignment, ground_alt, ground_source)
+    return _Layout(placed, dropped, grid, alignment, ground_alt, ground_source, surface)
 
 
 def _check(layout: _Layout, check_misalignment: bool, progress, jobs) -> dict | None:
@@ -455,7 +523,7 @@ def _composite(layout: _Layout, placed: list[_Placed], normalize: bool, composit
     return Mosaic(
         grid, temp, np.where(covered, source, np.nan).astype(np.float32),
         np.where(covered, best_angle, np.nan).astype(np.float32), table, layout.ground_alt, layout.ground_source,
-        report,
+        report, layout.heights,
     )
 
 
@@ -666,30 +734,49 @@ PRIOR_SHIFT_M = 0.15            # per-frame placement error expected from RTK + 
 PRIOR_ROT_DEG = 0.25            # tight: looser, frame rotations absorb roof parallax and bend straight edges
 PRIOR_BORESIGHT_DEG = 3.0
 OBS_SIGMA_PX = 2.0
+HEIGHT_SMOOTH_M = 0.5           # expected height difference between neighbouring cells (robust: edges)
+HEIGHT_ANCHOR_M = 0.3           # rangefinder target altitude error
+HEIGHT_PRIOR_M = 5.0            # weak pull of unobserved cells to the plane
 
 
-def _align(frames, placed, grid, ground, zone, north, iterations: int = 3,
-           progress: Callable[..., None] | None = None, jobs: int = 1):
+def _align(frames, placed, grid, ground, zone, north, iterations: int | None = None,
+           progress: Callable[..., None] | None = None, jobs: int = 1, heights: str = "auto",
+           height_cell: int = HEIGHT_CELL_PX):
     """Self-calibrate the flight from its overlaps.
 
     Unknowns: one boresight (camera-body pitch and yaw) for the whole flight, the angle between where the
     gimbal says the camera points and where it does (its ground effect flips with heading,
-    which makes it observable), and for each frame a small shift and rotation on the ground
-    plane. Observations: the block offsets between overlapping frames. Each frame's
-    correction is held near zero by a prior (the RTK position and gimbal attitude are good),
-    and a robust (Huber) weighting stops blocks dominated by roofs or trees, whose offsets
-    are parallax, from pulling the ground out of line. A pair's blocks are strongly
-    correlated, so each pair counts about as one observation (block weight 1/sqrt(blocks)).
-    Solved by iteratively reweighted linear least squares, re-measuring the offsets after
-    each round. (On a 21 m M4T flight, fitting half of the overlapping pairs cut the other
-    half's median offset from 0.37 m to 0.12 m.)
+    which makes it observable), for each frame a small shift and rotation on the ground
+    plane, and (heights="auto") the height of the surface above the plane on a grid of cells
+    height_cell mosaic pixels wide, from the parallax between frames seeing it from different
+    places. Observations: the block offsets between overlapping frames, and the rangefinder's
+    target altitudes. Each frame's correction is held near zero by a prior (the RTK position
+    and gimbal attitude are good), and a robust (Huber) weighting stops blocks the model
+    can't explain (moving things, trees) from pulling the rest out of line. A pair's blocks
+    are strongly correlated, so each pair counts about as one observation (block weight
+    1/sqrt(blocks)). Solved by iteratively reweighted linear least squares, re-measuring the
+    offsets after each round (iterations: 4 with heights, 3 without). (On a 21 m M4T
+    flight, fitting half of the overlapping pairs cut the other half's median offset from
+    0.37 m to 0.12 m.) When the heights can't be estimated (too few cells seen by two
+    frames, or a surface reaching the cameras) the flight is aligned on the plane instead,
+    and the report says why.
     progress: as build's, for the "align" stage: per round, the pairs measured, then the
     solve's reweighting steps.
+    Returns the placed frames, their heights (None on the plane) and the report.
     """
+    if heights not in ("auto", "plane"):
+        raise ValueError(f"heights must be 'auto' or 'plane', not {heights!r}")
+    use_heights = heights == "auto"
+    if iterations is None:
+        iterations = 4 if use_heights else 3
     by_name = {f.name: f for f in frames}
+    n = len(placed)
     bias = np.zeros(2)
-    shifts = np.zeros((len(placed), 2))
-    rots = np.zeros(len(placed))
+    shifts = np.zeros((n, 2))
+    rots = np.zeros(n)
+    surface = Heights.flat(grid, height_cell * grid.gsd) if use_heights else None
+    observed = None
+    failed = None
     before = None
     obs = np.zeros((0, 6))
     inliers = 1.0
@@ -702,16 +789,45 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int = 3,
             before = _summary(obs, grid)
         if len(obs) < 3:
             break
-        step, inliers = _solve(placed, obs, grid.gsd, bias, report("solve steps"))
-        n = len(placed)
-        bias += step[3 * n:]
+        step, inliers, observed = _solve(placed, obs, grid.gsd, bias, report("solve steps"), surface,
+                                         _anchors(placed, ground) if use_heights else None)
+        if not np.isfinite(step).all():
+            failed = "the solve diverged"
+            break
+        bias += step[3 * n:3 * n + 2]
         shifts += step[:3 * n].reshape(n, 3)[:, :2]
         rots += step[:3 * n].reshape(n, 3)[:, 2]
+        if surface is not None:
+            surface = dataclasses.replace(surface, z=surface.z + step[3 * n + 2:].reshape(surface.z.shape))
         replaced = [_place(by_name[pl.frame.name], ground, zone, north, tuple(bias)) for pl in placed]
         for k, pl in enumerate(replaced):
-            pl.shift, pl.rot = shifts[k].copy(), float(rots[k])
+            pl.shift, pl.rot, pl.heights = shifts[k].copy(), float(rots[k]), surface
         placed = replaced
-    return placed, {
+
+    heights_report = None
+    if use_heights:
+        seen = observed > 0.5 if observed is not None else np.zeros(surface.z.size, bool)
+        if failed is None and seen.sum() < 4:
+            failed = f"{int(seen.sum())} height cells seen by two frames (4 needed)"
+        if failed is None and surface.z.max() >= min(pl.h for pl in placed) - 1:
+            failed = f"the surface reaches {surface.z.max():.1f} m above the plane, within 1 m of a camera"
+        if failed:
+            placed = [_place(by_name[pl.frame.name], ground, zone, north) for pl in placed]
+            placed, _, result = _align(frames, placed, grid, ground, zone, north, progress=progress, jobs=jobs,
+                                       heights="plane")
+            result["heights"] = {"method": "plane", "reason": failed}
+            return placed, None, result
+        anchors = _anchors(placed, ground)
+        z_seen = surface.z.ravel()[seen]
+        heights_report = {
+            "method": "parallax between overlapping frames, anchored to the rangefinder",
+            "cell_m": round(surface.cell, 3), "cells": int(surface.z.size), "observed_cells": int(seen.sum()),
+            "range_m": [round(float(z_seen.min()), 2) + 0.0, round(float(z_seen.max()), 2) + 0.0],
+            "anchors": len(anchors),
+            "anchor_residual_m": (round(float(np.median(np.abs(surface.at_points(anchors[:, 0], anchors[:, 1])
+                                                               - anchors[:, 2]))), 3) if len(anchors) else None),
+        }
+    result = {
         "method": "boresight + per-frame ground shift/rotation from overlap offsets (robust least squares)",
         "boresight_deg": {"pitch": round(math.degrees(bias[0]), 3), "yaw": round(math.degrees(bias[1]), 3)},
         "frame_shift_m": {"median": round(float(np.median(np.linalg.norm(shifts, axis=1))), 3),
@@ -720,17 +836,44 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int = 3,
                                "max": round(float(np.degrees(np.abs(rots).max())), 3)},
         "observations": len(obs), "inlier_fraction": round(float(inliers), 3),
         "before": {k: v for k, v in (before or {}).items() if k != "pairs_detail"},
+        "heights": heights_report or {"method": "plane", "reason": "not asked for"},
     }
+    return placed, surface, result
+
+
+def _anchors(placed: list[_Placed], ground: float) -> np.ndarray:
+    """Where each frame's rangefinder hit, in mosaic coordinates, and that point's height
+    above the plane: rows (E, N, height)."""
+    rows = []
+    for pl in placed:
+        lrf = pl.frame.pose.ground_alt
+        ray = pl.r_t.T[:, 0]
+        if lrf is None or ray[2] <= 1e-6:
+            continue
+        drop = pl.frame.pose.abs_alt - lrf
+        if drop <= 0:
+            continue
+        x = pl.c + pl.j @ (np.array([ray[1], ray[0]]) * drop / ray[2])
+        d = x - pl.c
+        x = x - pl.shift - pl.rot * np.array([-d[1], d[0]])
+        rows.append([x[0], x[1], lrf - ground])
+    return np.array(rows).reshape(-1, 3)
 
 
 def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
-           report: Callable[[int, int], None] | None = None) -> tuple[np.ndarray, float]:
+           report: Callable[[int, int], None] | None = None, heights: Heights | None = None,
+           anchors: np.ndarray | None = None) -> tuple[np.ndarray, float, np.ndarray | None]:
     """Correction increments [shift E, shift N, rotation] per frame + [boresight pitch, yaw]
-    that cancel the observed offsets, and the fraction of observations kept at full weight.
+    (+ with heights, one per height cell) that cancel the observed offsets, the fraction of
+    observations kept at full weight, and (with heights) each cell's observation weight.
 
     Moving frame k's content: its correction (sampling at X + t + r perp(X - c)) moves it by
     -(t + r perp(X - c)); a boresight b moves it by G_k b (G_k: ground shift of the optical
-    axis per radian). For each block, (move_b - move_a)(X) = -observed shift.
+    axis per radian); raising the surface by dz at X moves it by -(X - c_k) dz / (h_k - z(X)),
+    away from the frame's nadir. For each block, (move_b - move_a)(X) = -observed shift.
+    The heights are held to their neighbours' (smoothness, robust so that roof edges stay
+    sharp), to the rangefinder's (anchors: rows of E, N, height above the plane) and weakly to
+    the plane.
     report(done, total): the reweighting steps solved.
     """
     n = len(placed)
@@ -744,10 +887,16 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
             cols.append((_centre_ground(moved) - _centre_ground(pl)) / eps)
         g.append(np.column_stack(cols))
     # each observation row touches 8 unknowns: [t comp, r] of frames a and b, and the boresight
+    # (and the 4 height cells its block centre interpolates)
     a, b = obs[:, 0].astype(int), obs[:, 1].astype(int)
     _, pair, count = np.unique(obs[:, :2].astype(int), axis=0, return_inverse=True, return_counts=True)
     c = np.array([pl.c for pl in placed])
+    h = np.array([pl.h for pl in placed])
     g = np.array(g)
+    m0 = 3 * n + n_global
+    if heights is not None:
+        cells, cell_w = heights.point_weights(obs[:, 2], obs[:, 3])
+        z_obs = (heights.z.ravel()[cells] * cell_w).sum(1)
     idx, val, rhs = [], [], []
     for comp, target in ((0, -obs[:, 4]), (1, -obs[:, 5])):
         cols, vals = [], []
@@ -757,37 +906,106 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
             vals += [np.full(len(k), -sign), sign * (vn if comp == 0 else -ve)]   # -t, -r perp(v): (r vn, -r ve)
         cols += [np.full(len(a), 3 * n), np.full(len(a), 3 * n + 1)]
         vals += list((g[b, comp] - g[a, comp]).T)
+        if heights is not None:
+            v = obs[:, 2 + comp]
+            dz = -(v - c[b, comp]) / (h[b] - z_obs) + (v - c[a, comp]) / (h[a] - z_obs)
+            cols += list((m0 + cells).T)
+            vals += list((dz[:, None] * cell_w).T)
         idx.append(np.column_stack(cols))
         val.append(np.column_stack(vals))
         rhs.append(target)
-    idx = np.stack(idx, 1).reshape(-1, 6)                                     # rows in (block, comp) order
-    val = np.stack(val, 1).reshape(-1, 6)
-    b_obs = np.stack(rhs, 1).ravel()
-    pair_w = np.repeat(1 / np.sqrt(count[pair.ravel()]), 2)
-    m = 3 * n + n_global
-    outer = (idx[:, :, None] * m + idx[:, None, :]).ravel()
+    width = idx[0].shape[1]
+    idx = np.stack(idx, 1).reshape(-1, width)                                 # rows in (block, comp) order
+    val = np.stack(val, 1).reshape(-1, width)
+    b_rows = np.stack(rhs, 1).ravel()
+    base = np.repeat(1 / np.sqrt(count[pair.ravel()]), 2)
+    sigma = np.full(len(b_rows), OBS_SIGMA_PX * gsd)
+    n_obs = len(b_rows)
+
     prior = np.concatenate([np.tile([1 / PRIOR_SHIFT_M, 1 / PRIOR_SHIFT_M, 1 / math.radians(PRIOR_ROT_DEG)], n),
                             np.full(2, 1 / math.radians(PRIOR_BORESIGHT_DEG))])
     current = np.concatenate([np.column_stack([np.array([pl.shift for pl in placed]),
                                                [pl.rot for pl in placed]]).ravel(), bias])
-    sigma = OBS_SIGMA_PX * gsd
-    w = np.ones(len(b_obs))
+    observed = None
+    if heights is not None:
+        z = heights.z.ravel()
+        rows_, cols_ = heights.z.shape
+        observed = np.bincount(cells.ravel(), (cell_w * base[::2, None]).ravel(), minlength=z.size)
+        # constraints on the total heights: the row is val . increment = target - val . current
+        grid_i = np.arange(z.size).reshape(rows_, cols_)
+        pairs = np.concatenate([np.column_stack([grid_i[:, :-1].ravel(), grid_i[:, 1:].ravel()]),
+                                np.column_stack([grid_i[:-1].ravel(), grid_i[1:].ravel()])])
+        extra_idx = [m0 + pairs]
+        extra_val = [np.tile([1.0, -1.0], (len(pairs), 1))]
+        extra_rhs = [z[pairs[:, 1]] - z[pairs[:, 0]]]
+        extra_sigma = [np.full(len(pairs), HEIGHT_SMOOTH_M)]
+        if anchors is not None and len(anchors):
+            a_cells, a_w = heights.point_weights(anchors[:, 0], anchors[:, 1])
+            extra_idx.append(m0 + a_cells)
+            extra_val.append(a_w)
+            extra_rhs.append(anchors[:, 2] - (z[a_cells] * a_w).sum(1))
+            extra_sigma.append(np.full(len(anchors), HEIGHT_ANCHOR_M))
+        pad = lambda arr: np.pad(arr, ((0, 0), (0, width - arr.shape[1])))   # noqa: E731
+        idx = np.concatenate([idx] + [pad(i) for i in extra_idx])
+        val = np.concatenate([val] + [pad(v) for v in extra_val])
+        b_rows = np.concatenate([b_rows] + extra_rhs)
+        sigma = np.concatenate([sigma] + extra_sigma)
+        base = np.concatenate([base, np.ones(len(b_rows) - len(base))])
+        prior = np.concatenate([prior, np.full(z.size, 1 / HEIGHT_PRIOR_M)])
+        current = np.concatenate([current, z])
+
+    m = len(prior)
+    dense = m <= 3000
+    if dense:
+        outer = (idx[:, :, None] * m + idx[:, None, :]).ravel()
+    w = np.ones(len(b_rows))
     x = np.zeros(m)
     steps = 8
     if report:
         report(0, steps)
     for i in range(steps):
-        ww = (w * pair_w / sigma) ** 2
+        ww = (w * base / sigma) ** 2
         # the normal equations of the weighted rows and the priors, which act on the total correction
-        normal = np.bincount(outer, (ww[:, None, None] * val[:, :, None] * val[:, None, :]).ravel(),
-                             minlength=m * m).reshape(m, m) + np.diag(prior ** 2)
-        y = np.bincount(idx.ravel(), (val * (ww * b_obs)[:, None]).ravel(), minlength=m) - current * prior ** 2
-        x = np.linalg.solve(normal, y)
-        r = np.abs((val * x[idx]).sum(1) - b_obs) / sigma
+        y = np.bincount(idx.ravel(), (val * (ww * b_rows)[:, None]).ravel(), minlength=m) - current * prior ** 2
+        if dense:
+            normal = np.bincount(outer, (ww[:, None, None] * val[:, :, None] * val[:, None, :]).ravel(),
+                                 minlength=m * m).reshape(m, m) + np.diag(prior ** 2)
+            x = np.linalg.solve(normal, y)
+        else:
+            x = _cg(idx, val, ww, prior ** 2, y, x)
+        r = np.abs((val * x[idx]).sum(1) - b_rows) / sigma
         w = np.where(r <= 2.0, 1.0, np.sqrt(2.0 / np.maximum(r, 1e-12)))   # Huber, k = 2
         if report:
             report(i + 1, steps)
-    return x, float((w == 1.0).mean())
+    return x, float((w[:n_obs] == 1.0).mean()), observed
+
+
+def _cg(idx: np.ndarray, val: np.ndarray, ww: np.ndarray, diag: np.ndarray, y: np.ndarray, x: np.ndarray,
+        rtol: float = 1e-8, max_iter: int = 500) -> np.ndarray:
+    """Solve (A' W A + diag) x = y, A's rows being sparse (idx, val), by Jacobi-preconditioned
+    conjugate gradients from x: for systems too large for the dense normal equations."""
+    m = len(y)
+
+    def apply(p):
+        return np.bincount(idx.ravel(), (val * (ww * (val * p[idx]).sum(1))[:, None]).ravel(), minlength=m) + diag * p
+
+    precond = 1 / (np.bincount(idx.ravel(), (val * val * ww[:, None]).ravel(), minlength=m) + diag)
+    r = y - apply(x)
+    zr = precond * r
+    p = zr.copy()
+    rz = r @ zr
+    stop = rtol * np.linalg.norm(y)
+    for _ in range(max_iter):
+        if np.linalg.norm(r) <= stop:
+            break
+        ap = apply(p)
+        alpha = rz / (p @ ap)
+        x = x + alpha * p
+        r = r - alpha * ap
+        zr = precond * r
+        rz, rz_old = r @ zr, rz
+        p = zr + (rz / rz_old) * p
+    return x
 
 
 # --- output ---------------------------------------------------------------------------------
@@ -813,9 +1031,10 @@ def write(m: Mosaic, path: Path, compression: str = "deflate", unit: str = "C",
     metres east and south of the mosaic's top-left corner."""
     g = m.grid
     bands = ((f"temperature_{unit.lower()}", units.SYMBOLS[unit]),) + BANDS[1:]
+    onto = "a horizontal plane" if m.heights is None else "the surface estimated from parallax (see write_heights)"
     if located:
         info = {
-            "method": "direct georeferencing onto a horizontal plane; one frame per pixel (most nadir), nearest neighbour",
+            "method": f"direct georeferencing onto {onto}; one frame per pixel (most nadir), nearest neighbour",
             "crs": f"EPSG:{g.epsg}", "gsd_m": g.gsd, "width": g.width, "height": g.height,
             "origin_utm": [g.e0, g.n0], "ground_alt_m": round(m.ground_alt, 3), "ground_alt_source": m.ground_alt_source,
             "bands": [{"name": n, "unit": u} for n, u in bands],
@@ -825,7 +1044,7 @@ def write(m: Mosaic, path: Path, compression: str = "deflate", unit: str = "C",
         frames = [{**{k: f[k] for k in _LOCATION_FREE_FRAME_KEYS if k in f},
                    "x_m": round(f["utm_e"] - g.e0, 3), "y_m": round(g.n0 - f["utm_n"], 3)} for f in m.frames]
         info = {
-            "method": "placed on a horizontal plane from the frames' positions (removed); one frame per pixel "
+            "method": f"placed on {onto} from the frames' positions (removed); one frame per pixel "
                       "(most nadir), nearest neighbour",
             "location_removed": True, "gsd_m": g.gsd, "width": g.width, "height": g.height,
             "bands": [{"name": n, "unit": u} for n, u in bands],
@@ -852,6 +1071,44 @@ def write(m: Mosaic, path: Path, compression: str = "deflate", unit: str = "C",
     with files.replaced_when_done(sidecar) as tmp:
         tmp.write_text(json.dumps(info, indent=2), encoding="utf-8")
     return path, sidecar
+
+
+def write_heights(m: Mosaic, path: Path, compression: str = "deflate", located: bool = True) -> Path | None:
+    """The surface the frames were projected onto, as a float32 GeoTIFF of one band on the
+    height cells (pixel centres at the cell centres; NaN where no frame covers the cell):
+    altitudes in metres, the ground plane's plus the estimated height above it. located=False:
+    the heights above the plane, without georeference. None (nothing written) on the plane."""
+    h = m.heights
+    if h is None:
+        return None
+    g = m.grid
+    step = max(1, round(h.cell / g.gsd))
+    rows, cols = h.z.shape
+    seen = np.isfinite(m.temperature)
+    seen = np.pad(seen, ((0, rows * step - g.height), (0, cols * step - g.width)))
+    covered = seen.reshape(rows, step, cols, step).any(axis=(1, 3))
+    z = h.z + (m.ground_alt if located else 0.0)
+    pixels = np.where(covered, z, np.nan).astype(np.float32)
+    name, unit = ("altitude_m", "m") if located else ("height_above_plane_m", "m")
+    info = {**m.report["alignment"]["heights"], "interpolation": "bilinear between cell centres"}
+    if located:
+        info.update({"crs": f"EPSG:{g.epsg}", "origin_utm": [h.e0, h.n0], "ground_alt_m": round(m.ground_alt, 3)})
+    items = [f'<Item name="DESCRIPTION" sample="0" role="description">{name}</Item>'
+             f'<Item name="UNITTYPE" sample="0" role="unittype">{unit}</Item>',
+             f'<Item name="dji_thermal_heights">{escape(json.dumps(info, separators=(",", ":")))}</Item>']
+    extra = {
+        42112: tiffout.tag("s", "<GDALMetadata>" + "".join(items) + "</GDALMetadata>"),
+        42113: tiffout.tag("s", "nan"),
+    }
+    if located:
+        extra.update({
+            33550: tiffout.tag("d", (h.cell, h.cell, 0.0)),
+            33922: tiffout.tag("d", (0.0, 0.0, 0.0, h.e0, h.n0, 0.0)),
+            34735: tiffout.tag("H", [1, 1, 0, 4, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, g.epsg, 3076, 0, 1, 9001]),
+        })
+    with files.replaced_when_done(path) as tmp:
+        tiffout.write_tiff(tmp, pixels, None, band_name=False, compression=compression, extra_tags=extra)
+    return path
 
 
 def write_preview(m: Mosaic, path: Path, lut: np.ndarray | None = None,
