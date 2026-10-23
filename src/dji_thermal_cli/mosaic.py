@@ -745,40 +745,47 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
             moved = dataclasses.replace(pl, r_t=(pl.r_t.T @ _boresight(*d)).T)
             cols.append((_centre_ground(moved) - _centre_ground(pl)) / eps)
         g.append(np.column_stack(cols))
-    blocks = {}
-    for a, b in obs[:, :2]:
-        blocks[(int(a), int(b))] = blocks.get((int(a), int(b)), 0) + 1
-    rows, rhs, pair_w = [], [], []
-    for a, b, e, nn, se, sn in obs:
-        a, b = int(a), int(b)
-        for comp, target in ((0, -se), (1, -sn)):
-            row = np.zeros(3 * n + n_global)
-            for k, sign in ((b, 1.0), (a, -1.0)):
-                ve, vn = e - placed[k].c[0], nn - placed[k].c[1]
-                row[3 * k + comp] = -sign                               # -t
-                row[3 * k + 2] = sign * (vn if comp == 0 else -ve)       # -r perp(v): (r vn, -r ve)
-                row[3 * n:] += sign * g[k][comp]
-            rows.append(row)
-            rhs.append(target)
-            pair_w.append(1 / math.sqrt(blocks[(a, b)]))
-    a_obs, b_obs = np.array(rows), np.array(rhs)
+    # each observation row touches 8 unknowns: [t comp, r] of frames a and b, and the boresight
+    a, b = obs[:, 0].astype(int), obs[:, 1].astype(int)
+    _, pair, count = np.unique(obs[:, :2].astype(int), axis=0, return_inverse=True, return_counts=True)
+    c = np.array([pl.c for pl in placed])
+    g = np.array(g)
+    idx, val, rhs = [], [], []
+    for comp, target in ((0, -obs[:, 4]), (1, -obs[:, 5])):
+        cols, vals = [], []
+        for k, sign in ((b, 1.0), (a, -1.0)):
+            ve, vn = obs[:, 2] - c[k, 0], obs[:, 3] - c[k, 1]
+            cols += [3 * k + comp, 3 * k + 2]
+            vals += [np.full(len(k), -sign), sign * (vn if comp == 0 else -ve)]   # -t, -r perp(v): (r vn, -r ve)
+        cols += [np.full(len(a), 3 * n), np.full(len(a), 3 * n + 1)]
+        vals += list((g[b, comp] - g[a, comp]).T)
+        idx.append(np.column_stack(cols))
+        val.append(np.column_stack(vals))
+        rhs.append(target)
+    idx = np.stack(idx, 1).reshape(-1, 6)                                     # rows in (block, comp) order
+    val = np.stack(val, 1).reshape(-1, 6)
+    b_obs = np.stack(rhs, 1).ravel()
+    pair_w = np.repeat(1 / np.sqrt(count[pair.ravel()]), 2)
+    m = 3 * n + n_global
+    outer = (idx[:, :, None] * m + idx[:, None, :]).ravel()
     prior = np.concatenate([np.tile([1 / PRIOR_SHIFT_M, 1 / PRIOR_SHIFT_M, 1 / math.radians(PRIOR_ROT_DEG)], n),
                             np.full(2, 1 / math.radians(PRIOR_BORESIGHT_DEG))])
     current = np.concatenate([np.column_stack([np.array([pl.shift for pl in placed]),
                                                [pl.rot for pl in placed]]).ravel(), bias])
     sigma = OBS_SIGMA_PX * gsd
     w = np.ones(len(b_obs))
-    x = np.zeros(3 * n + n_global)
-    pair_w = np.array(pair_w)
+    x = np.zeros(m)
     steps = 8
     if report:
         report(0, steps)
     for i in range(steps):
-        ww = w * pair_w / sigma
-        lhs = np.vstack([a_obs * ww[:, None], np.diag(prior)])
-        y = np.concatenate([b_obs * ww, -current * prior])             # priors act on the total correction
-        x = np.linalg.lstsq(lhs, y, rcond=None)[0]
-        r = np.abs(a_obs @ x - b_obs) / sigma
+        ww = (w * pair_w / sigma) ** 2
+        # the normal equations of the weighted rows and the priors, which act on the total correction
+        normal = np.bincount(outer, (ww[:, None, None] * val[:, :, None] * val[:, None, :]).ravel(),
+                             minlength=m * m).reshape(m, m) + np.diag(prior ** 2)
+        y = np.bincount(idx.ravel(), (val * (ww * b_obs)[:, None]).ravel(), minlength=m) - current * prior ** 2
+        x = np.linalg.solve(normal, y)
+        r = np.abs((val * x[idx]).sum(1) - b_obs) / sigma
         w = np.where(r <= 2.0, 1.0, np.sqrt(2.0 / np.maximum(r, 1e-12)))   # Huber, k = 2
         if report:
             report(i + 1, steps)
