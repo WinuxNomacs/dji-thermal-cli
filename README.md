@@ -417,7 +417,8 @@ The run summary says where each file's distance came from, and `list` shows the
 rangefinder reading in its `lrf_m` column.
 
 Files are processed in parallel by a pool of worker processes (`--jobs N`, default
-`min(CPU count, 8)`; `--jobs 1` runs them one at a time in the same process); a mosaic
+`min(CPU count, 8)`; `--jobs 1` runs them one at a time in the same process, as does a daemonic process such as
+a Celery worker's, which cannot start processes of its own); a mosaic
 matches its frames' overlaps in as many threads. Files that
 can't be converted are listed as `[skip, <reason>]` and the rest of the batch continues.
 
@@ -501,7 +502,8 @@ dtc.make_mosaic("flight/", "out-dsm/", settings, dtc.MosaicOptions(dsm="odm/dsm.
   `align` (per round: `pairs`, then `solve steps`), `composite` (frames), `check` (pairs),
   `write` (files). Each starts at `done = 0` and ends at its total. There is no overall
   percentage, as the stages' share of the time varies with the flight.
-- **Parallelism:** `jobs` as on the command line (`1` runs in the calling process).
+- **Parallelism:** `jobs` as on the command line (`1` runs in the calling process, as does
+  any job in a daemonic process, such as a Celery worker's; a mosaic still aligns in threads).
 - The API never prints or exits. The command line is a thin layer over it and writes
   byte-identical files.
 
