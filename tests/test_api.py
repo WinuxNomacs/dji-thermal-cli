@@ -182,6 +182,7 @@ def _pids_in_a_daemon(queue):
     queue.put([r for _, _, r in api._run_all(os.getpid, [()] * 4, 4)] + [os.getpid()])
 
 
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="needs the fork start method")
 def test_jobs_in_a_daemonic_process_run_in_that_process():
     queue = multiprocessing.get_context("fork").Queue()
     worker = multiprocessing.get_context("fork").Process(target=_pids_in_a_daemon, args=(queue,), daemon=True)
