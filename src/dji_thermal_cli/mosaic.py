@@ -412,8 +412,9 @@ def _dsm_surface(dsm: Dsm, placed: list[_Placed], grid: Grid, cell: float, groun
     return surface, report
 
 
-def _sample(pl: _Placed, grid: Grid, rows: slice, cols: slice, bilinear: bool = False):
-    """For grid pixels in rows x cols: (temperature, off-nadir angle in degrees, valid mask).
+def _sample(pl: _Placed, grid: Grid, rows: slice, cols: slice, bilinear: bool = False, pixel: bool = False):
+    """For grid pixels in rows x cols: (temperature, off-nadir angle in degrees, valid mask),
+    and with pixel=True the frame's pixel each was read from (column, row; nearest only).
     Nearest neighbour, so mosaic values are the frames' own; bilinear is for measuring
     misalignment only (nearest-neighbour renderings carry a staircase pattern tied to each
     frame's pixel grid, which biases image matching between frames)."""
@@ -450,6 +451,8 @@ def _sample(pl: _Placed, grid: Grid, rows: slice, cols: slice, bilinear: bool = 
     iu, iv = np.where(valid, u, 0).astype(np.intp), np.where(valid, v, 0).astype(np.intp)
     t = temperature[iv, iu]
     valid &= t > np.float32(tiffout.NO_DATA_C)          # a no-data pixel leaves the spot to other frames
+    if pixel:
+        return t, angle, valid, u.astype(np.float32), v.astype(np.float32)
     return t, angle, valid
 
 
@@ -473,6 +476,7 @@ class Mosaic:
     ground_alt_source: str
     report: dict
     heights: Heights | None = None      # the surface the frames were projected onto (None: the plane)
+    source_px: np.ndarray | None = None  # float32 (height, width, 2): the source frame's column and row, NaN where none
 
 
 def _grid(placed: list[_Placed], gsd: float, zone: int, north: bool) -> Grid:
@@ -613,9 +617,10 @@ def _composite(layout: _Layout, placed: list[_Placed], normalize: bool, composit
     second = np.full(shape, np.nan, np.float32)
     source = np.full(shape, -1, np.int32)
     second_source = np.full(shape, -1, np.int32)
+    source_px = np.full(shape + (2,), np.nan, np.float32)
     for k, pl in enumerate(placed):
         rows, cols = _window(pl, grid)
-        t, angle, valid = _sample(pl, grid, rows, cols)
+        t, angle, valid, u, v = _sample(pl, grid, rows, cols, pixel=True)
         angle = np.where(valid, angle, np.inf)
         ba, sa = best_angle[rows, cols], second_angle[rows, cols]
         bt, st, bs, ss = temp[rows, cols], second[rows, cols], source[rows, cols], second_source[rows, cols]
@@ -624,6 +629,8 @@ def _composite(layout: _Layout, placed: list[_Placed], normalize: bool, composit
         sa[:] = np.where(better, ba, np.where(runner, angle, sa))
         st[:] = np.where(better, bt, np.where(runner, t, st))
         ss[:] = np.where(better, bs, np.where(runner, k, ss))
+        px = source_px[rows, cols]
+        px[:] = np.where(better[..., None], np.stack([u, v], axis=-1), px)
         ba[:] = np.where(better, angle, ba)
         bt[:] = np.where(better, t, bt)
         bs[:] = np.where(better, k, bs)
@@ -665,7 +672,7 @@ def _composite(layout: _Layout, placed: list[_Placed], normalize: bool, composit
     return Mosaic(
         grid, temp, np.where(covered, source, np.nan).astype(np.float32),
         np.where(covered, best_angle, np.nan).astype(np.float32), table, layout.ground_alt, layout.ground_source,
-        report, layout.heights,
+        report, layout.heights, source_px,
     )
 
 
@@ -1155,7 +1162,8 @@ def _cg(idx: np.ndarray, val: np.ndarray, ww: np.ndarray, diag: np.ndarray, y: n
 # --- output ---------------------------------------------------------------------------------
 
 BANDS = (("temperature_c", "deg C"), ("source_frame", "index into the frames table"),
-         ("view_angle_deg", "off-nadir degrees"))
+         ("view_angle_deg", "off-nadir degrees"), ("source_u", "source frame pixel column"),
+         ("source_v", "source frame pixel row"))
 
 
 # what a location-free mosaic keeps of each frame (see privacy): no position, altitude or identifier
@@ -1168,13 +1176,14 @@ _LOCATION_FREE_FRAME_KEYS = (
 
 def write(m: Mosaic, path: Path, compression: str = "deflate", unit: str = "C",
           located: bool = True) -> tuple[Path, Path]:
-    """The mosaic GeoTIFF (3 float32 bands, NaN = no data) and its JSON sidecar. unit: the
-    temperature band's unit, C, F or K (converted from the SDK's Celsius, rounded once).
+    """The mosaic GeoTIFF (5 float32 bands, NaN = no data; 3 for a mosaic without source_px)
+    and its JSON sidecar. unit: the temperature band's unit, C, F or K (converted from the
+    SDK's Celsius, rounded once).
     located=False: a plain TIFF without georeference, and a sidecar without the CRS, origin,
     ground altitude or any frame's position or identifiers; frames are placed by x_m/y_m,
     metres east and south of the mosaic's top-left corner."""
     g = m.grid
-    bands = ((f"temperature_{unit.lower()}", units.SYMBOLS[unit]),) + BANDS[1:]
+    bands = ((f"temperature_{unit.lower()}", units.SYMBOLS[unit]),) + BANDS[1:3 if m.source_px is None else 5]
     onto = ("a horizontal plane" if m.heights is None else "a surface model (see write_heights)"
             if (m.report.get("heights") or {}).get("method") == "DSM"
             else "the surface estimated from parallax (see write_heights)")
@@ -1210,7 +1219,10 @@ def write(m: Mosaic, path: Path, compression: str = "deflate", unit: str = "C",
             33922: tiffout.tag("d", (0.0, 0.0, 0.0, g.e0, g.n0, 0.0)),
             34735: tiffout.tag("H", geokeys),
         })
-    pixels = np.dstack([units.float32_in(m.temperature, unit), m.source, m.view_angle]).astype(np.float32)
+    layers = [units.float32_in(m.temperature, unit), m.source, m.view_angle]
+    if m.source_px is not None:
+        layers += [m.source_px[..., 0], m.source_px[..., 1]]
+    pixels = np.dstack(layers).astype(np.float32)
     with files.replaced_when_done(path) as tmp:
         tiffout.write_tiff(tmp, pixels, None, band_name=False, compression=compression, extra_tags=extra)
     sidecar = path.with_suffix(".json")

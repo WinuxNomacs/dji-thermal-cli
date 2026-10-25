@@ -128,19 +128,43 @@ def test_values_are_original_measurements(synthetic):
     assert np.nanmax(m.view_angle) < 45
 
 
+def test_each_pixel_keeps_where_in_its_source_frame_it_was_read(synthetic):
+    frames, m = synthetic
+    ok = np.isfinite(m.temperature)
+    assert (np.isfinite(m.source_px).all(axis=-1) == ok).all()
+    for k, f in enumerate(frames):
+        mine = ok & (m.source == k)
+        u, v = (m.source_px[mine][:, i].astype(np.intp) for i in (0, 1))
+        np.testing.assert_array_equal(f.temperature[v, u], m.temperature[mine])
+        assert u.min() >= 0 and u.max() < f.pose.width and v.min() >= 0 and v.max() < f.pose.height
+
+
 def test_geotiff(synthetic, tmp_path):
     _, m = synthetic
     tif, sidecar = mosaic.write(m, tmp_path / "mosaic_temp_c.tif")
     with tifffile.TiffFile(tif) as tf:
         page = tf.pages[0]
-        assert page.asarray().shape == (m.grid.height, m.grid.width, 3)
+        assert page.asarray().shape == (m.grid.height, m.grid.width, 5)
         assert tf.geotiff_metadata["ProjectedCSTypeGeoKey"] == 32616
         assert page.tags["ModelPixelScaleTag"].value[:2] == (m.grid.gsd, m.grid.gsd)
         assert page.tags["ModelTiepointTag"].value[3:5] == (m.grid.e0, m.grid.n0)
         assert "temperature_c" in page.tags["GDAL_METADATA"].value and page.tags["GDAL_NODATA"].value == "nan"
         np.testing.assert_array_equal(page.asarray()[..., 0], m.temperature)
+        np.testing.assert_array_equal(page.asarray()[..., 3:], m.source_px)
+        for name in ("source_frame", "view_angle_deg", "source_u", "source_v"):
+            assert f">{name}<" in page.tags["GDAL_METADATA"].value
     info = json.loads(sidecar.read_text())
     assert [f["file"] for f in info["frames"]] == [f"f{i}" for i in range(6)]
+    assert [b["name"] for b in info["bands"]] == ["temperature_c", "source_frame", "view_angle_deg", "source_u",
+                                                  "source_v"]
+
+
+def test_a_mosaic_without_source_pixels_is_written_with_three_bands(synthetic, tmp_path):
+    _, m = synthetic
+    tif, sidecar = mosaic.write(dataclasses.replace(m, source_px=None), tmp_path / "mosaic_temp_c.tif")
+    with tifffile.TiffFile(tif) as tf:
+        assert tf.pages[0].asarray().shape == (m.grid.height, m.grid.width, 3)
+    assert len(json.loads(sidecar.read_text())["bands"]) == 3
 
 
 def test_heights_geotiff_holds_the_surface_altitudes_on_its_cells(synthetic, tmp_path):

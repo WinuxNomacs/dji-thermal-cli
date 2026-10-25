@@ -154,11 +154,13 @@ results, skipped files and errors still print.
 
 It writes these files to the output directory:
 
-- **`mosaic_temp_c.tif`:** a GeoTIFF in the flight's UTM zone (WGS84) with three float32
+- **`mosaic_temp_c.tif`:** a GeoTIFF in the flight's UTM zone (WGS84) with five float32
   bands. NaN marks ground no frame covers.
   1. temperature in °C (`--mosaic-unit F` or `K` for `mosaic_temp_f.tif`/`mosaic_temp_k.tif`);
   2. the frame each pixel came from;
-  3. the off-nadir angle at which that frame saw it.
+  3. the off-nadir angle at which that frame saw it;
+  4. and 5. the pixel of that frame it was read from (column, row), so a point of the mosaic
+     can be found in its source image.
 - **`mosaic_temp_c.json`:** the grid, a seam and misalignment report, and a table of every
   frame (also embedded in the GeoTIFF). Each frame's entry holds its file name, capture
   time, RTK position and accuracy, gimbal and aircraft attitude, rangefinder reading,
