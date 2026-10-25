@@ -6,6 +6,11 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- The mosaic GeoTIFF has two more bands, `source_u` and `source_v`: the column and row of
+  the source frame's pixel each mosaic pixel was read from, so a point of the mosaic can be
+  shown in its source image (`Mosaic.source_px` in the API). Readers of the first three
+  bands are unaffected.
+
 ## [1.3.0] - 2026-10-23
 
 - The mosaic projects its frames onto the heights it estimates from the parallax between
