@@ -37,9 +37,12 @@ __all__ = [
     "Settings", "MosaicOptions", "Event", "SettingsError", "MosaicError", "FileProblem",
     "ListResult", "CheckResult", "Measurement", "ProcessReport", "MosaicReport",
     "Normalization", "scan", "classify", "describe", "list_dataset", "check", "measure", "process",
-    "make_mosaic", "normalization",
+    "make_mosaic", "normalization", "FrameModels", "read_frame_models",
     "PALETTES", "palette_index", "parse_outputs",
 ]
+
+FrameModels = _mosaic.FrameModels
+read_frame_models = _mosaic.read_frame_models
 
 PALETTES = tuple(core.PSEUDO_COLOR_NAMES)
 DEFAULT_MAX_WORKERS = 8          # past this, worker startup and disk I/O outweigh the parallelism

@@ -6,6 +6,15 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- The mosaic's JSON sidecar holds each frame's model (`frame_models`): its camera, lens and
+  rotation, the alignment's correction, the surface it was projected onto, and its
+  footprint's corners in lon/lat. `read_frame_models` reads them back, and the `FrameModels`
+  it returns finds a ground point (lon/lat) in every frame that saw it, not only the one the
+  mosaic took it from (`pixels`, `view_angles`, `covering`), and lists the frames whose
+  footprint meets an area (`meeting`). On a 220-frame M4T flight a point was seen by 15
+  frames (median). Sidecars written with `--strip-location` have no frame models, and older
+  sidecars read as None.
+
 ## [1.4.0] - 2026-10-25
 
 - The mosaic GeoTIFF has two more bands, `source_u` and `source_v`: the column and row of
