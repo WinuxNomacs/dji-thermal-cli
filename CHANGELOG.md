@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-27
+
 - The mosaic's JSON sidecar holds each frame's model (`frame_models`): its camera, lens and
   rotation, the alignment's correction, the surface it was projected onto, and its
   footprint's corners in lon/lat. `read_frame_models` reads them back, and the `FrameModels`
@@ -101,7 +103,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.1.0...v1.2.0
