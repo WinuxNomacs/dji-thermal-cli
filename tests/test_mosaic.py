@@ -194,6 +194,107 @@ def test_heights_geotiff_holds_the_surface_altitudes_on_its_cells(synthetic, tmp
         np.testing.assert_allclose(tf.pages[0].asarray()[covered], z[covered], atol=1e-6)
 
 
+def _lonlat(m, rows, cols):
+    """The lon/lat of mosaic pixel centres."""
+    g = m.grid
+    lat, lon = geo.utm_inverse(g.e0 + (cols + 0.5) * g.gsd, g.n0 - (rows + 0.5) * g.gsd, g.zone, g.north)
+    return lon, lat
+
+
+def _check_frame_models(frames, m, tmp_path):
+    """The models read back from the sidecar find every mosaic pixel at the source frame pixel
+    the mosaic read it from, and every frame that saw it saw the same ground."""
+    _, sidecar = mosaic.write(m, tmp_path / "mosaic_temp_c.tif")
+    models = api.read_frame_models(sidecar)
+    assert models.files == tuple(f["file"] for f in m.frames)
+    rows, cols = np.nonzero(np.isfinite(m.temperature))
+    pick = np.random.default_rng(1).choice(rows.size, 400, replace=False)
+    rows, cols = rows[pick], cols[pick]
+    lon, lat = _lonlat(m, rows, cols)
+    px = models.pixels(lon, lat)
+    source = m.source[rows, cols].astype(np.intp)
+    used = px[source, np.arange(rows.size)]
+    # the same pixel, but for points within the lon/lat round trip's error (well under 0.01
+    # pixel) of a pixel's edge
+    assert np.abs(used - m.source_px[rows, cols]).max() <= 0.51
+    assert (np.floor(used + 0.5) == m.source_px[rows, cols]).all(axis=1).mean() > 0.98
+    by_name = {f.name: f for f in frames}
+    g = m.grid
+    truth = _field(g.e0 + (cols + 0.5) * g.gsd, g.n0 - (rows + 0.5) * g.gsd)
+    seen = np.isfinite(px[..., 0])
+    assert (seen.sum(axis=0) > 1).mean() > 0.5         # most points were seen by more than the frame used
+    frame_gsd = max(pl.h / pl.frame.pose.focal_px for pl in m.placed)
+    for k, name in enumerate(models.files):
+        u, v = (np.floor(px[k, seen[k], i] + 0.5).astype(np.intp) for i in (0, 1))
+        got = by_name[name].temperature[v, u]
+        assert np.abs(got - truth[seen[k]]).max() <= FIELD_SLOPE * (frame_gsd + g.gsd) * math.sqrt(2)
+    angles = models.view_angles(lon, lat)
+    np.testing.assert_allclose(angles[source, np.arange(rows.size)], m.view_angle[rows, cols], atol=1e-3)
+    assert (np.isnan(angles) == ~seen).all()
+    return models
+
+
+def test_frame_models_find_a_point_in_every_frame_that_saw_it(synthetic, tmp_path):
+    frames, _ = synthetic
+    m = mosaic.build(frames, check_misalignment=False)
+    models = _check_frame_models(frames, m, tmp_path)
+    assert m.report["alignment"] is not None
+    assert any(pl.shift.any() or pl.rot for pl in models._placed)    # the alignment's corrections are kept
+
+
+def test_frame_models_find_points_on_a_surface_from_parallax(tmp_path):
+    zone, north = geo.utm_zone(LAT, LON)
+    centre = np.array(geo.utm(LAT - 4.0 / 111132.0, LON + 4.0 / (111320.0 * math.cos(math.radians(LAT))), zone, north))
+
+    def mound(e, n):
+        return 1.5 * np.exp(-((e - centre[0]) ** 2 + (n - centre[1]) ** 2) / 8.0)
+
+    frames = [_frame(f"f{i}", 4.0 * (i % 3), -4.0 * (i // 3), yaw=5.4 if (i // 3) % 2 == 0 else -174.6,
+                     roll=180.0, surface=mound) for i in range(6)]
+    m = mosaic.build(frames, check_misalignment=False)
+    assert m.heights is not None
+    _check_frame_models(frames, m, tmp_path)
+
+
+def test_frame_models_say_which_frames_saw_a_point_or_meet_an_area(synthetic, tmp_path):
+    frames, m = synthetic
+    models = api.read_frame_models(mosaic.write(m, tmp_path / "mosaic_temp_c.tif")[0])
+    centre = models.footprints[4].mean(axis=0)
+    assert 4 in models.covering(*centre) and set(models.covering(*centre)) <= set(range(6))
+    lon, lat = models.footprints[0].min(axis=0) - 0.001
+    assert models.covering(lon, lat) == [] and np.isnan(models.pixels(lon, lat)).all()
+    assert models.pixels([lon, centre[0]], [lat, centre[1]]).shape == (6, 2, 2)
+    every = np.concatenate(models.footprints)
+    lo, hi = every.min(axis=0), every.max(axis=0)
+    assert models.meeting([lo, (hi[0], lo[1]), hi, (lo[0], hi[1])]) == list(range(6))
+    d = 1e-6
+    assert models.meeting([centre - d, centre + (d, -d), centre + d]) == models.covering(*centre)
+    far = lo - 0.01
+    assert models.meeting([far, far + (d, 0), far + d]) == []
+    # a thin area crossing frame 0's edge without a vertex inside it
+    left = models.footprints[0][:, 0].min()
+    mid = models.footprints[0][:, 1].mean()
+    assert 0 in models.meeting([(left - 1e-4, mid), (left + 1e-4, mid - 1e-7), (left - 1e-4, mid - 2e-7)])
+    with pytest.raises(ValueError, match="at least 3"):
+        models.meeting([lo, hi])
+
+
+def test_frame_models_are_in_the_located_sidecar_only(synthetic, tmp_path):
+    _, m = synthetic
+    tif, sidecar = mosaic.write(m, tmp_path / "mosaic_temp_c.tif")
+    info = json.loads(sidecar.read_text())
+    assert info["frame_models"]["version"] == 1 and info["frame_models"]["surface"] is None
+    assert len(info["frame_models"]["frames"][0]["footprint_lonlat"]) == 4
+    with tifffile.TiffFile(tif) as tf:
+        assert "frame_models" not in tf.pages[0].tags["GDAL_METADATA"].value
+    del info["frame_models"]                                        # a sidecar from before 1.5.0
+    assert mosaic.FrameModels.from_sidecar(info) is None
+    _, unlocated = mosaic.write(m, tmp_path / "unlocated.tif", located=False)
+    assert api.read_frame_models(unlocated) is None
+    with pytest.raises(ValueError, match="version 2"):
+        mosaic.FrameModels.from_sidecar({"frame_models": {"version": 2}})
+
+
 @pytest.mark.parametrize("unit, band, convert", [("F", "temperature_f", lambda c: c * 9 / 5 + 32),
                                                  ("K", "temperature_k", lambda c: c + 273.15)])
 def test_geotiff_units(synthetic, tmp_path, unit, band, convert):

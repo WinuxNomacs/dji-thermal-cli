@@ -165,7 +165,11 @@ It writes these files to the output directory:
   frame (also embedded in the GeoTIFF). Each frame's entry holds its file name, capture
   time, RTK position and accuracy, gimbal and aircraft attitude, rangefinder reading,
   height above the ground plane, and the measurement parameters used (with where its
-  distance came from).
+  distance came from). Its `frame_models` entry (in the sidecar only) holds how each frame
+  saw the ground: its camera, lens and rotation, the alignment's correction, the surface it
+  was projected onto, and its footprint's corners in lon/lat. With it a point of the mosaic
+  can be found in every frame that saw it, not only the one the mosaic used (see
+  `read_frame_models` below). It is left out with `--strip-location`.
 - **`mosaic_preview.png`:** a quick look in the files' own palette (or `--palette`), with
   one colour scale for the whole mosaic: `--range-min`/`--range-max`, or else the 2nd to
   98th percentile of its temperatures. Uncovered areas are transparent.
@@ -485,6 +489,19 @@ dtc.make_mosaic("flight/", "out-dsm/", settings, dtc.MosaicOptions(dsm="odm/dsm.
   `normalize=True`, also writes the mosaic without the normalization there, laid out and
   checked once for both (`report.as_converted` is its report). It is laid out from the
   normalized frames, so it can differ slightly from a separate `normalize=False` mosaic.
+- **Every frame that saw a point:** `read_frame_models("out/mosaic_temp_c.json")` reads a
+  mosaic's frame models (None for a sidecar written before 1.5.0, or without location).
+  `models.pixels(lon, lat)` gives each frame's pixel (column, row) for points, NaN where the
+  frame did not see them, and `models.view_angles(lon, lat)` the angle it saw them at;
+  `models.covering(lon, lat)` lists the frames that saw a point, and `models.meeting(outline)`
+  those whose footprint meets an area (a polygon of lon/lat vertices). Frames are numbered as
+  in the sidecar's `frames` table and the mosaic's source band.
+
+  ```python
+  models = dtc.read_frame_models("out/mosaic_temp_c.json")
+  for k in models.covering(-88.0767, 42.1034):
+      print(models.files[k], models.pixels(-88.0767, 42.1034)[k, 0])
+  ```
 - **Errors:** a missing path raises `FileNotFoundError`, a mosaic that can't be built raises
   `MosaicError`, and `describe` of a non-thermal file raises `FileProblem`. Within a dataset a
   bad file never raises: it is reported in the result and the rest carries on.

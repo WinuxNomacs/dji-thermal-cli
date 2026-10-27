@@ -422,21 +422,10 @@ def _sample(pl: _Placed, grid: Grid, rows: slice, cols: slice, bilinear: bool = 
     e = grid.e0 + (np.arange(cols.start, cols.stop) + 0.5) * grid.gsd
     n = grid.n0 - (np.arange(rows.start, rows.stop) + 0.5) * grid.gsd
     de, dn = np.meshgrid(e - pl.c[0], n - pl.c[1])
-    if pl.rot or pl.shift.any():
-        de, dn = de + pl.shift[0] - pl.rot * dn, dn + pl.shift[1] + pl.rot * de
-    east = pl.j_inv[0, 0] * de + pl.j_inv[0, 1] * dn
-    north = pl.j_inv[1, 0] * de + pl.j_inv[1, 1] * dn
     # the camera's height over the surface at each point (taken where the point is in the
     # mosaic, before the correction)
     hz = pl.h if pl.heights is None else np.maximum(pl.h - pl.heights.at(e, n), 0.1)
-    rt = pl.r_t
-    fwd = rt[0, 0] * north + rt[0, 1] * east + rt[0, 2] * hz
-    right = rt[1, 0] * north + rt[1, 1] * east + rt[1, 2] * hz
-    down = rt[2, 0] * north + rt[2, 1] * east + rt[2, 2] * hz
-    with np.errstate(divide="ignore", invalid="ignore"):
-        uf = pl.cx + p.focal_px * right / fwd
-        vf = pl.cy + p.focal_px * down / fwd
-    angle = np.degrees(np.arctan2(np.hypot(east, north), hz)).astype(np.float32)
+    uf, vf, fwd, angle = _project(pl, de, dn, hz)
     temperature = pl.frame.temperature
     if bilinear:
         valid = (fwd > 0) & (uf >= 0) & (uf <= p.width - 1) & (vf >= 0) & (vf <= p.height - 1)
@@ -454,6 +443,27 @@ def _sample(pl: _Placed, grid: Grid, rows: slice, cols: slice, bilinear: bool = 
     if pixel:
         return t, angle, valid, u.astype(np.float32), v.astype(np.float32)
     return t, angle, valid
+
+
+def _project(pl: _Placed, de, dn, hz):
+    """For ground points at UTM offsets (de, dn) from the camera (where they are in the
+    mosaic, before the alignment correction), hz metres below it: the frame's pixel each is
+    seen at (column, row; continuous, pixel centres at whole numbers), how far in front of the
+    camera it is (positive: seen), and its off-nadir angle in degrees."""
+    p = pl.frame.pose
+    if pl.rot or pl.shift.any():
+        de, dn = de + pl.shift[0] - pl.rot * dn, dn + pl.shift[1] + pl.rot * de
+    east = pl.j_inv[0, 0] * de + pl.j_inv[0, 1] * dn
+    north = pl.j_inv[1, 0] * de + pl.j_inv[1, 1] * dn
+    rt = pl.r_t
+    fwd = rt[0, 0] * north + rt[0, 1] * east + rt[0, 2] * hz
+    right = rt[1, 0] * north + rt[1, 1] * east + rt[1, 2] * hz
+    down = rt[2, 0] * north + rt[2, 1] * east + rt[2, 2] * hz
+    with np.errstate(divide="ignore", invalid="ignore"):
+        uf = pl.cx + p.focal_px * right / fwd
+        vf = pl.cy + p.focal_px * down / fwd
+    angle = np.degrees(np.arctan2(np.hypot(east, north), hz)).astype(np.float32)
+    return uf, vf, fwd, angle
 
 
 def _window(pl: _Placed, grid: Grid) -> tuple[slice, slice]:
@@ -477,6 +487,7 @@ class Mosaic:
     report: dict
     heights: Heights | None = None      # the surface the frames were projected onto (None: the plane)
     source_px: np.ndarray | None = None  # float32 (height, width, 2): the source frame's column and row, NaN where none
+    placed: list[_Placed] | None = None  # the frames as placed (index = source band value), for the frame models
 
 
 def _grid(placed: list[_Placed], gsd: float, zone: int, north: bool) -> Grid:
@@ -672,7 +683,7 @@ def _composite(layout: _Layout, placed: list[_Placed], normalize: bool, composit
     return Mosaic(
         grid, temp, np.where(covered, source, np.nan).astype(np.float32),
         np.where(covered, best_angle, np.nan).astype(np.float32), table, layout.ground_alt, layout.ground_source,
-        report, layout.heights, source_px,
+        report, layout.heights, source_px, list(placed),
     )
 
 
@@ -1195,6 +1206,8 @@ def write(m: Mosaic, path: Path, compression: str = "deflate", unit: str = "C",
             "bands": [{"name": n, "unit": u} for n, u in bands],
             "report": m.report, "frames": m.frames,
         }
+        if m.placed is not None:
+            info["frame_models"] = _frame_models(m)
     else:
         frames = [{**{k: f[k] for k in _LOCATION_FREE_FRAME_KEYS if k in f},
                    "x_m": round(f["utm_e"] - g.e0, 3), "y_m": round(g.n0 - f["utm_n"], 3)} for f in m.frames]
@@ -1207,7 +1220,8 @@ def write(m: Mosaic, path: Path, compression: str = "deflate", unit: str = "C",
         }
     items = [f'<Item name="DESCRIPTION" sample="{i}" role="description">{n}</Item>'
              f'<Item name="UNITTYPE" sample="{i}" role="unittype">{escape(u)}</Item>' for i, (n, u) in enumerate(bands)]
-    items.append(f'<Item name="dji_thermal_mosaic">{escape(json.dumps(info, separators=(",", ":")))}</Item>')
+    embedded = {k: v for k, v in info.items() if k != "frame_models"}
+    items.append(f'<Item name="dji_thermal_mosaic">{escape(json.dumps(embedded, separators=(",", ":")))}</Item>')
     geokeys = [1, 1, 0, 4, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, g.epsg, 3076, 0, 1, 9001]
     extra = {
         42112: tiffout.tag("s", "<GDALMetadata>" + "".join(items) + "</GDALMetadata>"),
@@ -1229,6 +1243,148 @@ def write(m: Mosaic, path: Path, compression: str = "deflate", unit: str = "C",
     with files.replaced_when_done(sidecar) as tmp:
         tmp.write_text(json.dumps(info, indent=2), encoding="utf-8")
     return path, sidecar
+
+
+FRAME_MODELS_VERSION = 1
+
+
+def _frame_models(m: Mosaic) -> dict:
+    """How each placed frame sees the ground, for FrameModels: its camera (UTM position, height
+    above the ground plane, local-to-UTM map, NED-to-camera rotation with the boresight, lens),
+    its alignment correction, the surface it was projected onto, and its corrected footprint's
+    corners in lon/lat."""
+    g, h = m.grid, m.heights
+    frames = []
+    for k, pl in enumerate(m.placed):
+        p = pl.frame.pose
+        corners = pl.corrected_footprint()[::9]               # _place's outline: 9 points per edge
+        lat, lon = geo.utm_inverse(corners[:, 0], corners[:, 1], g.zone, g.north)
+        frames.append({
+            "index": k, "file": pl.frame.name, "width": p.width, "height": p.height, "focal_px": p.focal_px,
+            "principal_point_px": [pl.cx, pl.cy], "camera_utm": pl.c.tolist(), "height_m": pl.h,
+            "local_to_utm": pl.j.tolist(), "ned_to_camera": pl.r_t.tolist(),
+            "alignment_shift_m": pl.shift.tolist(), "alignment_rotation_rad": pl.rot,
+            "footprint_lonlat": np.column_stack([lon, lat]).tolist(),
+        })
+    return {
+        "version": FRAME_MODELS_VERSION, "crs": f"EPSG:{g.epsg}",
+        "surface": None if h is None else {"origin_utm": [h.e0, h.n0], "cell_m": h.cell,
+                                           "height_above_plane_m": h.z.tolist()},
+        "frames": frames,
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class FrameModels:
+    """How each frame of a mosaic saw the ground, read from the mosaic's JSON sidecar
+    (read_frame_models): enough to find a ground point in every frame that saw it, not only in
+    the one the mosaic took it from. Frames are numbered as in the sidecar's frame table (the
+    source band's values). Points and areas are WGS84 lon/lat, in degrees."""
+    files: tuple[str, ...]
+    footprints: tuple[np.ndarray, ...]  # each frame's ground outline after alignment, (4, 2) lon/lat corners
+    _placed: tuple[_Placed, ...]
+    _zone: int
+    _north: bool
+
+    @classmethod
+    def from_sidecar(cls, info: dict) -> FrameModels | None:
+        """From a mosaic sidecar's contents; None when it has no frame models (written before
+        dji-thermal-cli 1.5.0, or with the location removed)."""
+        fm = info.get("frame_models")
+        if not fm:
+            return None
+        if fm.get("version") != FRAME_MODELS_VERSION:
+            raise ValueError(f"frame models version {fm.get('version')!r} is not supported")
+        epsg = int(str(fm["crs"]).split(":")[1])
+        zone, north = epsg % 100, epsg < 32700
+        s = fm["surface"]
+        heights = None if s is None else Heights(s["origin_utm"][0], s["origin_utm"][1], s["cell_m"],
+                                                 np.asarray(s["height_above_plane_m"], float))
+        placed, footprints = [], []
+        for f in fm["frames"]:
+            pose = Pose(math.nan, math.nan, math.nan, math.nan, math.nan, math.nan, f["focal_px"], f["width"],
+                        f["height"], None, None, {})
+            j = np.asarray(f["local_to_utm"], float)
+            placed.append(_Placed(
+                Frame(f["file"], np.zeros((0, 0), np.float32), pose), f["height_m"], np.asarray(f["camera_utm"], float),
+                j, np.linalg.inv(j), np.asarray(f["ned_to_camera"], float), *f["principal_point_px"],
+                np.zeros((0, 2)), np.asarray(f["alignment_shift_m"], float), f["alignment_rotation_rad"], heights))
+            footprints.append(np.asarray(f["footprint_lonlat"], float))
+        return cls(tuple(f["file"] for f in fm["frames"]), tuple(footprints), tuple(placed), zone, north)
+
+    def _see(self, lon, lat):
+        """For points lon/lat: each frame's pixel, angle and whether it saw them, (frames, points)."""
+        lon, lat = np.atleast_1d(np.asarray(lon, float)), np.atleast_1d(np.asarray(lat, float))
+        e, n = geo.utm(lat, lon, self._zone, self._north)
+        shape = (len(self._placed), e.size)
+        u, v, angle = np.full(shape, np.nan), np.full(shape, np.nan), np.full(shape, np.nan)
+        for k, pl in enumerate(self._placed):
+            hz = pl.h if pl.heights is None else np.maximum(pl.h - pl.heights.at_points(e, n), 0.1)
+            uf, vf, fwd, a = _project(pl, e - pl.c[0], n - pl.c[1], hz)
+            w, h = pl.frame.pose.width, pl.frame.pose.height
+            # seen as the mosaic samples: the nearest pixel is inside the frame
+            seen = (fwd > 0) & (uf >= -0.5) & (uf < w - 0.5) & (vf >= -0.5) & (vf < h - 0.5)
+            u[k], v[k], angle[k] = np.where(seen, uf, np.nan), np.where(seen, vf, np.nan), np.where(seen, a, np.nan)
+        return u, v, angle
+
+    def pixels(self, lon, lat) -> np.ndarray:
+        """Each frame's pixel for points lon/lat (scalars or 1-D arrays): (frames, points, 2),
+        the column and row (continuous, pixel centres at whole numbers; the mosaic reads the
+        nearest, floor(x + 0.5)), NaN where the frame did not see the point."""
+        u, v, _ = self._see(lon, lat)
+        return np.stack([u, v], axis=-1)
+
+    def view_angles(self, lon, lat) -> np.ndarray:
+        """The off-nadir angle each frame saw points lon/lat at, in degrees: (frames, points),
+        NaN where it did not see them."""
+        return self._see(lon, lat)[2]
+
+    def covering(self, lon: float, lat: float) -> list[int]:
+        """The frames that saw the point lon/lat."""
+        u, _, _ = self._see(lon, lat)
+        return [int(k) for k in np.flatnonzero(np.isfinite(u[:, 0]))]
+
+    def meeting(self, outline) -> list[int]:
+        """The frames whose footprint meets the area inside outline, a polygon of (lon, lat)
+        vertices (not closed: the last joins the first)."""
+        area = np.asarray(outline, float)
+        if area.ndim != 2 or area.shape[1] != 2 or len(area) < 3:
+            raise ValueError("an area needs at least 3 (lon, lat) vertices")
+        to_utm = lambda pts: np.column_stack(geo.utm(pts[:, 1], pts[:, 0], self._zone, self._north))  # noqa: E731
+        a = to_utm(area)
+        return [k for k, fp in enumerate(self.footprints) if _polygons_meet(a, to_utm(fp))]
+
+
+def read_frame_models(path: Path) -> FrameModels | None:
+    """The frame models in a mosaic's JSON sidecar (path: the sidecar or its GeoTIFF), or None
+    when it has none."""
+    return FrameModels.from_sidecar(json.loads(Path(path).with_suffix(".json").read_text(encoding="utf-8")))
+
+
+def _inside(points: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """Which points (k, 2) are inside the polygon (m, 2), by the even-odd rule."""
+    x, y = poly[:, 0], poly[:, 1]
+    x2, y2 = np.roll(x, -1), np.roll(y, -1)
+    px, py = points[:, :1], points[:, 1:]
+    straddles = (y > py) != (y2 > py)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        at = x + (x2 - x) * (py - y) / (y2 - y)
+    return ((straddles & (px < at)).sum(axis=1) % 2) == 1
+
+
+def _polygons_meet(a: np.ndarray, b: np.ndarray) -> bool:
+    """Whether two polygons (k, 2) overlap or touch: a vertex of one inside the other, or two
+    edges crossing."""
+    if _inside(a, b).any() or _inside(b, a).any():
+        return True
+    p, r = a, np.roll(a, -1, axis=0) - a
+    q, s = b, np.roll(b, -1, axis=0) - b
+    cross = r[:, None, 0] * s[None, :, 1] - r[:, None, 1] * s[None, :, 0]
+    qp = q[None, :, :] - p[:, None, :]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = (qp[..., 0] * s[None, :, 1] - qp[..., 1] * s[None, :, 0]) / cross
+        w = (qp[..., 0] * r[:, None, 1] - qp[..., 1] * r[:, None, 0]) / cross
+    return bool(((cross != 0) & (t >= 0) & (t <= 1) & (w >= 0) & (w <= 1)).any())
 
 
 def write_heights(m: Mosaic, path: Path, compression: str = "deflate", located: bool = True) -> Path | None:
