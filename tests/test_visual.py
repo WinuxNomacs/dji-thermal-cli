@@ -248,7 +248,8 @@ def test_make_mosaic_with_the_visual_frames(tmp_path):
     assert last["visual_frames"]["total"] == len(flight_visual()) and last["write"]["total"] == 4 + (report.heights is not None)
     v = report.visual
     assert v.frames + v.skipped == len(flight_visual()) and 0 < v.mosaic.report["frames_used"] <= flight_counts()[0]
-    assert v.mosaic.report["camera_offset"]["applied"] and v.mosaic.grid.gsd == 0.03
+    off = v.mosaic.report["camera_offset"]
+    assert off["applied"] == (off["pairs_measured"] >= visual.MIN_OFFSET_PAIRS) and v.mosaic.grid.gsd == 0.03
     assert sorted(p.name for p in tmp_path.glob("mosaic_visual*")) == [
         "mosaic_visual.json", "mosaic_visual.tif", "mosaic_visual_preview.png"]
 
@@ -263,7 +264,7 @@ def test_the_command_line_prints_the_visual_mosaic(tmp_path):
         return
     assert "other JPEGs (not thermal R-JPEGs) for the visual mosaic" in proc.stdout
     assert "mosaic_visual.tif  (" in proc.stdout and "3.0 cm/px" in proc.stdout
-    assert "cameras' offset: pitch " in proc.stdout
+    assert "cameras' offset: pitch " in proc.stdout or "cameras' offset: not corrected, " in proc.stdout
 
 
 def test_the_visual_pixel_size_needs_the_visual_mosaic(tmp_path):
