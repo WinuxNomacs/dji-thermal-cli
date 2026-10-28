@@ -6,6 +6,18 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- A mosaic of the visual (RGB) frames DJI's thermal drones take with the thermal ones
+  (`--mosaic-visual`, `MosaicOptions(visual=True)`): `mosaic_visual.tif` (red, green, blue
+  and alpha, 8-bit, on the thermal mosaic's UTM zone) with its JSON sidecar (the visual
+  frames, each with its thermal frame, and their frame models) and
+  `mosaic_visual_preview.png`. Each visual frame is paired with the thermal frame exposed
+  with it and placed as that frame is in the thermal mosaic; the small rotation between the
+  two cameras is measured from the pairs and corrected, so the two mosaics line up (on a
+  327-frame M4T flight: 10 cm apart before, 2.6 cm after). Zoom frames are left out. Its
+  pixel size is the visual frames' own, or `--mosaic-visual-gsd`. `read_pose(visual=True)`
+  poses a visual frame with its 35 mm-equivalent focal length, and the TIFF writer takes
+  RGB with alpha.
+
 ## [1.5.0] - 2026-10-27
 
 - The mosaic's JSON sidecar holds each frame's model (`frame_models`): its camera, lens and

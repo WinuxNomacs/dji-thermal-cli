@@ -104,10 +104,13 @@ def _exif_number(value) -> float | None:
     return f if math.isfinite(f) and f > 0 else None
 
 
-def read_pose(data: bytes, size: tuple[int, int] | None = None) -> tuple[Pose | None, str | None]:
+def read_pose(data: bytes, size: tuple[int, int] | None = None,
+              visual: bool = False) -> tuple[Pose | None, str | None]:
     """The frame's camera pose from its DJI XMP and EXIF, or (None, why not), for an image of
     the frame's measured size (width, height): its R-JPEG's, read when not given. That differs
-    from the JPEG's in super-resolution images (M4T: a 1280x1024 JPEG over 640x512 measurements)."""
+    from the JPEG's in super-resolution images (M4T: a 1280x1024 JPEG over 640x512 measurements).
+    visual: a visual (RGB) image, of the JPEG's own size, its focal length from the 35 mm
+    equivalent (SENSORS are the thermal cameras')."""
     f = djixmp.fields(data)
     need = ("GpsLatitude", "GpsLongitude", "AbsoluteAltitude", "GimbalYawDegree", "GimbalPitchDegree",
             "GimbalRollDegree")
@@ -116,7 +119,9 @@ def read_pose(data: bytes, size: tuple[int, int] | None = None) -> tuple[Pose | 
     if missing:
         return None, f"no camera pose in the DJI XMP (missing {', '.join(missing)})"
     image = Image.open(io.BytesIO(data))
-    if size is None:
+    if visual:
+        size = image.size
+    elif size is None:
         try:
             rj = tsdk.open(data)
             size = rj.width, rj.height
@@ -126,8 +131,8 @@ def read_pose(data: bytes, size: tuple[int, int] | None = None) -> tuple[Pose | 
     exif = image.getexif()
     lens = exif.get_ifd(0x8769)
     model = str(exif.get(272, "")).strip("\0 ")
-    focal_px, focal_source = focal_length_px(model, width, height, _exif_number(lens.get(37386)),
-                                             _exif_number(lens.get(41989)))
+    focal_px, focal_source = focal_length_px("" if visual else model, width, height,
+                                             _exif_number(lens.get(37386)), _exif_number(lens.get(41989)))
     if focal_px is None:
         return None, "no focal length in the EXIF"
     rel = djixmp.number(f, "RelativeAltitude")
@@ -191,12 +196,16 @@ def _boresight(pitch: float, yaw: float) -> np.ndarray:
     return ry @ rz
 
 
-def _place(frame: Frame, ground: float, zone: int, north: bool, bias: tuple[float, float] = (0.0, 0.0)) -> _Placed | None:
+def _place(frame: Frame, ground: float, zone: int, north: bool, bias: tuple[float, float] = (0.0, 0.0),
+           r: np.ndarray | None = None) -> _Placed | None:
+    """The frame placed over the ground plane, its camera turned by the boresight bias (or
+    pointing as r says, camera body -> north/east/down)."""
     p = frame.pose
     h = p.abs_alt - ground
     if h <= 0:
         return None
-    r = rotation(p.yaw, p.pitch, p.roll) @ _boresight(*bias)
+    if r is None:
+        r = rotation(p.yaw, p.pitch, p.roll) @ _boresight(*bias)
     cx, cy = (p.width - 1) / 2, (p.height - 1) / 2
     c = np.array(geo.utm(p.lat, p.lon, zone, north))
     j = geo.local_to_utm(p.lat, p.lon, zone, north)

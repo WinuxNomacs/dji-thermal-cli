@@ -182,6 +182,8 @@ def _build_parser() -> argparse.ArgumentParser:
     proc.add_argument("--mosaic-dsm-offset", type=float, metavar="METRES", help="Metres added to the DSM's altitudes to match the frames' (default: estimated from the rangefinder)")
     proc.add_argument("--mosaic-height-cell", type=int, default=mosaic.HEIGHT_CELL_PX, metavar="PIXELS", help="Size of the height cells, in mosaic pixels (default: %(default)d)")
     proc.add_argument("--mosaic-gsd", type=float, default=None, metavar="METRES", help="Mosaic pixel size (default: the frames' median ground sample distance)")
+    proc.add_argument("--mosaic-visual", action="store_true", help="Also mosaic the visual (RGB) frames the drone took with the thermal ones (M4T, M30T, M3T, H20T, H30T wide camera; zoom frames are left out): <output-dir>/mosaic_visual.tif (red, green, blue, alpha; UTM) with a .json sidecar and mosaic_visual_preview.png. Each visual frame is placed as its thermal frame is in the thermal mosaic, the two cameras' offset measured and corrected, so the two mosaics line up")
+    proc.add_argument("--mosaic-visual-gsd", type=float, default=None, metavar="METRES", help="The visual mosaic's pixel size (default: the visual frames' median ground sample distance)")
     proc.add_argument("--compression", choices=outputs.COMPRESSIONS, default="deflate", help="TIFF/EXR compression: deflate = lossless Deflate (EXR: ZIP), the default; none = uncompressed. PNG is always compressed")
     proc.add_argument("--jobs", "-j", type=_positive_int, default=None, help="Worker processes, and the mosaic's matching threads (default: min(CPU count, 8); 1 = in this process)")
     proc.add_argument("--quiet", "-q", action="store_true", help="Don't show the mosaic's progress (--mosaic, --normalize) on stderr; results, skipped files and errors are still printed")
@@ -284,7 +286,9 @@ class _MosaicProgress:
     one line as each stage starts. Other events go to show, clearing the line first."""
 
     STAGES = {"ambient": "reading ambient temperatures", "frames": "reading frames", "align": "aligning",
-              "composite": "compositing", "check": "checking alignment", "write": "writing"}
+              "composite": "compositing", "check": "checking alignment", "visual_frames": "reading visual frames",
+              "visual_offset": "measuring the visual camera's offset", "visual_composite": "compositing visual frames",
+              "write": "writing"}
 
     def __init__(self, show, out=None, quiet: bool = False):
         self.show, self.out, self.quiet = show, out or sys.stderr, quiet
@@ -329,6 +333,7 @@ def _cmd_process(args: argparse.Namespace) -> None:
                                     normalize=args.mosaic_normalize, gsd=args.mosaic_gsd,
                                     heights=args.mosaic_heights, height_cell=args.mosaic_height_cell,
                                     dsm=args.mosaic_dsm, dsm_offset=args.mosaic_dsm_offset,
+                                    visual=args.mosaic_visual, visual_gsd=args.mosaic_visual_gsd,
                                     units=tuple(u for group in (args.mosaic_units or [["C"]]) for u in group))
     except api.SettingsError as e:
         _fail(e)
@@ -384,17 +389,18 @@ def _location_notice(settings: api.Settings) -> None:
               "ODM/WebODM can't use these frames; process without it for them.")
 
 
-def _print_mosaic_counts(counts: dict, max_pitch: float) -> None:
+def _print_mosaic_counts(counts: dict, max_pitch: float, visual: bool = False) -> None:
+    others = "for the visual mosaic" if visual else "ignored"
     print(f"\nMosaic: {counts['frames']} nadir frames, {counts['oblique']} oblique left out (pitch above {max_pitch:g} deg), "
           f"{counts['unusable']} unusable"
-          + (f", {counts['not_thermal']} other JPEGs (not thermal R-JPEGs) ignored." if counts["not_thermal"] else "."))
+          + (f", {counts['not_thermal']} other JPEGs (not thermal R-JPEGs) {others}." if counts["not_thermal"] else "."))
 
 
 def _print_mosaic(rep: api.MosaicReport, settings: api.Settings, max_pitch: float) -> None:
     m = rep.mosaic
     g, r = m.grid, m.report
     _print_mosaic_counts({"frames": rep.frames, "oblique": rep.oblique, "unusable": rep.unusable,
-                          "not_thermal": rep.not_thermal}, max_pitch)
+                          "not_thermal": rep.not_thermal}, max_pitch, visual=bool(rep.visual or rep.visual_note))
     crs = "" if settings.strip_location else f", EPSG:{g.epsg}"       # the UTM zone tells roughly where
     for tif, sidecar in rep.files:
         print(f"  {tif}  ({g.width}x{g.height} px, {g.gsd * 100:.1f} cm/px{crs})\n  {sidecar}")
@@ -424,6 +430,30 @@ def _print_mosaic(rep: api.MosaicReport, settings: api.Settings, max_pitch: floa
     if mis and mis.get("pairs"):
         print(f"  misalignment between overlapping frames: {mis['median_m'] * 100:.0f} cm median, "
               f"{mis['p90_m'] * 100:.0f} cm p90 ({mis['pairs']} pairs); objects above the ground plane add parallax")
+    if rep.visual_note:
+        print(f"\nVisual mosaic: none, {rep.visual_note}.")
+    elif rep.visual:
+        _print_visual(rep.visual, settings)
+
+
+def _print_visual(v: api.VisualReport, settings: api.Settings) -> None:
+    m = v.mosaic
+    g, r = m.grid, m.report
+    print(f"\nVisual mosaic: {r['frames_used']} visual frames paired with the thermal mosaic's"
+          + (f", {len(r['thermal_frames_without_visual'])} thermal frames without one" if r["thermal_frames_without_visual"] else "")
+          + (f", {len(r['visual_frames_unused'])} visual frames unused (oblique or unpaired)" if r["visual_frames_unused"] else "")
+          + (f", {v.skipped} other JPEGs ignored" if v.skipped else "") + ".")
+    crs = "" if settings.strip_location else f", EPSG:{g.epsg}"
+    print(f"  {v.file}  ({g.width}x{g.height} px, {g.gsd * 100:.1f} cm/px{crs})\n  {v.sidecar}")
+    print(f"  {v.preview}" + (f"  (1/{v.preview_reduction} size)" if v.preview_reduction > 1 else ""))
+    off = r["camera_offset"]
+    if off.get("applied"):
+        b = off["boresight_deg"]
+        print(f"  cameras' offset: pitch {b['pitch']:+.2f} deg, yaw {b['yaw']:+.2f} deg from {off['pairs_used']} pairs; "
+              f"visual vs thermal {off['offset_before_m']['median'] * 100:.0f} cm median before, "
+              f"{off['residual_m']['median'] * 100:.0f} cm after")
+    else:
+        print(f"  cameras' offset: not corrected, {off['reason']}")
 
 
 TABLE_COLUMNS = (   # (header, flattened key, format); {u} is the temperature unit
