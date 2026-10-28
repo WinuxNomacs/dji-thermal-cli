@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-27
+
 - A mosaic of the visual (RGB) frames DJI's thermal drones take with the thermal ones
   (`--mosaic-visual`, `MosaicOptions(visual=True)`): `mosaic_visual.tif` (red, green, blue
   and alpha, 8-bit, on the thermal mosaic's UTM zone) with its JSON sidecar (the visual

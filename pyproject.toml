@@ -1,6 +1,6 @@
 [project]
 name = "dji-thermal-cli"
-version = "1.5.0"
+version = "1.6.0"
 description = "DJI R-JPEG thermal images to temperatures, in pure Python: CLI and API for datasets, mosaics and WebODM"
 readme = "README.md"
 # AGPL for this project; tsdk/powf32.py carries Arm's optimized-routines powf tables
