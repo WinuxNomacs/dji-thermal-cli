@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-10-28
+
 - A FLIR radiometric JPEG (the kind DJI's Zenmuse XT2 writes, with its data in APP1 "FLIR"
   segments) is reported as unsupported, saying what it is ("a FLIR radiometric JPEG (XT2), not
   a DJI R-JPEG format"), instead of as an ordinary JPEG without thermal data: `classify` gives
