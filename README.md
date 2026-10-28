@@ -278,6 +278,56 @@ for 42 frames (14 s on the plane) and about 2.5 minutes for 327.
 The frames must carry DJI XMP position and attitude (e.g. the M4T); the older cameras'
 samples don't.
 
+### Visual mosaic
+
+DJI's thermal drones (M4T, M30T, M3T, H20T, H30T) can save the wide camera's visual
+(RGB) image with each thermal one. `--mosaic-visual` mosaics those too, alongside the
+thermal mosaic, so the two can be compared:
+
+```
+dji-thermal-cli process --input-dir /path/to/flight --output-dir out --mosaic --mosaic-visual
+```
+
+It writes, besides the thermal mosaic's files:
+
+- **`mosaic_visual.tif`:** a GeoTIFF on the same UTM zone with four 8-bit bands: red,
+  green, blue, and alpha (0 where no frame covers).
+- **`mosaic_visual.json`:** the grid, a report, the table of visual frames (each with its
+  thermal frame) and their `frame_models`, as the thermal mosaic's sidecar.
+- **`mosaic_visual_preview.png`:** a quick look, at most 2048 pixels on its longer side.
+
+How it works:
+
+- **Pairing:** the JPEGs that aren't thermal R-JPEGs are read as visual frames when they
+  carry a DJI camera pose and aren't a zoom camera's (`ImageSource`). Each is paired with
+  the thermal frame exposed with it: DJI's `UTCAtExposure` within 0.25 s (on an M4T the two
+  are 10 to 100 ms apart, the captures at least 0.5 s), or, when either has no exposure
+  time, the same capture number in the same folder. A visual frame is used only when its
+  thermal frame is in the thermal mosaic, so the oblique ones are left out with theirs.
+- **Lens:** the focal length is the EXIF 35 mm equivalent (24 mm on the M4T's wide camera,
+  2795 px at 4032×3024), over the JPEG's own size. Lens distortion isn't modelled.
+- **Placement:** each visual frame is placed as its thermal frame is in the thermal mosaic:
+  the same attitude with the alignment's boresight, the same shift and rotation, the same
+  surface. Only its own position and lens are its own.
+- **The cameras' offset:** the two cameras don't point exactly the same way. For each pair,
+  the offset between where the visual and the thermal frame show the same ground is measured
+  by phase correlation of their edges (gradient magnitudes), on the largest square inside
+  the thermal footprint. A robust least-squares fit turns these offsets into one small
+  rotation between the cameras (pitch and yaw), applied to every visual frame. With fewer
+  than 5 pairs measured it isn't corrected, and the report says so.
+- **One frame per pixel:** each pixel takes its colour from the frame that saw it most
+  directly, interpolated bilinearly (colours are a picture, not measurements).
+- **Pixel size:** the visual frames' own ground sample distance, or
+  `--mosaic-visual-gsd METRES`. At two or more times the frames' own, the JPEGs are decoded
+  at a half, a quarter or an eighth of their size, which is faster.
+
+On a 327-frame M4T flight at 21 m (151 nadir pairs), the visual mosaic is 5764×6256 px at
+0.6 cm/px (the thermal one: 1.6 cm/px), 86 MB, built in about a minute after the thermal
+mosaic. 94 pairs were measured; the cameras' offset (pitch +0.25°, yaw −0.29°) moved the
+visual frames by 10 cm (median), and the pairs then agree to 2.6 cm (median, 4.5 cm p90).
+With `--mosaic-normalize` and the as-converted mosaic (the Python API's
+`as_converted_dir`), the visual mosaic is written once, in the output directory.
+
 ## Supported cameras
 
 | Camera | R-JPEG format |
@@ -445,8 +495,8 @@ dji-thermal-cli process --input-dir flight/ --output-dir share/ --strip-location
   and body serial numbers.
 - Kept: capture time, camera model, gimbal and flight attitude, the rangefinder distance,
   the measurement parameters, and the `dtc:` record, which notes `LocationRemoved="True"`.
-- The mosaic is still placed using the GPS, then written as a plain TIFF without its
-  georeference. Its JSON sidecar gives each frame's position in metres from the mosaic's
+- The mosaic (and the visual mosaic) is still placed using the GPS, then written as a plain
+  TIFF without its georeference. Its JSON sidecar gives each frame's position in metres from the mosaic's
   top-left corner (`x_m`, `y_m`) instead of coordinates.
 
 ODM and WebODM need the GPS to place frames, so give them ordinary outputs and make a
@@ -484,7 +534,11 @@ dtc.make_mosaic("flight/", "out-dsm/", settings, dtc.MosaicOptions(dsm="odm/dsm.
   `make_mosaic`. Each returns a result object (`ListResult`, `CheckResult`, `Measurement`,
   `ProcessReport`, `MosaicReport`).
 - **MosaicOptions** holds what the `--mosaic-*` options set: `heights` (`"auto"` or
-  `"plane"`), `height_cell`, `dsm` and `dsm_offset` among them.
+  `"plane"`), `height_cell`, `dsm`, `dsm_offset`, `visual` and `visual_gsd` among them.
+- **The visual mosaic:** with `MosaicOptions(visual=True)`, `report.visual` is a
+  `VisualReport` (its `mosaic` holds the colours as `rgb` and each pixel's frame as
+  `source`, -1 where none; `file`, `sidecar`, `preview`), or None with
+  `report.visual_note` saying why there is none. `read_frame_models` reads its sidecar too.
 - **Both mosaics from one build:** `make_mosaic(..., as_converted_dir="out-raw/")`, with
   `normalize=True`, also writes the mosaic without the normalization there, laid out and
   checked once for both (`report.as_converted` is its report). It is laid out from the
@@ -519,7 +573,8 @@ dtc.make_mosaic("flight/", "out-dsm/", settings, dtc.MosaicOptions(dsm="odm/dsm.
 
   The stages, in order and each only when it runs: `ambient` (files), `frames` (files),
   `align` (per round: `pairs`, then `solve steps`), `composite` (frames), `check` (pairs),
-  `write` (files). Each starts at `done = 0` and ends at its total. There is no overall
+  with `visual=True` `visual_frames` (files), `visual_offset` (pairs) and `visual_composite`
+  (frames), then `write` (files). Each starts at `done = 0` and ends at its total. There is no overall
   percentage, as the stages' share of the time varies with the flight.
 - **Parallelism:** `jobs` as on the command line (`1` runs in the calling process, as does
   any job in a daemonic process, such as a Celery worker's; a mosaic still aligns in threads).

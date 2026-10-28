@@ -180,7 +180,7 @@ def write_tiff(path: Path, pixels: np.ndarray, metadata: SourceMetadata | None =
     """Write a TIFF carrying the source EXIF and XMP.
 
     pixels: 2-D float32, uint16, int16 or uint8 (one band), (height, width, 3) uint8 RGB,
-    or (height, width, bands) float32.
+    (height, width, 4) uint8 RGB with alpha, or (height, width, bands) float32.
     band_name: add Camera:BandName="LWIR" to the XMP (single-band thermal products).
     compression: "deflate" (lossless, in strips of about 64 KB) or "none" (one strip).
     extra_tags: {tag: tag(...)} added to IFD0 (little-endian payloads; e.g. GeoTIFF keys).
@@ -188,8 +188,8 @@ def write_tiff(path: Path, pixels: np.ndarray, metadata: SourceMetadata | None =
     if compression not in _COMPRESSION:
         raise ValueError(f"unknown TIFF compression {compression!r}")
     pixels = np.ascontiguousarray(pixels)
-    if pixels.ndim == 3 and pixels.shape[2] == 3 and pixels.dtype == np.uint8:
-        spp = 3
+    if pixels.ndim == 3 and pixels.shape[2] in (3, 4) and pixels.dtype == np.uint8:
+        spp = pixels.shape[2]
     elif pixels.ndim == 3 and pixels.dtype == np.float32:
         spp = pixels.shape[2]
     elif pixels.ndim == 2 and pixels.dtype in (np.float32, np.uint16, np.int16, np.uint8):
@@ -247,7 +247,7 @@ def write_tiff(path: Path, pixels: np.ndarray, metadata: SourceMetadata | None =
         257: (_LONG, 1, _entry_value(bo, _LONG, height)),
         258: shorts(*[bits] * spp),
         259: shorts(_COMPRESSION[compression]),
-        262: shorts(2 if spp == 3 and pixels.dtype == np.uint8 else 1),
+        262: shorts(2 if spp in (3, 4) and pixels.dtype == np.uint8 else 1),
         273: longs(*strip_offsets),
         277: shorts(spp),
         278: (_LONG, 1, _entry_value(bo, _LONG, rows_per_strip)),
@@ -259,6 +259,8 @@ def write_tiff(path: Path, pixels: np.ndarray, metadata: SourceMetadata | None =
         entries[317] = shorts(predictor)
     if spp > 1 and pixels.dtype != np.uint8:
         entries[338] = shorts(*[0] * (spp - 1))          # ExtraSamples: unspecified data bands
+    elif spp == 4:
+        entries[338] = shorts(2)                         # ExtraSamples: unassociated alpha
     for tag_id, (type_, count, raw) in (extra_tags or {}).items():
         if bo != "<":
             raise ValueError("extra_tags need a little-endian file")

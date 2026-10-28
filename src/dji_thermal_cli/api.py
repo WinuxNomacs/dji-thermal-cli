@@ -31,11 +31,12 @@ from pathlib import Path
 
 import numpy as np
 
-from . import adjust, checks, core, dataset, listing, mosaic as _mosaic, outputs as _outputs, units, webodm as _webodm
+from . import adjust, checks, core, dataset, listing, mosaic as _mosaic, outputs as _outputs, units, visual as _visual
+from . import webodm as _webodm
 
 __all__ = [
     "Settings", "MosaicOptions", "Event", "SettingsError", "MosaicError", "FileProblem",
-    "ListResult", "CheckResult", "Measurement", "ProcessReport", "MosaicReport",
+    "ListResult", "CheckResult", "Measurement", "ProcessReport", "MosaicReport", "VisualReport",
     "Normalization", "scan", "classify", "describe", "list_dataset", "check", "measure", "process",
     "make_mosaic", "normalization", "FrameModels", "read_frame_models",
     "PALETTES", "palette_index", "parse_outputs",
@@ -170,7 +171,9 @@ class MosaicOptions:
     the frames onto the surface estimated from their parallax (with align; see mosaic._align),
     on cells height_cell mosaic pixels wide; "plane" onto the flat ground. dsm: a surface model
     GeoTIFF (WGS84 UTM or lat/lon, metres) to project onto instead, with dsm_offset metres added
-    to its altitudes (None: estimated from the rangefinder; see mosaic._dsm_surface)."""
+    to its altitudes (None: estimated from the rangefinder; see mosaic._dsm_surface). visual:
+    also the mosaic of the visual (RGB) frames taken with the thermal ones (see visual), at
+    visual_gsd metres per pixel (None: the visual frames' own)."""
 
     max_pitch: float = _mosaic.DEFAULT_MAX_PITCH
     align: bool = True
@@ -181,6 +184,8 @@ class MosaicOptions:
     height_cell: int = _mosaic.HEIGHT_CELL_PX
     dsm: Path | None = None
     dsm_offset: float | None = None
+    visual: bool = False
+    visual_gsd: float | None = None
 
     def __post_init__(self):
         chosen = tuple(dict.fromkeys(str(u).upper() for u in self.units))
@@ -189,6 +194,10 @@ class MosaicOptions:
         object.__setattr__(self, "units", chosen)
         if self.gsd is not None and self.gsd <= 0:
             raise SettingsError("gsd must be positive")
+        if self.visual_gsd is not None and not self.visual:
+            raise SettingsError("visual_gsd needs visual")
+        if self.visual_gsd is not None and self.visual_gsd <= 0:
+            raise SettingsError("visual_gsd must be positive")
         if self.heights not in ("auto", "plane"):
             raise SettingsError(f"heights must be 'auto' or 'plane', not {self.heights!r}")
         if not 8 <= self.height_cell <= 1024:
@@ -245,8 +254,10 @@ class Event:
     them given), "frames" (files measured), "align" (per round, data["round"] of
     data["rounds"]: the overlapping pairs measured, counted by the area they overlap so the
     count moves evenly, then the solve's reweighting steps, unit "solve steps"),
-    "composite" (frames), "check" (pairs, the misalignment report; make_mosaic only) and
-    "write" (files; make_mosaic only). With make_mosaic's as_converted_dir, "frames",
+    "composite" (frames), "check" (pairs, the misalignment report; make_mosaic only), with
+    MosaicOptions.visual "visual_frames" (files: the other JPEGs read), "visual_offset" (pairs:
+    the cameras' offset measured) and "visual_composite" (frames), and "write" (files;
+    make_mosaic only). With make_mosaic's as_converted_dir, "frames",
     "composite" and "write" count both mosaics. Each stage starts with done = 0. There is no overall
     percentage: the stages' costs vary with the flight.
     """
@@ -472,6 +483,19 @@ class MosaicReport:
     normalize_ambient_c: tuple[float, float] | None   # (ambient, reflected) when normalize set them
     heights: Path | None = None                 # mosaic_heights.tif (None on the plane)
     as_converted: MosaicReport | None = None    # the mosaic written to as_converted_dir
+    visual: VisualReport | None = None          # with MosaicOptions.visual, when there were visual frames
+    visual_note: str = ""                       # why there is no visual mosaic, when asked for
+
+
+@dataclasses.dataclass
+class VisualReport:
+    mosaic: _visual.VisualMosaic                # colours, source frames, report
+    file: Path                                  # mosaic_visual.tif
+    sidecar: Path                               # its JSON
+    preview: Path                               # mosaic_visual_preview.png
+    preview_reduction: int                      # the preview's pixels per side of one of its own
+    frames: int                                 # visual frames read (with a pose, not a zoom camera's)
+    skipped: int                                # other JPEGs that are not usable visual frames
 
 
 def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings: Settings = Settings(),
@@ -480,11 +504,14 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
            as_converted_dir: str | os.PathLike | None = None) -> MosaicReport:
     """Stitch a dataset's nadir frames into one georeferenced mosaic in output_dir:
     mosaic_temp_<unit>.tif (+ .json) per unit, mosaic_preview.png and, when the frames were
-    projected onto estimated heights or a DSM, mosaic_heights.tif.
+    projected onto estimated heights or a DSM, mosaic_heights.tif. With options.visual, also
+    mosaic_visual.tif (+ .json) and mosaic_visual_preview.png from the visual frames taken
+    with the thermal ones (see visual); without any, MosaicReport.visual_note says why.
 
     as_converted_dir (with options.normalize): also write the mosaic without the normalization
     there, from the same layout (alignment and misalignment check), in about the time of one
-    mosaic instead of two; the frames, composite and write stages then count both."""
+    mosaic instead of two; the frames, composite and write stages then count both. The visual
+    mosaic, the same for both, is written in output_dir only."""
     if as_converted_dir is not None and not options.normalize:
         raise SettingsError("as_converted_dir needs options.normalize")
     root = _existing(path)
@@ -495,12 +522,12 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
     adj = settings.adjustments()
     report = _stages(progress, _build_stages(settings, options, options.normalize, check=True) + ["write"])
     parts = 1 if as_converted_dir is None else 2
-    frames, palettes, counts, overrides, normalized = _mosaic_frames(
+    frames, palettes, counts, overrides, normalized, others = _mosaic_frames(
         found, src_root, settings, options, adj, options.normalize, jobs, progress, _share(report, "frames", 0, parts))
     if not frames:
         raise MosaicError("No frames to mosaic.", counts)
     if as_converted_dir is not None:
-        converted, _, converted_counts, _, _ = _mosaic_frames(
+        converted, _, converted_counts, _, _, _ = _mosaic_frames(
             found, src_root, settings, options, adj, False, jobs, progress, _share(report, "frames", 1, parts))
     try:
         if as_converted_dir is None:
@@ -511,8 +538,12 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
                                        jobs=worker_count(jobs, len(frames)), **_height_options(options))
     except ValueError as e:
         raise MosaicError(f"Mosaic failed: {e}", counts) from None
+    visual = note = None
+    if options.visual:
+        visual, note = _visual_mosaic(m, others, src_root, options, jobs, report)
     result = _write_mosaic(m, out, settings, options, compression, adj, palettes, _share(report, "write", 0, parts),
-                           normalize_ambient_c=normalized, **counts)
+                           normalize_ambient_c=normalized, visual=visual, **counts)
+    result.visual_note = note or ""
     if as_converted_dir is not None:
         result.as_converted = _write_mosaic(mc, Path(as_converted_dir), settings, options, compression, adj, palettes,
                                             _share(report, "write", 1, parts), normalize_ambient_c=None,
@@ -545,11 +576,13 @@ def _share(report, stage: str, part: int, parts: int):
 
 
 def _write_mosaic(m: _mosaic.Mosaic, out: Path, settings: Settings, options: MosaicOptions, compression: str,
-                  adj: adjust.Adjustments, palettes, report, **fields) -> MosaicReport:
-    """Write a built mosaic's GeoTIFFs and preview in out (the "write" stage)."""
+                  adj: adjust.Adjustments, palettes, report, visual=None, **fields) -> MosaicReport:
+    """Write a built mosaic's GeoTIFFs and preview in out (the "write" stage), and the visual
+    mosaic's when given ((VisualMosaic, frames read, skipped))."""
     out.mkdir(parents=True, exist_ok=True)
     m.report["adjustments"] = adjust.describe(adj)
-    writes = len(options.units) + 1 + (m.heights is not None)   # each unit's GeoTIFF (+ sidecar), the heights, the preview
+    # each unit's GeoTIFF (+ sidecar), the heights, the preview, the visual mosaic and its preview
+    writes = len(options.units) + 1 + (m.heights is not None) + 2 * (visual is not None)
     if report:
         report("write", 0, writes, "files")
     files = []
@@ -570,8 +603,18 @@ def _write_mosaic(m: _mosaic.Mosaic, out: Path, settings: Settings, options: Mos
         report("write", len(files) + 1, writes, "files")
     preview, low, high = _mosaic.write_preview(m, out / "mosaic_preview.png", lut, lo, hi)
     if report:
-        report("write", writes, writes, "files")
-    return MosaicReport(m, files, preview, palette_name, (low, high), heights=heights, **fields)
+        report("write", writes - 2 * (visual is not None), writes, "files")
+    visual_report = None
+    if visual is not None:
+        vm, read, skipped = visual
+        tif, sidecar = _visual.write(vm, out / "mosaic_visual.tif", compression, located=not adj.strip_location)
+        if report:
+            report("write", writes - 1, writes, "files")
+        visual_preview, reduction = _visual.write_preview(vm, out / "mosaic_visual_preview.png")
+        if report:
+            report("write", writes, writes, "files")
+        visual_report = VisualReport(vm, tif, sidecar, visual_preview, reduction, read, skipped)
+    return MosaicReport(m, files, preview, palette_name, (low, high), heights=heights, visual=visual_report, **fields)
 
 
 @dataclasses.dataclass
@@ -608,8 +651,8 @@ def normalization(path: str | os.PathLike, settings: Settings = Settings(), opti
     adj = dataclasses.replace(settings.adjustments(), replace_above=None, replace_above_value=None,
                               replace_below=None, replace_below_value=None)
     report = _stages(progress, _build_stages(settings, options, True, check=False))
-    frames, _, counts, overrides, _ = _mosaic_frames(found, src_root, settings, options, adj, True, jobs, progress,
-                                                     report)
+    frames, _, counts, overrides, _, _ = _mosaic_frames(found, src_root, settings, options, adj, True, jobs,
+                                                        progress, report)
     if not frames:
         raise MosaicError("No frames to compare for normalization.", counts)
     try:
@@ -624,9 +667,36 @@ def normalization(path: str | os.PathLike, settings: Settings = Settings(), opti
 
 
 def _build_stages(settings: Settings, options: MosaicOptions, median_ambient: bool, check: bool) -> list[str]:
-    """The stages of a mosaic run up to its compositing (and check), as Event describes them."""
+    """The stages of a mosaic run up to its compositing (and check, and the visual mosaic's with
+    check), as Event describes them."""
     return ((["ambient"] if _reads_ambient(settings, median_ambient) else []) + ["frames"]
-            + (["align"] if options.align else []) + ["composite"] + (["check"] if check else []))
+            + (["align"] if options.align else []) + ["composite"] + (["check"] if check else [])
+            + (["visual_frames", "visual_offset", "visual_composite"] if check and options.visual else []))
+
+
+def _visual_mosaic(m: _mosaic.Mosaic, others: list[Path], src_root: Path, options: MosaicOptions, jobs: int | None,
+                   report) -> tuple[tuple | None, str | None]:
+    """The visual mosaic laid out by m from the JPEGs that are not thermal: ((VisualMosaic,
+    frames read, skipped), None), or (None, why there is none)."""
+    if report:
+        report("visual_frames", 0, len(others), "files")
+    frames, skipped = [], 0
+    args = [(src, src.relative_to(src_root).as_posix()) for src in others]
+    for done, (_, ok, payload) in enumerate(_run_all(_visual.read_visual, args, jobs), 1):
+        if ok and payload[0] is not None:
+            frames.append(payload[0])
+        else:
+            skipped += 1
+        if report:
+            report("visual_frames", done, len(others), "files")
+    if not frames:
+        return None, "no visual frames (JPEGs with a DJI camera pose that are not thermal)"
+    frames.sort(key=lambda f: f.name)
+    try:
+        vm = _visual.build(m, frames, gsd=options.visual_gsd, progress=report, jobs=worker_count(jobs, len(frames)))
+    except ValueError as e:
+        return None, str(e)
+    return (vm, len(frames), skipped), None
 
 
 def _reads_ambient(settings: Settings, median_ambient: bool) -> bool:
@@ -638,7 +708,8 @@ def _mosaic_frames(found: dataset.Scan, src_root: Path, settings: Settings, opti
                    adj: adjust.Adjustments, median_ambient: bool, jobs: int | None, progress: ProgressFn | None,
                    report=None):
     """Every placeable frame measured for a mosaic: (frames, palettes, counts, overrides,
-    (ambient, reflected) when median_ambient filled them in). report: see _stages."""
+    (ambient, reflected) when median_ambient filled them in, the JPEGs that are not thermal).
+    report: see _stages."""
     overrides = settings.overrides()
     normalized = None
     total = len(found.jpegs)
@@ -658,7 +729,7 @@ def _mosaic_frames(found: dataset.Scan, src_root: Path, settings: Settings, opti
                 reflection=refl if overrides.reflection is None else overrides.reflection)
             normalized = (overrides.ambient_temp, overrides.reflection)
             _emit(progress, "normalize", data={"ambient_c": normalized[0], "reflected_c": normalized[1]})
-    frames, palettes, unusable, oblique, other = [], [], 0, 0, 0
+    frames, palettes, unusable, oblique, others = [], [], 0, 0, []
     arglist = [(src, src_root, overrides, options.max_pitch, adj) for src in found.jpegs]
     if report:
         report("frames", 0, total, "files")
@@ -673,15 +744,15 @@ def _mosaic_frames(found: dataset.Scan, src_root: Path, settings: Settings, opti
         elif ok and payload.get("oblique"):
             oblique += 1
         elif ok and payload.get("not_thermal"):
-            other += 1
+            others.append(src)
         else:
             unusable += 1
             _emit(progress, "mosaic_skip", src, payload["reason"] if ok else payload)
         if report:
             report("frames", done, total, "files")
     frames.sort(key=lambda f: f.name)
-    counts = {"frames": len(frames), "oblique": oblique, "unusable": unusable, "not_thermal": other}
-    return frames, palettes, counts, overrides, normalized
+    counts = {"frames": len(frames), "oblique": oblique, "unusable": unusable, "not_thermal": len(others)}
+    return frames, palettes, counts, overrides, normalized, sorted(others)
 
 
 # --- helpers --------------------------------------------------------------------------------
