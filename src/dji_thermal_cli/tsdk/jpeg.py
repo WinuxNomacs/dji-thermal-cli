@@ -59,6 +59,12 @@ def first_segment(segs: list[Segment], marker: int) -> Segment | None:
     return next((s for s in segs if s.marker == marker), None)
 
 
+def is_flir(segs: list[Segment]) -> bool:
+    """Whether the JPEG carries FLIR's radiometric data (APP1 segments starting "FLIR\\0", as
+    FLIR cameras and DJI's Zenmuse XT2 write)."""
+    return any(s.marker == APP1 and s.payload.startswith(b"FLIR\0") for s in segs)
+
+
 def exif_make_model(segs: list[Segment]) -> tuple[str, str]:
     """IFD0 Make (0x010F) and Model (0x0110) from the APP1 Exif segment; '' when absent."""
     for s in segs:

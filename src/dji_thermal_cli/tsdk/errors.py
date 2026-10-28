@@ -14,7 +14,8 @@ class RJpegError(TsdkError, ValueError):
 
 
 class UnsupportedRJpeg(RJpegError):
-    """A DJI R-JPEG whose format the pure-Python port does not (yet) implement."""
+    """A thermal R-JPEG whose format the pure-Python port does not (yet) implement: a DJI format,
+    or another maker's (FLIR's radiometric JPEG, as DJI's Zenmuse XT2 writes)."""
 
 
 class ParamError(TsdkError, ValueError):

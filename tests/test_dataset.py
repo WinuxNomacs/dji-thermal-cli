@@ -32,6 +32,17 @@ def _unsupported(data: bytes) -> bytes:
     return data[:i + 4] + b"xirp" + data[i + 8:]
 
 
+def _flir(model: str = "XT2") -> bytes:
+    """A JPEG with FLIR's radiometric data (an APP1 "FLIR" segment), and its camera in Exif."""
+    buf = io.BytesIO()
+    exif = Image.Exif()
+    exif[0x010F], exif[0x0110] = "DJI", model
+    Image.fromarray(np.zeros((64, 80, 3), dtype=np.uint8)).save(buf, "JPEG", exif=exif)
+    data = buf.getvalue()
+    flir = b"FLIR\0\x01\x00\x00FFF\0" + bytes(32)
+    return data[:2] + b"\xff\xe1" + (len(flir) + 2).to_bytes(2, "big") + flir + data[2:]
+
+
 @pytest.fixture
 def mixed(tmp_path):
     src = _thermal()
@@ -46,6 +57,7 @@ def mixed(tmp_path):
         "cut_thermal.jpg": data[: len(data) // 3],     # raw thermal data cut short
         "cut_image.jpg": data[:800_000],               # metadata intact, main image data cut short
         "other_plugin.jpg": _unsupported(data),
+        "DJI_0001_R.JPG": _flir(),                     # a Zenmuse XT2's radiometric JPEG
     }
     for name, content in files.items():
         (tmp_path / name).write_bytes(content)
@@ -65,12 +77,23 @@ def test_scan_by_content(mixed):
     ("thermal_renamed.bin", dataset.THERMAL), ("thermal_no_extension", dataset.THERMAL),
     ("DJI_0002_T.JPG", dataset.THERMAL), ("notes.jpg", dataset.NOT_JPEG), ("video.MP4", dataset.NOT_JPEG),
     ("visual_V.JPG", dataset.NOT_THERMAL), ("cut_thermal.jpg", dataset.CORRUPT),
-    ("other_plugin.jpg", dataset.UNSUPPORTED),
+    ("other_plugin.jpg", dataset.UNSUPPORTED), ("DJI_0001_R.JPG", dataset.UNSUPPORTED),
 ])
 @pytest.mark.samples
 def test_classify(mixed, name, kind):
     status = dataset.classify(mixed / name)
     assert status.kind == kind, status
+
+
+def test_flir_is_unsupported_not_ordinary(tmp_path):
+    """FLIR's radiometric JPEG (DJI's Zenmuse XT2) is a thermal image of a format not read here:
+    unsupported, saying what it is, not an ordinary JPEG."""
+    (tmp_path / "xt2.jpg").write_bytes(_flir())
+    status = dataset.classify(tmp_path / "xt2.jpg")
+    assert status.kind == dataset.UNSUPPORTED
+    assert status.reason == "a FLIR radiometric JPEG (XT2), not a DJI R-JPEG format"
+    (tmp_path / "plain.jpg").write_bytes(_visual_jpeg())
+    assert dataset.classify(tmp_path / "plain.jpg").kind == dataset.NOT_THERMAL
 
 
 @pytest.mark.samples

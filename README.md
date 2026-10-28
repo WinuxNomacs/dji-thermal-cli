@@ -354,7 +354,8 @@ With `--mosaic-normalize` and the as-converted mosaic (the Python API's
   example, the H20T and XT S rebuild a color LUT whenever the parameters change and refuse
   some unusual combinations, such as very low emissivity with a hot reflected temperature).
   The file is reported as skipped and the rest of the batch goes on.
-- **Not covered:** other R-JPEG formats, which are reported as unsupported, and a few
+- **Not covered:** other R-JPEG formats, which are reported as unsupported (FLIR's
+  radiometric JPEG, as DJI's Zenmuse XT2 writes, among them), and a few
   color settings where the SDK itself reads memory it never initialised, so its output isn't
   defined (they need a color bar or isotherm far outside the frame's temperatures). For
   those the temperature TIFF is still written and the PNG is skipped with a note.

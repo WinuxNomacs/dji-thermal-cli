@@ -94,5 +94,9 @@ def _open_plugin(segs, t: dict):
         from .hirp import Hirp
         return Hirp(segs, t, nd)
     if plugin in ("none", "unknown"):
+        if jpeg.is_flir(segs):
+            model = jpeg.exif_make_model(segs)[1]
+            raise UnsupportedRJpeg("a FLIR radiometric JPEG" + (f" ({model})" if model else "") +
+                                   ", not a DJI R-JPEG format")
         raise RJpegError("no DJI thermal data found (not an R-JPEG)")
     raise UnsupportedRJpeg(f"R-JPEG plugin {plugin!r} is not supported")

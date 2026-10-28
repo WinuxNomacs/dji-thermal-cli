@@ -6,6 +6,12 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- A FLIR radiometric JPEG (the kind DJI's Zenmuse XT2 writes, with its data in APP1 "FLIR"
+  segments) is reported as unsupported, saying what it is ("a FLIR radiometric JPEG (XT2), not
+  a DJI R-JPEG format"), instead of as an ordinary JPEG without thermal data: `classify` gives
+  `unsupported`, `list` counts it among the problems, and a conversion or mosaic
+  skips it as an unsupported R-JPEG. `tsdk.open` raises `UnsupportedRJpeg` for it.
+
 ## [1.6.0] - 2026-10-27
 
 - A mosaic of the visual (RGB) frames DJI's thermal drones take with the thermal ones
