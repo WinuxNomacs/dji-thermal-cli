@@ -384,6 +384,13 @@ def test_no_pose_data(tmp_path):
     assert "no camera pose in the DJI XMP" in proc.stdout
 
 
+def _preview_palette(stdout: str) -> str:
+    """The palette the mosaic's preview line names ("mosaic_preview.png  (whitehot, 9.6 to ...")."""
+    m = re.search(r"mosaic_preview\.png  \((\w+), ", stdout)
+    assert m, stdout
+    return m.group(1)
+
+
 @pytest.mark.flight
 def test_flight(tmp_path):
     proc = _cli("process", "--input-dir", flight_dir(), "--output-dir", tmp_path, "--mosaic")
@@ -392,7 +399,7 @@ def test_flight(tmp_path):
     assert f"Mosaic: {nadir} nadir frames, {oblique} oblique left out" in proc.stdout
     names = ["mosaic_heights.tif", "mosaic_preview.png", "mosaic_temp_c.json", "mosaic_temp_c.tif"]
     assert sorted(p.name for p in tmp_path.iterdir()) == names
-    assert "mosaic_preview.png  (ironred, " in proc.stdout
+    assert _preview_palette(proc.stdout) in api.PALETTES                 # the flight's own, whichever it recorded
     assert re.search(r"mosaic_heights\.tif  \(\d+ cm cells, [+-]\d+\.\d to [+-]\d+\.\d m above the ground plane\)", proc.stdout)
     with Image.open(tmp_path / "mosaic_preview.png") as im:
         assert im.mode == "RGBA"
@@ -418,7 +425,7 @@ def test_flight_quiet_prints_the_results_without_progress(tmp_path):
     proc = _cli("process", "--input-dir", flight_dir(), "--output-dir", tmp_path, "--mosaic", "--no-mosaic-align", "--quiet")
     assert proc.returncode == 0, proc.stderr
     assert "Mosaic step" not in proc.stderr + proc.stdout
-    assert "mosaic_preview.png  (ironred, " in proc.stdout
+    assert _preview_palette(proc.stdout) in api.PALETTES                 # the flight's own, whichever it recorded
 
 
 def test_alignment_recovers_boresight(monkeypatch):
