@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-10-29
+
 - DJI's own Thermal SDK in place of the built-in port, for those who have it: `process --sdk
   DIR` and `list --sdk DIR`, and in Python `Settings(sdk=DIR)`, `describe(..., sdk=DIR)`,
   `list_dataset(..., sdk=DIR)`, with DIR an unpacked DJI Thermal SDK v1.8. DJI's library
@@ -158,7 +160,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.6.0...v1.6.1
