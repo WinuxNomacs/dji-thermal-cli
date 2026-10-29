@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-29
+
 - Python 3.9 or newer (was 3.12), so that it installs where WebODM runs it: WebODM's plugins
   share its Python 3.9, with numpy 1.26.2 and Pillow 11.3.0. Nothing else changes: the same
   code gives the same temperatures (the whole test suite, the native SDK comparisons included,
@@ -131,7 +133,10 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.6.1...v1.7.0
+[1.6.1]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.6.0...v1.6.1
+[1.6.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.2.0...v1.3.0
