@@ -6,6 +6,12 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- Python 3.9 or newer (was 3.12), so that it installs where WebODM runs it: WebODM's plugins
+  share its Python 3.9, with numpy 1.26.2 and Pillow 11.3.0. Nothing else changes: the same
+  code gives the same temperatures (the whole test suite, the native SDK comparisons included,
+  passes on 3.9). CI tests the oldest supported Python, now 3.9, with the lowest dependency
+  versions.
+
 ## [1.6.1] - 2026-10-28
 
 - A FLIR radiometric JPEG (the kind DJI's Zenmuse XT2 writes, with its data in APP1 "FLIR"

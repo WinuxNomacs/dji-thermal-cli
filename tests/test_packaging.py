@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import tomllib
 from importlib import resources
 from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    import tomli as tomllib
 
 import dji_thermal_cli as dtc
 

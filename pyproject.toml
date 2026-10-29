@@ -21,6 +21,9 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -29,7 +32,8 @@ classifiers = [
     "Topic :: Multimedia :: Graphics :: Graphics Conversion",
     "Typing :: Typed",
 ]
-requires-python = ">=3.12"
+# 3.9: WebODM runs it (its plugins share its Python)
+requires-python = ">=3.9"
 # lower bounds are tested in CI (lowest-direct resolution)
 dependencies = [
     "numpy>=1.26.2",
@@ -52,9 +56,12 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "openexr>=3.5.2",
-    "pytest>=9.1.1",
+    "pytest>=9.1.1; python_version >= '3.10'",
+    "pytest>=8.4.2; python_version < '3.10'",
     "ruff>=0.17.1",
-    "tifffile>=2024.12.12",     # its 2025+ releases need numpy 2: this floor lets CI test numpy 1.26
+    "tifffile>=2024.12.12; python_version >= '3.10'",     # its 2025+ releases need numpy 2: this floor lets CI test numpy 1.26
+    "tifffile>=2024.8.30; python_version < '3.10'",       # the last for Python 3.9
+    "tomli>=2.0.1; python_version < '3.11'",              # tomllib before 3.11
 ]
 
 [tool.pytest.ini_options]
@@ -68,7 +75,7 @@ markers = [
 ]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py39"
 line-length = 120
 
 [tool.ruff.lint]
