@@ -24,7 +24,7 @@ pip install dji-thermal-cli
 ```
 
 or as a stand-alone command with `uv tool install dji-thermal-cli` or
-`pipx install dji-thermal-cli`. It needs Python 3.12 or newer; numpy and Pillow are its only
+`pipx install dji-thermal-cli`. It needs Python 3.9 or newer; numpy and Pillow are its only
 dependencies. Neither the DJI Thermal SDK nor any native library is needed. It runs on
 Linux, Windows and macOS, and gives the same results on each.
 

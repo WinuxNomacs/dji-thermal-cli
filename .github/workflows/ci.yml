@@ -36,9 +36,10 @@ jobs:
         python: ["3.14"]
         resolution: [locked]
         include:
-          # the oldest supported Python with the lowest dependency versions (numpy 1.26)
+          # the oldest supported Python with the lowest dependency versions (numpy 1.26.2 and
+          # Pillow 11.3.0, the versions WebODM runs it with)
           - os: ubuntu-latest
-            python: "3.12"
+            python: "3.9"
             resolution: lowest-direct
     runs-on: ${{ matrix.os }}
     env:
@@ -93,7 +94,7 @@ jobs:
         shell: bash
         run: |
           wheel=$(ls dist/*.whl)
-          for py in 3.12 3.14; do
+          for py in 3.9 3.14; do
             uvx --python $py --from "$wheel" dji-thermal-cli --version
             uvx --python $py --from "$wheel" dji-thermal-cli --help > /dev/null
             uv run --python $py --no-project --with "$wheel" python -c "import dji_thermal_cli as dtc; print(dtc.__version__, len(dtc.PALETTES))"
