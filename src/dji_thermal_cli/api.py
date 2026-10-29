@@ -32,13 +32,13 @@ from pathlib import Path
 import numpy as np
 
 from . import adjust, checks, core, dataset, listing, mosaic as _mosaic, outputs as _outputs, units, visual as _visual
-from . import webodm as _webodm
+from . import rjpeg as _rjpeg, webodm as _webodm
 
 __all__ = [
     "Settings", "MosaicOptions", "Event", "SettingsError", "MosaicError", "FileProblem",
     "ListResult", "CheckResult", "Measurement", "ProcessReport", "MosaicReport", "VisualReport",
     "Normalization", "scan", "classify", "describe", "list_dataset", "check", "measure", "process",
-    "make_mosaic", "normalization", "FrameModels", "read_frame_models",
+    "make_mosaic", "normalization", "FrameModels", "read_frame_models", "rjpeg_copy", "RJpegCopyError",
     "PALETTES", "palette_index", "parse_outputs",
 ]
 
@@ -46,6 +46,7 @@ FrameModels = _mosaic.FrameModels
 read_frame_models = _mosaic.read_frame_models
 
 PALETTES = tuple(core.PSEUDO_COLOR_NAMES)
+RJPEG_PICTURES = ("palette", "original")
 DEFAULT_MAX_WORKERS = 8          # past this, worker startup and disk I/O outweigh the parallelism
 
 ProgressFn = Callable[["Event"], None]
@@ -64,6 +65,9 @@ class MosaicError(RuntimeError):
     def __init__(self, message: str, counts: dict | None = None):
         super().__init__(message)
         self.counts = counts or {}
+
+
+RJpegCopyError = _rjpeg.CopyError     # an R-JPEG copy that can't be made (rjpeg_copy): the message says why
 
 
 class FileProblem(ValueError):
@@ -412,6 +416,19 @@ def measure(path: str | os.PathLike, settings: Settings = Settings(), unit: str 
                        m.replaced.above, m.replaced.below, m.notes)
 
 
+def rjpeg_copy(path: str | os.PathLike, settings: Settings = Settings(), picture: np.ndarray | None = None) -> bytes:
+    """One R-JPEG written again so that DJI's tools measure it as process() would (see rjpeg):
+    with the settings' measurement parameters where they differ from the file's own, without the
+    location and identifiers with strip_location, and with picture (uint8 RGB, any size) as its
+    visible image (None: DJI's). Raises RJpegCopyError for what an R-JPEG can't carry (replaced
+    temperatures, parameters on a camera that stores none, values outside its range), and the
+    SDK's TsdkError family for files it can't read."""
+    src = _existing(path)
+    data = src.read_bytes()
+    rj = core._open_with_params(data, settings.overrides(), core.ProcessResult(src, ok=True))
+    return core._rjpeg_copy(data, rj, settings.adjustments(), 0.0, picture)
+
+
 @dataclasses.dataclass
 class ProcessReport:
     results: list[core.ProcessResult]           # one per JPEG file, in path order
@@ -430,15 +447,19 @@ def process(path: str | os.PathLike, output_dir: str | os.PathLike, settings: Se
             outputs: Iterable[str | tuple[str, str]] = ("temp_c:tiff", "pseudo:png"),
             compression: str = "deflate", jobs: int | None = None,
             progress: ProgressFn | None = None, normalize: bool | Normalization = False,
-            max_pitch: float | None = None, mosaic_options: MosaicOptions = MosaicOptions()) -> ProcessReport:
+            max_pitch: float | None = None, mosaic_options: MosaicOptions = MosaicOptions(),
+            rjpeg_picture: str = "palette") -> ProcessReport:
     """Write the chosen outputs (see outputs.PRODUCTS) for every thermal file of a dataset,
     mirroring the dataset's folders under output_dir. Source files are never modified.
 
     normalize: make the frames' temperatures consistent with each other (see normalization();
     True computes it with mosaic_options, or pass one computed before). max_pitch: process only
-    frames whose gimbal pitch is at or below it (e.g. -80 for nadir frames only)."""
+    frames whose gimbal pitch is at or below it (e.g. -80 for nadir frames only). rjpeg_picture:
+    the rjpeg output's picture, "palette" (coloured as pseudo) or "original" (DJI's)."""
     if compression not in _outputs.COMPRESSIONS:
         raise SettingsError(f"compression must be one of {', '.join(_outputs.COMPRESSIONS)}")
+    if rjpeg_picture not in RJPEG_PICTURES:
+        raise SettingsError(f"rjpeg_picture must be one of {', '.join(RJPEG_PICTURES)}")
     wanted = parse_outputs(outputs)
     root = _existing(path)
     found = _scan(root, progress)
@@ -455,7 +476,7 @@ def process(path: str | os.PathLike, output_dir: str | os.PathLike, settings: Se
     clashes = dataset.output_clashes(found.jpegs, src_root)
     run = [src for src in found.jpegs if src not in clashes]
     arglist = [(src, out, src_root, overrides, lo, hi, settings.palette, wanted, compression, adj,
-                norm.offsets_c.get(src, 0.0) if norm else 0.0, max_pitch)
+                norm.offsets_c.get(src, 0.0) if norm else 0.0, max_pitch, rjpeg_picture)
                for src in run]
     results: dict[Path, core.ProcessResult] = {}
     for src, keeper in clashes.items():

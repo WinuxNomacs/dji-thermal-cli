@@ -16,7 +16,8 @@ from .conftest import flight_files, sample
 from .test_cli import _cli
 
 CAMERAS = ("M4T", "M30T", "H20T", "XTS", "M3TD")
-ALL_OUTPUTS = [(p, f) for p, prod in outputs.PRODUCTS.items() for f in prod.formats] + [("temp_c", "tif")]
+# Every pixel product in every format (rjpeg, the source written again, is tested in test_rjpeg)
+ALL_OUTPUTS = [(p, f) for p, prod in outputs.PRODUCTS.items() if p != "rjpeg" for f in prod.formats] + [("temp_c", "tif")]
 
 
 def _sample(camera: str):

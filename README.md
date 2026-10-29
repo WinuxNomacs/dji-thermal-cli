@@ -86,6 +86,7 @@ where `tif` and `tiff` are both accepted and the extension is written as you typ
 | `raw` | uint16 raw sensor counts, uncalibrated (`dirp_get_original_raw`) | tiff, png |
 | `gray16` | uint16 view: `--range-min..--range-max`, or each image's own range, stretched to 0..65535 | png, tiff |
 | `pseudo` | 8-bit RGB pseudo-color (`--palette`, `--range-min/--range-max`) | png, tiff |
+| `rjpeg` | the source R-JPEG written again, for DJI's own tools (see [R-JPEG copies](#r-jpeg-copies)) | jpg |
 
 ```
 dji-thermal-cli process --input-dir mission --output-dir out -o temp_c:exr,temp_ck:png,gray16
@@ -482,6 +483,28 @@ can't be converted are listed as `[skip, <reason>]` and the rest of the batch co
 Run `dji-thermal-cli process --help` / `... list --help` for the full
 flag list.
 
+### R-JPEG copies
+
+The `rjpeg` output is the source R-JPEG written again, so that DJI's own tools (DJI Thermal
+Analysis Tool, the Thermal SDK) measure it as this tool does:
+
+- **The measurement parameters** used (`--emissivity`, `--distance` or the rangefinder's,
+  `--humidity`, `--reflected-temp`, `--ambient-temp`) are written where DJI's SDK reads them,
+  when they differ from the file's own. The Zenmuse H20T and XT S store none (DJI's SDK starts
+  them from fixed values), so their copies only keep the file's own parameters; asked for
+  others, the output is skipped with the reason.
+- **The picture** photo viewers show is the `pseudo` output (`--palette`, `--range-min/--range-max`),
+  at DJI's size, and so is the preview image inside the file. `--rjpeg-picture original`
+  keeps DJI's picture. DJI's tools colour the image from the measurements either way. The small
+  EXIF thumbnail stays DJI's.
+- **With `--strip-location`** the copy is private (see below), and still radiometric.
+- **Not carried:** `--normalize` and `--replace-*` change the temperatures themselves, which an
+  R-JPEG can't hold: `rjpeg` is then skipped with the reason (`temp_c` carries them).
+
+Every change is made in place, at the same bytes DJI's SDK reads, and the tests check each
+copy of DJI's sample images with the native SDK: it measures the copy exactly as it measures
+the source with the same parameters set.
+
 ### Sharing without location
 
 `process --strip-location` writes outputs that can be shared, e.g. online, without revealing
@@ -492,8 +515,12 @@ dji-thermal-cli process --input-dir flight/ --output-dir share/ --strip-location
 ```
 
 - Removed from every output's metadata: the EXIF GPS block, DJI's position, altitude, RTK
-  and rangefinder-target fields, any other GPS property in the XMP, and the drone, camera
-  and body serial numbers.
+  and rangefinder-target fields, any other GPS property in the XMP, the drone, camera, body
+  and sensor serial numbers, and the free-text fields where a name or an address could be
+  (EXIF ImageDescription, Artist, Copyright, UserComment and the Windows XP fields; XMP
+  `dc:creator`, `dc:rights`, `dc:description`, `dc:title`, `dc:subject`).
+- An `rjpeg` copy also has the sensor's and the thermal module's serial numbers zeroed
+  wherever else DJI wrote them (its debug and padding blocks, the calibration block).
 - Kept: capture time, camera model, gimbal and flight attitude, the rangefinder distance,
   the measurement parameters, and the `dtc:` record, which notes `LocationRemoved="True"`.
 - The mosaic (and the visual mosaic) is still placed using the GPS, then written as a plain
@@ -525,6 +552,7 @@ m.temperature                                       # float32 kelvin array, noth
 dtc.process("flight/", "out/", settings, outputs=["temp_c:tiff", "temp_f:exr"])
 dtc.make_mosaic("flight/", "out/", settings, dtc.MosaicOptions(normalize=True, units=("C", "K")))
 dtc.make_mosaic("flight/", "out-dsm/", settings, dtc.MosaicOptions(dsm="odm/dsm.tif"))
+data = dtc.rjpeg_copy("flight/DJI_0001_T.JPG", settings, picture=rgb)   # an R-JPEG, as bytes
 ```
 
 - **Settings** holds what the `process` options set: measurement parameters, `unit` (the unit
@@ -532,7 +560,9 @@ dtc.make_mosaic("flight/", "out-dsm/", settings, dtc.MosaicOptions(dsm="odm/dsm.
   `strip_location`.
   It validates itself and raises `SettingsError` naming the field.
 - **Functions:** `scan`, `classify`, `describe`, `list_dataset`, `check`, `measure`, `process`,
-  `make_mosaic`. Each returns a result object (`ListResult`, `CheckResult`, `Measurement`,
+  `make_mosaic`, and `rjpeg_copy` (one R-JPEG copy as bytes, with the settings' parameters,
+  private with `strip_location`, and an RGB array as its picture or DJI's; `RJpegCopyError`
+  says why one can't be made). The others return a result object (`ListResult`, `CheckResult`, `Measurement`,
   `ProcessReport`, `MosaicReport`).
 - **MosaicOptions** holds what the `--mosaic-*` options set: `heights` (`"auto"` or
   `"plane"`), `height_cell`, `dsm`, `dsm_offset`, `visual` and `visual_gsd` among them.

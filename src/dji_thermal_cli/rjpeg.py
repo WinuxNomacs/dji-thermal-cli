@@ -14,6 +14,11 @@ Where each camera family keeps its parameters (as the SDK port reads them):
 - dirp (Zenmuse H20T, XT S) reads none: DJI's SDK starts it from fixed values, so its R-JPEGs
   cannot carry parameters.
 
+A new picture replaces what follows the APP segments (the visible JPEG's tables and scan) and the
+MPF preview image after it, and the MPF index is rewritten; the APP segments, where the SDK reads,
+stay as they are. (iirp reads its tau table up to 16 bytes past APP5, into the next APP segment.)
+The EXIF thumbnail is DJI's still.
+
 A private copy has privacy's removals (see privacy) made in its EXIF and XMP, and every other
 occurrence of the sensor's and the thermal module's serials zeroed: in DJI's debug and padding
 blocks, and in the hirp calibration block (which the SDK measures the same without it).
@@ -21,8 +26,12 @@ blocks, and in the hirp calibration block (which the SDK measures the same witho
 
 from __future__ import annotations
 
+import io
 import re
 import struct
+
+import numpy as np
+from PIL import Image
 
 from . import privacy, xmpedit
 from .tsdk import jpeg, open as open_rjpeg
@@ -36,6 +45,8 @@ _XMP = b"http://ns.adobe.com/xap/1.0/\0"
 _MEASURED = (jpeg.APP3, jpeg.APP4, jpeg.APP5)
 _HIDR_MODULE = 4                    # the HIDR block naming the thermal module (HM-TM...)
 _MODULE_SERIAL = rb"([0-9A-Z]{8,})"  # what follows the module's name in the calibration block
+_MPF = b"MPF\0"
+PICTURE_QUALITY = 92
 
 NO_PARAMS = "this camera's R-JPEGs cannot carry measurement parameters (DJI's SDK reads none from them)"
 
@@ -44,16 +55,94 @@ class CopyError(ValueError):
     """An R-JPEG copy that can't be made: the message says why."""
 
 
-def copy(data: bytes, params: MeasurementParams | None = None, private: bool = False) -> bytes:
+def copy(data: bytes, params: MeasurementParams | None = None, private: bool = False,
+         picture: np.ndarray | None = None) -> bytes:
     """The R-JPEG with params written where DJI's SDK reads them (None: its own), without the
-    location and identifiers when private. Raises CopyError, or TsdkError for a file that
+    location and identifiers when private, and with picture (uint8 RGB, any size: scaled to
+    DJI's) as its visible image (None: DJI's). Raises CopyError, or TsdkError for a file that
     isn't an R-JPEG the port reads."""
     out = bytearray(data)
     if params is not None:
         write_params(out, params)
     if private:
         make_private(out)
+    return bytes(out) if picture is None else with_picture(bytes(out), picture)
+
+
+def with_picture(data: bytes, rgb: np.ndarray) -> bytes:
+    """The R-JPEG with rgb as its visible image and its MPF preview, each at DJI's size."""
+    if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise CopyError("the picture must be uint8 RGB (height, width, 3)")
+    segs = jpeg.segments(data)
+    first = next((s for s in segs if not 0xE0 <= s.marker <= 0xEF), None)
+    if first is None:
+        raise CopyError("the R-JPEG has no image after its APP segments")
+    head = data[:first.offset - 4]
+    mpf = next((s for s in segs if s.marker == jpeg.APP2 and s.payload.startswith(_MPF)), None)
+    index = _mpf_index(data, mpf) if mpf else None
+    main_end = index[1][2] if index and len(index) > 1 else len(data)
+    main = head + _encode(rgb, _size(data[:main_end]))[2:]
+    main = main[:len(head)] + _without_app_segments(main[len(head):])
+    if not index or len(index) < 2:
+        return main
+    _, size2, start2 = index[1]
+    preview = _encode(rgb, _size(data[start2:start2 + size2]))
+    out = bytearray(main + preview + data[start2 + size2:])
+    _set_mpf_index(out, mpf, len(main), len(preview))
     return bytes(out)
+
+
+def _encode(rgb: np.ndarray, size: tuple[int, int]) -> bytes:
+    image = Image.fromarray(rgb)                     # uint8 (height, width, 3): RGB
+    if image.size != size:
+        image = image.resize(size, Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, "JPEG", quality=PICTURE_QUALITY)
+    return buf.getvalue()
+
+
+def _without_app_segments(body: bytes) -> bytes:
+    """A JPEG's segments after its SOI without the APP ones (Pillow's JFIF header): the
+    R-JPEG's own APP segments come before them."""
+    i = 0
+    while body[i:i + 1] == b"\xff" and 0xE0 <= body[i + 1] <= 0xEF:
+        i += 2 + struct.unpack_from(">H", body, i + 2)[0]
+    return body[i:]
+
+
+def _size(jpeg_data: bytes) -> tuple[int, int]:
+    """(width, height) from a JPEG's frame header."""
+    sof = next((s for s in jpeg.segments(jpeg_data) if s.marker in (0xC0, 0xC1, 0xC2)), None)
+    if sof is None:
+        raise CopyError("the R-JPEG's picture has no frame header")
+    height, width = struct.unpack_from(">HH", sof.payload, 1)
+    return width, height
+
+
+def _mpf_index(data: bytes, mpf: jpeg.Segment) -> list[tuple[int, int, int]]:
+    """The MPF entries as (attribute, size, file offset); the first image starts the file."""
+    base, t = mpf.offset + 4, mpf.payload[4:]
+    bo = "<" if t[:2] == b"II" else ">"
+    (ifd,) = struct.unpack_from(bo + "I", t, 4)
+    (n,) = struct.unpack_from(bo + "H", t, ifd)
+    for i in range(n):
+        tag, _type, count, value = struct.unpack_from(bo + "HHII", t, ifd + 2 + 12 * i)
+        if tag == 0xB002:
+            entries = [struct.unpack_from(bo + "III", t, value + 16 * k) for k in range(count // 16)]
+            return [(attr, size, base + off if off else 0) for attr, size, off in entries]
+    raise CopyError("the R-JPEG's MPF index has no image list")
+
+
+def _set_mpf_index(data: bytearray, mpf: jpeg.Segment, main_size: int, preview_size: int) -> None:
+    """Rewrite the first two MPF entries' sizes and the second's offset, in place."""
+    base, t = mpf.offset + 4, mpf.payload[4:]
+    bo = "<" if t[:2] == b"II" else ">"
+    (ifd,) = struct.unpack_from(bo + "I", t, 4)
+    (n,) = struct.unpack_from(bo + "H", t, ifd)
+    value = next(struct.unpack_from(bo + "I", t, ifd + 2 + 12 * i + 8)[0] for i in range(n)
+                 if struct.unpack_from(bo + "H", t, ifd + 2 + 12 * i)[0] == 0xB002)
+    struct.pack_into(bo + "I", data, base + value + 4, main_size)
+    struct.pack_into(bo + "II", data, base + value + 16 + 4, preview_size, main_size - base)
 
 
 def write_params(data: bytearray, p: MeasurementParams) -> None:
