@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-29
+
 - R-JPEG copies: the `rjpeg` output of `process` (`<stem>_rjpeg.jpg`) and
   `rjpeg_copy()` write the source R-JPEG again so that DJI's own tools measure it as this tool
   does. The measurement parameters used are written where DJI's SDK reads them (the iirp,
@@ -148,7 +150,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.5.0...v1.6.0
