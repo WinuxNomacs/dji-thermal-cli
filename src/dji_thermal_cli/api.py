@@ -32,6 +32,7 @@ from pathlib import Path
 import numpy as np
 
 from . import adjust, checks, core, dataset, listing, mosaic as _mosaic, outputs as _outputs, units, visual as _visual
+from .native.client import NativeCrash, NativeError, NativeSdkError
 from . import rjpeg as _rjpeg, webodm as _webodm
 
 __all__ = [
@@ -39,7 +40,7 @@ __all__ = [
     "ListResult", "CheckResult", "Measurement", "ProcessReport", "MosaicReport", "VisualReport",
     "Normalization", "scan", "classify", "describe", "list_dataset", "check", "measure", "process",
     "make_mosaic", "normalization", "FrameModels", "read_frame_models", "rjpeg_copy", "RJpegCopyError",
-    "PALETTES", "palette_index", "parse_outputs",
+    "PALETTES", "palette_index", "parse_outputs", "check_sdk", "NativeError", "NativeSdkError", "NativeCrash",
 ]
 
 FrameModels = _mosaic.FrameModels
@@ -88,7 +89,8 @@ class Settings:
     (C, F or K) and are converted to Celsius for the SDK. distance is "lrf" (each file's
     laser-rangefinder distance where valid, else its embedded one), "embedded", or metres.
     humidity is a percent. palette is a number 0-9 or a name (see PALETTES).
-    replace_*_value is a temperature or "nodata".
+    replace_*_value is a temperature or "nodata". sdk: an unpacked DJI Thermal SDK to measure
+    with instead of the built-in port (DJI's library, run in a child process: see native).
     """
 
     distance: str | float = "lrf"
@@ -108,6 +110,7 @@ class Settings:
     replace_below: float | None = None
     replace_below_value: float | str | None = None
     strip_location: bool = False        # outputs without location or identifiers (see privacy)
+    sdk: str | os.PathLike | None = None
 
     def __post_init__(self):
         unit = str(self.unit).upper()
@@ -133,6 +136,8 @@ class Settings:
         if self.replace_above is not None and self.replace_below is not None \
                 and self.replace_below >= self.replace_above:
             raise SettingsError("replace_below must be lower than replace_above")
+        if self.sdk is not None:
+            object.__setattr__(self, "sdk", _sdk_dir(self.sdk))
         for name in ("reflected_temp", "ambient_temp", "range_min", "range_max", "replace_above",
                      "replace_below", "replace_above_value", "replace_below_value"):
             self._celsius(name)                      # rejects values below absolute zero
@@ -154,7 +159,7 @@ class Settings:
             distance=self.distance if isinstance(self.distance, float) else None,
             humidity=self.humidity, emissivity=self.emissivity,
             reflection=self._celsius("reflected_temp"), ambient_temp=self._celsius("ambient_temp"),
-            use_rangefinder=self.distance == "lrf")
+            use_rangefinder=self.distance == "lrf", sdk=self.sdk)
 
     def adjustments(self) -> adjust.Adjustments:
         """The gimbal override and replacement (Celsius)."""
@@ -303,9 +308,12 @@ def classify(path: str | os.PathLike, decode: bool = False) -> dataset.FileStatu
     return dataset.classify(_existing(path), decode=decode)
 
 
-def describe(path: str | os.PathLike, unit: str = "C", stats: bool = True, exif: bool = False) -> dict:
-    """Every group about one thermal R-JPEG (see listing). Raises FileProblem otherwise."""
-    info, status = listing.describe(_existing(path), _unit(unit), stats=stats, exif_all=exif)
+def describe(path: str | os.PathLike, unit: str = "C", stats: bool = True, exif: bool = False,
+             sdk: str | os.PathLike | None = None) -> dict:
+    """Every group about one thermal R-JPEG (see listing). Raises FileProblem otherwise. sdk: read
+    with DJI's SDK instead of the port (see Settings.sdk)."""
+    info, status = listing.describe(_existing(path), _unit(unit), stats=stats, exif_all=exif,
+                                    sdk=None if sdk is None else _sdk_dir(sdk))
     if info is None:
         raise FileProblem(status)
     if not exif:
@@ -322,12 +330,14 @@ class ListResult:
 
 
 def list_dataset(path: str | os.PathLike, unit: str = "C", stats: bool = True, exif: bool = False,
-                 jobs: int | None = None, progress: ProgressFn | None = None) -> ListResult:
+                 jobs: int | None = None, progress: ProgressFn | None = None,
+                 sdk: str | os.PathLike | None = None) -> ListResult:
     """describe() for every file of a dataset."""
     found = _scan(path, progress)
     unit = _unit(unit)
+    sdk = None if sdk is None else _sdk_dir(sdk)
     rows, problems, not_thermal = [], [], 0
-    arglist = [(src, unit, stats, exif) for src in found.jpegs]
+    arglist = [(src, unit, stats, exif, False, sdk) for src in found.jpegs]
     for i, ok, payload in _run_all(listing.describe, arglist, jobs):
         src = found.jpegs[i]
         info, status = payload if ok else (None, dataset.FileStatus(src, dataset.CORRUPT, payload))
@@ -392,6 +402,15 @@ def check(path: str | os.PathLike, unit: str = "C", max_pitch: float = _mosaic.D
     return CheckResult(findings, checks.summary(findings, reports), reports, found, plan)
 
 
+def check_sdk(sdk: str | os.PathLike, samples: Iterable[str | os.PathLike]) -> dict:
+    """Whether DJI's SDK in sdk can be used (see Settings.sdk), measuring the sample R-JPEGs with
+    it: {"library", "sdk_version", "api_revisions", "measured"}. Raises SettingsError if sdk has
+    no library for this system, NativeSdkError if it can't be used (a version not supported,
+    not loading, no sample measured)."""
+    from . import native
+    return native.check(_sdk_dir(sdk), [Path(p) for p in samples])
+
+
 # --- measuring and writing ------------------------------------------------------------------
 
 @dataclasses.dataclass
@@ -426,7 +445,7 @@ def rjpeg_copy(path: str | os.PathLike, settings: Settings = Settings(), picture
     src = _existing(path)
     data = src.read_bytes()
     rj = core._open_with_params(data, settings.overrides(), core.ProcessResult(src, ok=True))
-    return core._rjpeg_copy(data, rj, settings.adjustments(), 0.0, picture)
+    return core._rjpeg_copy(data, rj, settings.adjustments(), 0.0, picture, settings.sdk)
 
 
 @dataclasses.dataclass
@@ -738,7 +757,7 @@ def _mosaic_frames(found: dataset.Scan, src_root: Path, settings: Settings, opti
         if report:
             report("ambient", 0, total, "files")
         embedded = []
-        for done, (_, ok, p) in enumerate(_run_all(core.embedded_ambient, [(s,) for s in found.jpegs], jobs), 1):
+        for done, (_, ok, p) in enumerate(_run_all(core.embedded_ambient, [(s, overrides.sdk) for s in found.jpegs], jobs), 1):
             if ok and p:
                 embedded.append(p)
             if report:
@@ -783,6 +802,16 @@ def _existing(path: str | os.PathLike) -> Path:
     if not p.exists():
         raise FileNotFoundError(f"Input path does not exist: {p}")
     return p
+
+
+def _sdk_dir(sdk: str | os.PathLike) -> str:
+    """An unpacked DJI Thermal SDK's folder, checked to have the library for this system."""
+    from . import native
+    try:
+        native.find_library(sdk)
+    except FileNotFoundError as e:
+        raise SettingsError(str(e)) from None
+    return str(sdk)
 
 
 def _unit(unit: str) -> str:

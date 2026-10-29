@@ -187,6 +187,7 @@ def _build_parser() -> argparse.ArgumentParser:
     proc.add_argument("--rjpeg-picture", choices=api.RJPEG_PICTURES, default="palette", help="The rjpeg output's visible picture: palette = coloured as the pseudo output (--palette, --range-min/--range-max), the default; original = DJI's own. DJI's tools colour it from the measurements either way")
     proc.add_argument("--compression", choices=outputs.COMPRESSIONS, default="deflate", help="TIFF/EXR compression: deflate = lossless Deflate (EXR: ZIP), the default; none = uncompressed. PNG is always compressed")
     proc.add_argument("--jobs", "-j", type=_positive_int, default=None, help="Worker processes, and the mosaic's matching threads (default: min(CPU count, 8); 1 = in this process)")
+    proc.add_argument("--sdk", type=Path, default=None, metavar="DIR", help="Measure with DJI's own Thermal SDK, unpacked in DIR (DJI's download, v1.8), instead of the built-in port; its library runs in a separate process, so a crash there only fails the file it was measuring")
     proc.add_argument("--quiet", "-q", action="store_true", help="Don't show the mosaic's progress (--mosaic, --normalize) on stderr; results, skipped files and errors are still printed")
 
     lst = sub.add_parser("list", help="Describe every thermal R-JPEG: thermal parameters, temperature stats, position, attitude, camera, EXIF",
@@ -197,6 +198,7 @@ def _build_parser() -> argparse.ArgumentParser:
     lst.add_argument("--exif", choices=["curated", "all"], default="curated", help="curated: the grouped fields (default); all: also every EXIF tag and XMP property, raw (json/csv)")
     lst.add_argument("--unit", type=str.upper, choices=list(units.UNITS), default="C", help="Unit to display the reflected/ambient temperatures and color bar in: C, F or K (default: C)")
     lst.add_argument("--jobs", "-j", type=_positive_int, default=None, help="Worker processes (default: min(CPU count, 8); 1 = in this process)")
+    lst.add_argument("--sdk", type=Path, default=None, metavar="DIR", help="Read the files with DJI's own Thermal SDK, unpacked in DIR (DJI's download, v1.8), instead of the built-in port; its library runs in a separate process, so a crash there only fails the file it was measuring")
 
     chk = sub.add_parser("check", help="Find a dataset's errors and anomalies, with the options that address each",
                          formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -247,7 +249,7 @@ def _settings(args: argparse.Namespace) -> api.Settings:
             gimbal_yaw=args.gimbal_yaw, gimbal_pitch=args.gimbal_pitch, gimbal_roll=args.gimbal_roll,
             replace_above=args.replace_above, replace_above_value=args.replace_above_value,
             replace_below=args.replace_below, replace_below_value=args.replace_below_value,
-            strip_location=getattr(args, "strip_location", False))
+            strip_location=getattr(args, "strip_location", False), sdk=args.sdk)
     except api.SettingsError as e:
         _fail(e)
 
@@ -517,8 +519,8 @@ def _format_csv(rows: list[dict]) -> str:
 def _cmd_list(args: argparse.Namespace) -> None:
     try:
         res = api.list_dataset(args.input_dir, args.unit, args.stats, args.exif == "all", args.jobs,
-                               _printer(sys.stderr))
-    except FileNotFoundError as e:
+                               _printer(sys.stderr), sdk=args.sdk)
+    except (FileNotFoundError, api.SettingsError) as e:
         _fail(e)
     for status in res.problems:
         print(f"[skip, {status.reason}] {status.path}", file=sys.stderr)

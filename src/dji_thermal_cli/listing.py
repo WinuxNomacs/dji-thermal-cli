@@ -28,19 +28,22 @@ from PIL import Image
 from PIL.ExifTags import GPSTAGS, IFD, TAGS
 
 from . import core, dataset, djixmp, mosaic, tiffout, tsdk, units
+from .native.client import NativeError
 
 GROUPS = ("file", "camera", "thermal", "temperature", "geospatial", "attitude", "exif")
 
 
 def describe(path: Path, unit: str = "C", stats: bool = True, exif_all: bool = False,
-             decode: bool = False) -> tuple[dict | None, dataset.FileStatus | None]:
-    """(groups, None) for a thermal R-JPEG, or (None, its FileStatus) for any other file."""
+             decode: bool = False, sdk: str | None = None) -> tuple[dict | None, dataset.FileStatus | None]:
+    """(groups, None) for a thermal R-JPEG, or (None, its FileStatus) for any other file. sdk: DJI's
+    SDK to read the thermal groups with instead of the port (see native); which files are thermal
+    R-JPEGs is the port's (dataset.classify)."""
     status = dataset.classify(path, decode=decode)
     if status.kind != dataset.THERMAL:
         return None, status
     data = path.read_bytes()
     try:
-        rj = tsdk.open(data)
+        rj = core.open_rjpeg(data, sdk)
         info = {
             "file": {"path": str(path), "name": path.name, "size_bytes": len(data), "kind": status.kind,
                      "warnings": status.warnings},
@@ -48,6 +51,8 @@ def describe(path: Path, unit: str = "C", stats: bool = True, exif_all: bool = F
             "thermal": _thermal(rj, unit),
             "temperature": _stats(rj, unit) if stats else None,
         }
+    except NativeError:                         # DJI's SDK failed, not the file
+        raise
     except tsdk.TsdkError as e:
         return None, dataset.FileStatus(path, dataset.CORRUPT, f"{type(e).__name__}: {e}", rj.plugin if "rj" in locals() else "")
     exif = Image.open(io.BytesIO(data)).getexif()

@@ -67,6 +67,10 @@ pitches, its own temperatures), so any flight that `check` reports no errors for
       nadir, oblique = flight_counts()
   ```
   `--strict-markers` is on, so a misspelled marker fails.
+- **`--sdk`** (`dji_thermal_cli.native`): DJI's library runs only in a child process, which
+  must never take the caller with it. `test_native.py` checks that with a stand-in child
+  (`tests/fake_native_child.py`: crashes, hangs, output on stdout) everywhere, and with the
+  real SDK against the port.
 - **Native comparisons** live in the `*_vs_native.py` modules and `test_cli.py`. The native
   SDK always runs in a subprocess (`native_measure`, `native_process`, `native_sequence` in
   `conftest.py`), because it can crash. Sequences go in `tests/oracle_cases.py`, so the
@@ -84,8 +88,10 @@ them when you touch `tsdk`.
 
 1. Point `DJI_THERMAL_SDK_DIR` at the new release. If its API revision differs, the native
    tests are skipped with a reason that says so.
-2. Check `dirp_api.h` against the ctypes bindings in `tests/native_sdk.py`, update them,
-   and set `SDK_VERSION` and `SUPPORTED_API_VERSIONS` there.
+2. Check `dirp_api.h` against the ctypes bindings in `tests/native_sdk.py` (the oracle) and
+   in `src/dji_thermal_cli/native/bindings.py` (`--sdk`), update both, and set `SDK_VERSION`
+   and `SUPPORTED_API_VERSIONS` in each. The two are kept apart on purpose: the oracle checks
+   the tool's own bindings too (`test_native.py`).
 3. Run the native tests (`DJI_THERMAL_SDK_ALLOW_UNKNOWN_VERSION=1` runs them before step 2
    is done) and look at every difference: each is a change in DJI's results that the port
    would have to follow, as new functions next to the existing ones.
