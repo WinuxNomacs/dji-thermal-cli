@@ -10,7 +10,8 @@ Batch-process DJI R-JPEG thermal images into temperature images (float32 TIFF or
 
 Temperatures and pseudo-color images come from a pure-Python port of the DJI Thermal SDK
 v1.8. Its results are bit-for-bit identical to the SDK's `dirp_measure_ex` and `dirp_process`,
-and it needs neither the SDK nor any native library.
+and it needs neither the SDK nor any native library. If you have DJI's SDK, `--sdk` measures
+with DJI's own library instead (see [DJI's own SDK](#djis-own-sdk)).
 
 This does **not** rewrite the original R-JPEG: DJI bakes its environmental
 parameters into a binary APP4 block at capture time that isn't writable by
@@ -369,6 +370,24 @@ generated from that formula, short tuning constants are written out, and the mea
 calibration data and colour palettes are stored in `tsdk/data/dji_tsdk_v18.npz`. The test
 suite checks every table byte for byte against the SDK v1.8's own.
 
+## DJI's own SDK
+
+If you have the [DJI Thermal SDK](https://www.dji.com/downloads/softwares/dji-thermal-sdk)
+v1.8, `process --sdk DIR` and `list --sdk DIR` (in Python, `Settings(sdk=DIR)`,
+`describe(..., sdk=DIR)`, `list_dataset(..., sdk=DIR)`) measure with DJI's own library
+instead of the port; DIR is the unpacked SDK, as DJI's zip unpacks. The results are the same,
+bit for bit (the test suite checks it on DJI's sample images).
+
+- **DJI's library never runs in the tool's own process:** it is loaded in a child process,
+  started on first use. If it crashes there or stops answering (two minutes for one call),
+  the file it was working on is skipped with the reason (for example "DJI's Thermal SDK
+  crashed (dirp_process): killed by SIGSEGV"), and the next file starts a new child.
+- **Only SDK v1.8** (API revisions 19 and 20): another version is refused with the version it
+  reports, since its data structures may differ. `check_sdk(DIR, samples)` says whether an SDK
+  can be used, measuring the samples with it.
+- DJI ships its library for Linux and Windows (x64 and x86), not macOS; `--sdk` is checked on
+  Linux x64. Without `--sdk` the tool still needs no native library.
+
 ## Usage
 
 Describe every thermal image in a dataset without writing anything:
@@ -556,8 +575,8 @@ data = dtc.rjpeg_copy("flight/DJI_0001_T.JPG", settings, picture=rgb)   # an R-J
 ```
 
 - **Settings** holds what the `process` options set: measurement parameters, `unit` (the unit
-  of every temperature in it), colour range and palette, gimbal override, replacement and
-  `strip_location`.
+  of every temperature in it), colour range and palette, gimbal override, replacement,
+  `strip_location` and `sdk` (DJI's own SDK, see [DJI's own SDK](#djis-own-sdk)).
   It validates itself and raises `SettingsError` naming the field.
 - **Functions:** `scan`, `classify`, `describe`, `list_dataset`, `check`, `measure`, `process`,
   `make_mosaic`, and `rjpeg_copy` (one R-JPEG copy as bytes, with the settings' parameters,
@@ -625,7 +644,8 @@ Thermal SDK are each optional (environment variables `DJI_THERMAL_SAMPLES_DIR`,
 the SDK, the port is compared bit for bit with DJI's own libraries (Linux x64). Without them
 those tests are skipped, the built-in tables are still checked against the SDK's recorded
 SHA-256 digests, and, with the sample images, the port is checked against digests of every
-result that was compared with the SDK. The tool itself never loads the SDK's libraries. See
+result that was compared with the SDK. The tool loads DJI's libraries only when asked to
+(`--sdk`), and then in a child process. See
 [CONTRIBUTING.md](https://github.com/WinuxNomacs/dji-thermal-cli/blob/main/CONTRIBUTING.md).
 
 ## License

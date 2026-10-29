@@ -6,6 +6,14 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- DJI's own Thermal SDK in place of the built-in port, for those who have it: `process --sdk
+  DIR` and `list --sdk DIR`, and in Python `Settings(sdk=DIR)`, `describe(..., sdk=DIR)`,
+  `list_dataset(..., sdk=DIR)`, with DIR an unpacked DJI Thermal SDK v1.8. DJI's library
+  runs only in a child process: a crash or a hang there skips the file it was working on with
+  the reason, and the tool goes on (`NativeCrash`). Another SDK version is refused
+  (`NativeSdkError`); `check_sdk()` says whether one can be used. The results are those of the
+  port, bit for bit, on all of DJI's sample images.
+
 ## [1.8.0] - 2026-10-29
 
 - R-JPEG copies: the `rjpeg` output of `process` (`<stem>_rjpeg.jpg`) and

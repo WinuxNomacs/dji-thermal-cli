@@ -6,8 +6,9 @@ by this tool. `process_file` only ever produces new derivative files.
 
 Temperatures and pseudo-color images come from the pure-Python port of the DJI
 Thermal SDK in the tsdk package: bit-identical to the SDK, with no native library
-at run time. Anything the port cannot do is reported as a skipped file or a note,
-with the reason.
+at run time; or, where the caller gives an SDK folder (MeasurementOverrides.sdk),
+from DJI's own library, run in a child process (native). Anything that cannot be
+done is reported as a skipped file or a note, with the reason.
 """
 
 from __future__ import annotations
@@ -35,7 +36,9 @@ class MeasurementOverrides:
 
     use_rangefinder: when distance is not set, take each file's laser-rangefinder
     target distance (DJI XMP) instead of the embedded distance, where the file has
-    a valid reading."""
+    a valid reading.
+
+    sdk: an unpacked DJI Thermal SDK to measure with instead of the port (see native)."""
 
     distance: float | None = None
     humidity: float | None = None
@@ -43,6 +46,7 @@ class MeasurementOverrides:
     reflection: float | None = None
     ambient_temp: float | None = None
     use_rangefinder: bool = True
+    sdk: str | None = None
 
     def apply(self, params):
         for field in tsdk.MeasurementParams.FIELDS:
@@ -50,6 +54,14 @@ class MeasurementOverrides:
             if value is not None:
                 setattr(params, field, value)
         return params
+
+
+def open_rjpeg(data: bytes, sdk: str | None = None):
+    """The R-JPEG opened by the port, or by DJI's SDK in sdk (see native). Raises TsdkError."""
+    if sdk is None:
+        return tsdk.open(data)
+    from . import native
+    return native.open(data, sdk)
 
 
 @dataclasses.dataclass
@@ -146,7 +158,7 @@ def process_file(
     if asked_rjpeg:
         picture = made["pseudo"][0] if rjpeg_picture == "palette" and "pseudo" in made else None
         try:
-            made["rjpeg"] = (_rjpeg_copy(data, rj, adj, offset_c, picture), {})
+            made["rjpeg"] = (_rjpeg_copy(data, rj, adj, offset_c, picture, overrides.sdk), {})
         except (rjpeg.CopyError, tsdk.TsdkError) as e:
             failed["rjpeg"] = explain(e) if isinstance(e, tsdk.TsdkError) else str(e)
     made = {p: v for p, v in made.items() if p in dict(wanted)}
@@ -177,14 +189,15 @@ def process_file(
     return result
 
 
-def _rjpeg_copy(data: bytes, rj, adj: adjust.Adjustments, offset_c: float, picture: np.ndarray | None) -> bytes:
+def _rjpeg_copy(data: bytes, rj, adj: adjust.Adjustments, offset_c: float, picture: np.ndarray | None,
+                sdk: str | None = None) -> bytes:
     """The source R-JPEG written again (see rjpeg): with the parameters rj measures with where they
     differ from its own, private with strip_location. Raises CopyError for what it can't carry."""
     if adj.replaces() or offset_c:
         raise rjpeg.CopyError("an R-JPEG can't carry normalized or replaced temperatures (temp_c can)")
     used = rj.get_measurement_params()
     try:
-        own = tsdk.open(data).get_measurement_params()
+        own = open_rjpeg(data, sdk).get_measurement_params()
     except tsdk.ParamError:
         own = None
     return rjpeg.copy(data, None if used == own else used, private=adj.strip_location, picture=picture)
@@ -193,7 +206,7 @@ def _rjpeg_copy(data: bytes, rj, adj: adjust.Adjustments, offset_c: float, pictu
 def _open_with_params(data: bytes, overrides: MeasurementOverrides, result: ProcessResult):
     """The R-JPEG opened with the overrides applied (and the rangefinder distance, if asked
     for); result gets the distance and its source. Raises TsdkError."""
-    rj = tsdk.open(data)
+    rj = open_rjpeg(data, overrides.sdk)
     params = overrides.apply(rj.get_measurement_params())
     result.distance_source = "option" if overrides.distance is not None else "embedded"
     if overrides.distance is None and overrides.use_rangefinder:
@@ -321,9 +334,11 @@ def mosaic_frame(src: Path, src_root: Path, overrides: MeasurementOverrides, max
     max_pitch (degrees) are left out unmeasured."""
     data = src.read_bytes()
     try:
-        rj = tsdk.open(data)
+        rj = open_rjpeg(data, overrides.sdk)
     except tsdk.RJpegError as e:
         return {"reason": explain(e), "not_thermal": not isinstance(e, tsdk.UnsupportedRJpeg)}
+    except tsdk.TsdkError as e:                 # DJI's SDK failed (native)
+        return {"reason": explain(e)}
     pose, why = mosaic.read_pose(data, (rj.width, rj.height))
     if pose is None:
         return {"reason": why}
@@ -356,10 +371,10 @@ def mosaic_frame(src: Path, src_root: Path, overrides: MeasurementOverrides, max
             "notes": result.notes, "palette": palette}
 
 
-def embedded_ambient(src: Path) -> tuple[float, float] | None:
+def embedded_ambient(src: Path, sdk: str | None = None) -> tuple[float, float] | None:
     """The R-JPEG's embedded (ambient, reflected) temperatures, or None if it isn't one."""
     try:
-        params = tsdk.open(src.read_bytes()).get_measurement_params()
+        params = open_rjpeg(src.read_bytes(), sdk).get_measurement_params()
     except tsdk.TsdkError:
         return None
     return params.ambient_temp, params.reflection
