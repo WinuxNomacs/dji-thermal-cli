@@ -184,6 +184,7 @@ def _build_parser() -> argparse.ArgumentParser:
     proc.add_argument("--mosaic-gsd", type=float, default=None, metavar="METRES", help="Mosaic pixel size (default: the frames' median ground sample distance)")
     proc.add_argument("--mosaic-visual", action="store_true", help="Also mosaic the visual (RGB) frames the drone took with the thermal ones (M4T, M30T, M3T, H20T, H30T wide camera; zoom frames are left out): <output-dir>/mosaic_visual.tif (red, green, blue, alpha; UTM) with a .json sidecar and mosaic_visual_preview.png. Each visual frame is placed as its thermal frame is in the thermal mosaic, the two cameras' offset measured and corrected, so the two mosaics line up")
     proc.add_argument("--mosaic-visual-gsd", type=float, default=None, metavar="METRES", help="The visual mosaic's pixel size (default: the visual frames' median ground sample distance)")
+    proc.add_argument("--rjpeg-picture", choices=api.RJPEG_PICTURES, default="palette", help="The rjpeg output's visible picture: palette = coloured as the pseudo output (--palette, --range-min/--range-max), the default; original = DJI's own. DJI's tools colour it from the measurements either way")
     proc.add_argument("--compression", choices=outputs.COMPRESSIONS, default="deflate", help="TIFF/EXR compression: deflate = lossless Deflate (EXR: ZIP), the default; none = uncompressed. PNG is always compressed")
     proc.add_argument("--jobs", "-j", type=_positive_int, default=None, help="Worker processes, and the mosaic's matching threads (default: min(CPU count, 8); 1 = in this process)")
     proc.add_argument("--quiet", "-q", action="store_true", help="Don't show the mosaic's progress (--mosaic, --normalize) on stderr; results, skipped files and errors are still printed")
@@ -343,7 +344,8 @@ def _cmd_process(args: argparse.Namespace) -> None:
         if wanted:
             try:
                 report = api.process(args.input_dir, args.output_dir, settings, wanted, args.compression, args.jobs,
-                                     show, normalize=args.normalize, max_pitch=args.max_pitch, mosaic_options=options)
+                                     show, normalize=args.normalize, max_pitch=args.max_pitch, mosaic_options=options,
+                                     rjpeg_picture=args.rjpeg_picture)
             finally:
                 show.clear()
             print(f"\nDone. {report.processed}/{len(report.results)} candidate files processed.")

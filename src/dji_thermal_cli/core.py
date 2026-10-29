@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import adjust, djixmp, mosaic, outputs, privacy, tiffout, tsdk, units
+from . import adjust, djixmp, mosaic, outputs, privacy, rjpeg, tiffout, tsdk, units
 
 PSEUDO_COLOR_NAMES = [
     "whitehot", "fulgurite", "ironred", "hotiron", "medical",
@@ -112,12 +112,14 @@ def process_file(
     adj: adjust.Adjustments = adjust.Adjustments(),
     offset_c: float = 0.0,
     max_pitch: float | None = None,
+    rjpeg_picture: str = "palette",
 ) -> ProcessResult:
     """Write each wanted (product, extension) output of one R-JPEG. A product that can't be
     made is noted and the others are still written; the file is skipped only when none can.
     adj: the gimbal override and out-of-range replacement (see adjust). offset_c: subtracted
     from the CLI's temperature products (normalization; before any replacement). max_pitch:
-    skip the file when its gimbal pitch (after adj's override) is above it."""
+    skip the file when its gimbal pitch (after adj's override) is above it. rjpeg_picture: the
+    rjpeg product's picture, "palette" (coloured as pseudo) or "original" (DJI's)."""
     data = src.read_bytes()
     if max_pitch is not None:
         pitch = adj.gimbal_pitch
@@ -135,8 +137,20 @@ def process_file(
         return ProcessResult(src, ok=False, reason=explain(e))
 
     replaced = adjust.Replaced()
-    made, failed = _make_products(rj, dict.fromkeys(p for p, _ in wanted), range_min_c, range_max_c, palette, result,
+    products = dict.fromkeys(p for p, _ in wanted if p != "rjpeg")
+    asked_rjpeg = any(p == "rjpeg" for p, _ in wanted)
+    if asked_rjpeg and rjpeg_picture == "palette":
+        products["pseudo"] = None                   # the R-JPEG's picture (written only if asked for)
+    made, failed = _make_products(rj, products, range_min_c, range_max_c, palette, result,
                                   adj, replaced, offset_c)
+    if asked_rjpeg:
+        picture = made["pseudo"][0] if rjpeg_picture == "palette" and "pseudo" in made else None
+        try:
+            made["rjpeg"] = (_rjpeg_copy(data, rj, adj, offset_c, picture), {})
+        except (rjpeg.CopyError, tsdk.TsdkError) as e:
+            failed["rjpeg"] = explain(e) if isinstance(e, tsdk.TsdkError) else str(e)
+    made = {p: v for p, v in made.items() if p in dict(wanted)}
+    failed = {p: v for p, v in failed.items() if p in dict(wanted)}
     if not made:
         return ProcessResult(src, ok=False, reason="; ".join(failed.values()) or "nothing to do")
     for product, reason in failed.items():
@@ -161,6 +175,19 @@ def process_file(
             outputs.write(path, product, ext, pixels, metadata, {**text, **extra_text}, compression)
             result.outputs.append(path)
     return result
+
+
+def _rjpeg_copy(data: bytes, rj, adj: adjust.Adjustments, offset_c: float, picture: np.ndarray | None) -> bytes:
+    """The source R-JPEG written again (see rjpeg): with the parameters rj measures with where they
+    differ from its own, private with strip_location. Raises CopyError for what it can't carry."""
+    if adj.replaces() or offset_c:
+        raise rjpeg.CopyError("an R-JPEG can't carry normalized or replaced temperatures (temp_c can)")
+    used = rj.get_measurement_params()
+    try:
+        own = tsdk.open(data).get_measurement_params()
+    except tsdk.ParamError:
+        own = None
+    return rjpeg.copy(data, None if used == own else used, private=adj.strip_location, picture=picture)
 
 
 def _open_with_params(data: bytes, overrides: MeasurementOverrides, result: ProcessResult):

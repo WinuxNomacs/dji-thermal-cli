@@ -8,7 +8,8 @@ TIFF and EXR are compressed losslessly by default (Deflate / ZIP) or not at all
 (compression "none"); PNG is always zlib-compressed.
 
 Every TIFF and PNG carries the source EXIF (GPS included) and XMP; single-band thermal
-products also get Camera:BandName="LWIR" for WebODM/ODX.
+products also get Camera:BandName="LWIR" for WebODM/ODX. The rjpeg product is the source R-JPEG
+itself, written again (see rjpeg).
 """
 
 from __future__ import annotations
@@ -40,8 +41,11 @@ PRODUCTS = {
     "gray16": Product("uint16 grayscale view: --range-min..--range-max (or each image's own range) "
                       "stretched to 0..65535; for viewing, not measurement", ("png", "tiff")),
     "pseudo": Product("8-bit RGB pseudo-colour image (--palette, --range-min/--range-max)", ("png", "tiff")),
+    "rjpeg": Product("DJI R-JPEG that DJI's tools measure with the parameters used, its picture coloured as pseudo "
+                     "(--rjpeg-picture original keeps DJI's); not with --normalize or --replace-*; the H20T and XT S "
+                     "only with their own parameters", ("jpg",)),
 }
-FORMAT_ALIASES = {"tif": "tiff"}
+FORMAT_ALIASES = {"tif": "tiff", "jpeg": "jpg"}
 DEFAULT_OUTPUTS = (("temp_c", "tiff"), ("pseudo", "png"))
 COMPRESSIONS = ("deflate", "none")
 
@@ -92,11 +96,13 @@ def write(path: Path, product: str, ext: str, pixels: np.ndarray, metadata: tiff
     """Write one output. text: extra key/value metadata (PNG text chunks, EXR attributes).
     compression: "deflate" (TIFF Deflate, EXR ZIP) or "none"; PNG is always compressed."""
     fmt = FORMAT_ALIASES.get(ext, ext)
-    if fmt not in ("tiff", "png", "exr"):
+    if fmt not in ("tiff", "png", "exr", "jpg"):
         raise ValueError(fmt)
     band_name = product != "pseudo"
     with files.replaced_when_done(path) as tmp:
-        if fmt == "tiff":
+        if fmt == "jpg":                            # an R-JPEG copy, made whole (rjpeg.copy)
+            tmp.write_bytes(pixels)
+        elif fmt == "tiff":
             tiffout.write_tiff(tmp, pixels, metadata, band_name=band_name, compression=compression)
         elif fmt == "png":
             _write_png(tmp, pixels, metadata, band_name, text or {})

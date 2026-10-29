@@ -6,6 +6,21 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- R-JPEG copies: the `rjpeg` output of `process` (`<stem>_rjpeg.jpg`) and
+  `rjpeg_copy()` write the source R-JPEG again so that DJI's own tools measure it as this tool
+  does. The measurement parameters used are written where DJI's SDK reads them (the iirp,
+  girp and hirp cameras; the H20T and XT S store none, so other parameters are refused with
+  the reason). The visible picture and its preview are the `pseudo` output, or DJI's with
+  `--rjpeg-picture original`. With `--strip-location` the copy is private and still
+  radiometric. Normalized or replaced temperatures can't be carried: the output is then
+  skipped with the reason. Every copy of DJI's samples measures in the native SDK exactly as
+  its source with the same parameters set.
+- `--strip-location` also removes the free-text fields where a name or an address could be
+  (EXIF ImageDescription, Artist, Copyright, UserComment and the XP fields; XMP dc:creator,
+  dc:rights, dc:description, dc:title and dc:subject), and the sensor's serial number in the
+  debug records DJI writes inside the EXIF block (Zenmuse H20N, H20T, Mavic 2 Enterprise
+  Advanced), which TIFF and PNG outputs carried.
+
 ## [1.7.0] - 2026-10-29
 
 - Python 3.9 or newer (was 3.12), so that it installs where WebODM runs it: WebODM's plugins
