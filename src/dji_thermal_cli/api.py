@@ -554,6 +554,7 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
     mosaic, the same for both, is written in output_dir only."""
     if as_converted_dir is not None and not options.normalize:
         raise SettingsError("as_converted_dir needs options.normalize")
+    heights = _height_options(options)          # a DSM that can't be used fails before the frames
     root = _existing(path)
     found = _scan(root, progress)
     out = Path(output_dir)
@@ -572,10 +573,10 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
     try:
         if as_converted_dir is None:
             m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=options.normalize,
-                              progress=report, jobs=worker_count(jobs, len(frames)), **_height_options(options))
+                              progress=report, jobs=worker_count(jobs, len(frames)), **heights)
         else:
             m, mc = _mosaic.build_both(frames, converted, gsd=options.gsd, align=options.align, progress=report,
-                                       jobs=worker_count(jobs, len(frames)), **_height_options(options))
+                                       jobs=worker_count(jobs, len(frames)), **heights)
     except ValueError as e:
         raise MosaicError(f"Mosaic failed: {e}", counts) from None
     visual = note = None
@@ -685,6 +686,7 @@ def normalization(path: str | os.PathLike, settings: Settings = Settings(), opti
     """The per-frame normalization of a dataset (see Normalization), for process(normalize=...)
     or make_mosaic(MosaicOptions(normalize=True)). Uses options' max_pitch and align; the
     replacement settings are not applied while comparing frames."""
+    heights = _height_options(options)
     root = _existing(path)
     found = _found or _scan(root, progress)
     src_root = root if root.is_dir() else root.parent
@@ -697,7 +699,7 @@ def normalization(path: str | os.PathLike, settings: Settings = Settings(), opti
         raise MosaicError("No frames to compare for normalization.", counts)
     try:
         m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=False, check_misalignment=False,
-                          progress=report, jobs=worker_count(jobs, len(frames)), **_height_options(options))
+                          progress=report, jobs=worker_count(jobs, len(frames)), **heights)
     except ValueError as e:
         raise MosaicError(f"Normalization failed: {e}", counts) from None
     offsets = {src_root / row["file"]: float(row["temperature_offset_c"]) for row in m.frames}

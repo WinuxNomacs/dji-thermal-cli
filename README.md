@@ -218,6 +218,10 @@ How it works:
   - A DSM you already have, e.g. ODM's `dsm.tif`, replaces the estimated heights. It is a
     GeoTIFF in WGS84 UTM or latitude/longitude, with altitudes in metres. The mosaic never
     needs one.
+  - It is read without a TIFF library: uncompressed, Deflate or LZW, with or without a
+    predictor, as ODM and GDAL write them (other compressions: rewrite it with
+    `gdal_translate -co COMPRESS=DEFLATE`). A DSM that can't be used stops the run before
+    any frame is converted.
   - It is resampled onto the height cells (the median of the DSM pixels in each). Cells it
     doesn't cover stay on the plane.
   - A DSM's altitudes are often on another datum than the drone's. They are shifted to

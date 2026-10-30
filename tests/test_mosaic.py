@@ -9,6 +9,8 @@ import io
 import json
 import math
 import re
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -19,6 +21,7 @@ from dji_thermal_cli import api, geo, mosaic, units
 
 from .conftest import flight_counts, flight_dir, sample_files, samples_dir
 from .test_cli import _cli
+from . import tiffs
 from .test_rangefinder import _with_xmp, _xmp
 
 LAT, LON, GROUND = 42.1034, -88.0767, 200.0
@@ -533,6 +536,62 @@ def test_dsm_is_read_from_utm_and_latitude_longitude_geotiffs(tmp_path):
         mosaic.read_dsm(tmp_path / "plain.tif")
     with pytest.raises(ValueError, match="CRS must be"):
         mosaic.read_dsm(_write_dsm(tmp_path / "web.tif", z, 0, 0, 1, 1, 3857))
+
+
+def test_a_dsm_as_odm_writes_it_is_read_without_a_tiff_library(tmp_path):
+    """ODM's dsm.tif: tiled, Deflate with the floating-point predictor, which tifffile reads only
+    with imagecodecs; in a process that can't import tifffile."""
+    zone, north = geo.utm_zone(LAT, LON)
+    e0, n0 = (round(v) for v in geo.utm(LAT, LON, zone, north))
+    z = (np.arange(40 * 30.0).reshape(30, 40) / 7 + 200).astype(np.float32)
+    z[2, 3] = -9999
+    keys = (1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, geo.epsg(zone, north))
+    path = tiffs.write(tmp_path / "dsm.tif", z[None], compression="deflate", predictor=3, tile=16, extra=[
+        (33550, 12, (0.05, 0.05, 0.0)), (33922, 12, (0.0, 0.0, 0.0, e0, n0, 0.0)), (34735, 3, keys),
+        (42113, 2, b"-9999\0")])
+    code = ("import sys; sys.modules['tifffile'] = None; import numpy as np; from dji_thermal_cli import mosaic; "
+            f"d = mosaic.read_dsm({str(path)!r}); print(d.epsg, d.x0, d.y0, d.dx, int(np.isnan(d.z).sum()), d.z[29, 39])")
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == [str(geo.epsg(zone, north)), str(float(e0)), str(float(n0)), "0.05", "1",
+                                   str(float(z[29, 39]))]
+
+
+def test_a_dsm_is_read_once_while_its_file_is_unchanged(tmp_path):
+    z = np.full((3, 4), 200.0)
+    path = _write_dsm(tmp_path / "dsm.tif", z, 0, 0, 1, 1, 32616)
+    first = mosaic.read_dsm(path)
+    assert mosaic.read_dsm(path) is first and not first.z.flags.writeable
+    _write_dsm(path, z + 1, 0, 0, 1, 1, 32616, nodata="-99999")     # a longer file: a new size
+    assert mosaic.read_dsm(path).z[0, 0] == 201
+
+
+def test_a_dsm_that_cannot_be_read_fails_before_any_frame_is_converted(tmp_path):
+    (tmp_path / "bad.tif").write_bytes(b"not a tiff")
+    options = api.MosaicOptions(dsm=tmp_path / "bad.tif")
+    for call in (lambda: api.make_mosaic(tmp_path / "no-such-flight", tmp_path / "out", options=options),
+                 lambda: api.normalization(tmp_path / "no-such-flight", options=options)):
+        with pytest.raises(api.SettingsError, match="dsm: .*bad.tif: not a readable GeoTIFF"):
+            call()
+    flight = tmp_path / "flight dsm"
+    flight.mkdir()
+    proc = _cli("process", "--input-dir", flight, "--output-dir", tmp_path / "out", "--mosaic",
+                "--mosaic-dsm", tmp_path / "bad.tif")
+    assert proc.returncode != 0 and "Done." not in proc.stdout
+    assert proc.stderr.strip().startswith(f"--mosaic-dsm: {tmp_path / 'bad.tif'}: not a readable GeoTIFF (not a TIFF)")
+    assert "Normalization failed" not in proc.stderr
+
+
+def test_option_names_replace_field_names_but_not_paths_holding_them():
+    from dji_thermal_cli.cli import _fail
+    for message, shown in [("dsm: /data/dsm/dsm.tif: not a readable GeoTIFF",
+                            "--mosaic-dsm: /data/dsm/dsm.tif: not a readable GeoTIFF"),
+                           (r"dsm: C:\dsm\dsm.tif: bad", r"--mosaic-dsm: C:\dsm\dsm.tif: bad"),
+                           ("dsm_offset needs a dsm", "--mosaic-dsm-offset needs a --mosaic-dsm"),
+                           ("height_cell must be positive.", "--mosaic-height-cell must be positive.")]:
+        with pytest.raises(SystemExit) as exc:
+            _fail(ValueError(message))
+        assert exc.value.code == shown
 
 
 def test_frames_are_projected_onto_a_dsm_with_its_offset_estimated_from_the_rangefinder(tmp_path):
