@@ -385,7 +385,8 @@ bit for bit (the test suite checks it on DJI's sample images).
 - **DJI's library never runs in the tool's own process:** it is loaded in a child process,
   started on first use. If it crashes there or stops answering (two minutes for one call),
   the file it was working on is skipped with the reason (for example "DJI's Thermal SDK
-  crashed (dirp_process): killed by SIGSEGV"), and the next file starts a new child.
+  crashed (dirp_process): killed by SIGSEGV", or on Windows "ended by exception 0xC0000005
+  (access violation)"), and the next file starts a new child.
 - **Only SDK v1.8** (API revisions 19 and 20): another version is refused with the version it
   reports, since its data structures may differ. `check_sdk(DIR, samples)` says whether an SDK
   can be used, measuring the samples with it.

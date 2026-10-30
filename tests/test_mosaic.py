@@ -8,6 +8,7 @@ import dataclasses
 import io
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -562,7 +563,9 @@ def test_a_dsm_is_read_once_while_its_file_is_unchanged(tmp_path):
     path = _write_dsm(tmp_path / "dsm.tif", z, 0, 0, 1, 1, 32616)
     first = mosaic.read_dsm(path)
     assert mosaic.read_dsm(path) is first and not first.z.flags.writeable
-    _write_dsm(path, z + 1, 0, 0, 1, 1, 32616, nodata="-99999")     # a longer file: a new size
+    mtime = path.stat().st_mtime_ns
+    _write_dsm(path, z + 1, 0, 0, 1, 1, 32616)
+    os.utime(path, ns=(mtime + 10**9, mtime + 10**9))     # Windows' clock can leave it as it was
     assert mosaic.read_dsm(path).z[0, 0] == 201
 
 

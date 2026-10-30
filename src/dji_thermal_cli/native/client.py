@@ -23,6 +23,8 @@ from ._child import read_frame, write_frame
 
 START_TIMEOUT = 30.0        # seconds for the child to load the library
 REQUEST_TIMEOUT = 120.0     # seconds for one call (a measurement takes milliseconds)
+_WINDOWS_EXCEPTIONS = {0xC0000005: " (access violation)", 0xC00000FD: " (stack overflow)",
+                       0xC0000409: " (stack buffer overrun)", 0xC000001D: " (illegal instruction)"}
 
 _PACKAGE_PARENT = str(Path(__file__).resolve().parents[2])
 # The child runs this package's own copy (also when it was put on sys.path at run time, as
@@ -127,6 +129,8 @@ class NativeProcess:
                 why = f"killed by {signal.Signals(-code).name}"
             except ValueError:
                 why = f"killed by signal {-code}"
+        elif code >= 0xC0000000:                  # a Windows exception, as a crash ends a process there
+            why = f"ended by exception 0x{code:08X}" + _WINDOWS_EXCEPTIONS.get(code, "")
         else:
             why = f"its process exited with status {code}"
         tail = self._stderr_tail()

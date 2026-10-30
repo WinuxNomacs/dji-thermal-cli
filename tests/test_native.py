@@ -39,7 +39,9 @@ def fake():
 def test_a_crash_in_the_library_fails_only_that_call(fake):
     rj = native.open(DATA, "unused", fake)
     first = fake._proc.pid
-    with pytest.raises(native.NativeCrash, match="crashed .*killed by SIG"):
+    crashed = "ended by exception 0xC0000005 \\(access violation\\); it wrote: exception: access violation" \
+        if os.name == "nt" else "killed by SIG"
+    with pytest.raises(native.NativeCrash, match="crashed .*" + crashed):
         rj._call("crash", "crash")
     assert isinstance(native.NativeCrash("x"), tsdk.TsdkError)
     again = native.open(DATA, "unused", fake)               # a new child serves the next call

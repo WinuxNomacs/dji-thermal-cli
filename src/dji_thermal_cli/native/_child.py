@@ -12,17 +12,21 @@ is ("ready", library path) or ("failed", reason). Requests: (op, handles to clos
     ("exit", closes)                    -> the child exits
 
 A failed call replies ("dirp", function, code) for a dirp error, or ("error", type, message).
+A crash in the library ends the child: on Windows, where ctypes turns it into an OSError, the
+child exits with the exception's code, as the crash would have ended it.
 """
 
 from __future__ import annotations
 
 import os
 import pickle
+import re
 import struct
 import sys
 from typing import BinaryIO, Callable
 
 _HEADER = struct.Struct(">I")
+_ACCESS_VIOLATION = 0xC0000005
 
 
 def read_frame(stream: BinaryIO):
@@ -94,10 +98,23 @@ def serve(load: Callable[[str], object], argv: list[str]) -> None:
             else:
                 raise ValueError(f"unknown request {op!r}")
         except Exception as e:  # noqa: BLE001 - every failure is the parent's to raise
+            if os.name == "nt" and isinstance(e, OSError) and str(e).startswith("exception"):
+                _crash(str(e))
             func, code = getattr(e, "func", None), getattr(e, "code", None)
             reply = ("dirp", func, code) if func is not None and isinstance(code, int) else \
                 ("error", type(e).__name__, str(e))
         write_frame(replies, reply)
+
+
+def _crash(message: str) -> None:
+    """End as a crash in the library would have: ctypes on Windows reports one as an OSError
+    ("exception: access violation ...", "exception code 0x...") and the library's state can't
+    be trusted after it."""
+    found = re.search(r"exception code (0x[0-9a-fA-F]+)", message)
+    code = int(found.group(1), 16) if found else _ACCESS_VIOLATION
+    sys.stderr.write(message + "\n")
+    sys.stderr.flush()
+    os._exit(code - (1 << 32) if code >= 1 << 31 else code)
 
 
 def main() -> None:
