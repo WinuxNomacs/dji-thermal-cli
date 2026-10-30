@@ -6,6 +6,14 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- On Windows, a crash in DJI's library (`process --sdk`) now ends its child process as it does on
+  Linux: the file is skipped with `NativeCrash` ("ended by exception 0xC0000005 (access
+  violation)") and the next file starts a new child. ctypes turned the crash into an ordinary
+  error there, so the call failed with `NativeError` and the same child, its library's state
+  untrusted, went on serving.
+
 ## [1.9.1] - 2026-10-30
 
 ### Fixed
