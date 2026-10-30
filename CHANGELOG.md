@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.9.2] - 2026-10-30
+
 ### Fixed
 
 - On Windows, a crash in DJI's library (`process --sdk`) now ends its child process as it does on
@@ -184,7 +186,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.1...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.2...HEAD
+[1.9.2]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.1...v1.9.2
 [1.9.1]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.7.0...v1.8.0
