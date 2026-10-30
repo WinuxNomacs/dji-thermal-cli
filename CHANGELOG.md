@@ -6,6 +6,20 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `--mosaic-dsm` (`MosaicOptions(dsm=...)`) works when installed from PyPI: the DSM was read with
+  tifffile, which is not a dependency, so it failed with `No module named 'tifffile'`. It is now
+  read by the package itself (`tiffin.py`), with no new dependency.
+- ODM's own `dsm.tif` can be used: it is compressed with Deflate and the floating-point
+  predictor, which tifffile reads only with imagecodecs. Strips or tiles, classic TIFF or
+  BigTIFF, uncompressed, Deflate or LZW, with any predictor, are read; other compressions are
+  refused with how to rewrite the file.
+- A DSM that can't be used stops the run before any frame is converted, as a settings error
+  (`--mosaic-dsm: PATH: ...`), rather than as "Normalization failed" or "Mosaic failed" after
+  converting the frames; and option names in error messages no longer replace parts of paths
+  (a folder named `dsm` showed as `--mosaic-dsm`).
+
 ## [1.9.0] - 2026-10-29
 
 - DJI's own Thermal SDK in place of the built-in port, for those who have it: `process --sdk

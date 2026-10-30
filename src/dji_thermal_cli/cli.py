@@ -235,8 +235,8 @@ _FLAGS = {"replace_above_value": "--replace-above-value", "replace_below_value":
 def _fail(e: Exception) -> None:
     """Exit with the error, naming command-line options rather than API fields."""
     message = str(e)
-    for field, flag in _FLAGS.items():
-        message = re.sub(rf"(?<![\w-]){field}(?!\w)", flag, message)
+    for field, flag in _FLAGS.items():       # the field's name, not a path or file name holding it
+        message = re.sub(rf"(?<![\w\-./\\]){field}(?!\w|[./\\]\w)", flag, message)
     sys.exit(message)
 
 
@@ -338,6 +338,8 @@ def _cmd_process(args: argparse.Namespace) -> None:
                                     dsm=args.mosaic_dsm, dsm_offset=args.mosaic_dsm_offset,
                                     visual=args.mosaic_visual, visual_gsd=args.mosaic_visual_gsd,
                                     units=tuple(u for group in (args.mosaic_units or [["C"]]) for u in group))
+        if args.mosaic or args.normalize:
+            api._height_options(options)        # a DSM that can't be used fails before any frame is converted
     except api.SettingsError as e:
         _fail(e)
     show = _MosaicProgress(_printer(), quiet=args.quiet)

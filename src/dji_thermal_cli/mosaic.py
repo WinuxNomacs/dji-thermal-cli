@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import io
 import json
 import math
@@ -36,7 +37,7 @@ from xml.sax.saxutils import escape
 import numpy as np
 from PIL import Image
 
-from . import djixmp, files, geo, tiffout, tsdk, units
+from . import djixmp, files, geo, tiffin, tiffout, tsdk, units
 
 FULL_FRAME_DIAGONAL_MM = math.hypot(36.0, 24.0)
 DEFAULT_MAX_PITCH = -80.0
@@ -334,22 +335,25 @@ class Dsm:
 
 def read_dsm(path: Path) -> Dsm:
     """A DSM GeoTIFF's first band, as written by ODM, GDAL and the like: north-up (ModelPixelScale +
-    one ModelTiepoint), in WGS84 UTM or lat/lon, altitudes in metres, GDAL_NODATA for no data."""
-    import tifffile
-
+    one ModelTiepoint), in WGS84 UTM or lat/lon, altitudes in metres, GDAL_NODATA for no data.
+    The last one read is kept while its file is unchanged: a run checks it before reading it."""
     path = Path(path)
     try:
-        with tifffile.TiffFile(path) as tif:
-            page = tif.pages[0]
-            tags = {t.code: t.value for t in page.tags.values()}
-            z = page.asarray()
-    except (OSError, ValueError, tifffile.TiffFileError) as exc:
+        st = path.stat()
+    except OSError as exc:
+        raise ValueError(f"{path}: not a readable GeoTIFF ({exc})") from exc
+    return _read_dsm(path, st.st_mtime_ns, st.st_size)
+
+
+@functools.lru_cache(maxsize=1)
+def _read_dsm(path: Path, mtime_ns: int, size: int) -> Dsm:
+    try:
+        z, tags = tiffin.read_band(path)
+    except (OSError, ValueError) as exc:
         raise ValueError(f"{path}: not a readable GeoTIFF ({exc})") from exc
     if 33550 not in tags or 33922 not in tags:
         raise ValueError(f"{path}: no georeference (ModelPixelScale and ModelTiepoint): a transformed "
                          "(rotated) raster is not supported")
-    if z.ndim == 3:
-        z = z[..., 0] if page.planarconfig == 1 else z[0]      # contiguous: (rows, cols, bands)
     z = z.astype(np.float64)
     dx, dy = float(tags[33550][0]), float(tags[33550][1])
     tie = [float(v) for v in tags[33922][:6]]
@@ -374,6 +378,7 @@ def read_dsm(path: Path) -> Dsm:
         except ValueError:
             pass
     z[~np.isfinite(z)] = np.nan
+    z.flags.writeable = False                   # shared by the cache
     return Dsm(path, z, x0, y0, dx, dy, epsg)
 
 
