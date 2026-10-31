@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-10-31
+
 ### Added
 
 - `check()`: a drone's visual photos (not R-JPEGs, with DJI XMP) are described too, in the
@@ -198,7 +200,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.10.0...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.11.0...HEAD
+[1.11.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.10.0...v1.11.0
 [1.10.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.1...v1.10.0
 [1.9.1]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.8.0...v1.9.0
