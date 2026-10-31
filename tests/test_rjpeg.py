@@ -196,8 +196,11 @@ def test_process_writes_r_jpegs_with_the_parameters_used(tmp_path):
     copy = (tmp_path / "a" / f"{src.stem}_rjpeg.jpg").read_bytes()
     assert _open(copy).get_measurement_params().emissivity == pytest.approx(0.9)
     with Image.open(tmp_path / "a" / f"{src.stem}_pseudo.png") as pseudo, Image.open(io.BytesIO(copy)) as im:
-        diff = np.abs(np.asarray(im.convert("RGB")).astype(int) - np.asarray(pseudo.convert("RGB")).astype(int))
-        assert diff.mean() < 4                       # its picture is the pseudo output, JPEG-compressed
+        # Its picture is the pseudo output, JPEG-compressed: what compression loses depends on the frame
+        buf = io.BytesIO()
+        pseudo.convert("RGB").save(buf, "JPEG", quality=rjpeg.PICTURE_QUALITY)
+        expected = np.asarray(Image.open(buf).convert("RGB")).astype(int)
+        assert np.abs(np.asarray(im.convert("RGB")).astype(int) - expected).mean() < 0.5
     proc = _cli("process", "--input-dir", src, "--output-dir", tmp_path / "b", "-o", "rjpeg", "--jobs", "1",
                 "--rjpeg-picture", "original", "--strip-location")
     assert proc.returncode == 0, proc.stderr
