@@ -6,6 +6,13 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `check()`: a drone's visual photos (not R-JPEGs, with DJI XMP) are described too, in the
+  report's new `FileReport.visual`: the camera (model, serials, size, capture time), position,
+  altitudes, GPS status, rangefinder and attitude, from the EXIF and DJI XMP. `info` stays a
+  thermal frame's only, so the findings and the WebODM plan are unchanged.
+
 ## [1.10.0] - 2026-10-31
 
 ### Added

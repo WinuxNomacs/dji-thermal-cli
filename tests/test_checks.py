@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 
 from dji_thermal_cli import checks, dataset
 
-from .conftest import flight_counts, flight_dir, sample
+from .conftest import flight_counts, flight_dir, flight_visual, sample
 from .test_cli import _cli
 
 
@@ -143,3 +144,39 @@ def test_command_on_flight():
     warnings = json.loads(_cli("check", "--input-dir", flight, "--format", "json").stdout)["summary"]["warning"]
     strict = _cli("check", "--input-dir", flight, "--strict")
     assert strict.returncode == (1 if warnings else 0)
+
+
+def test_a_visual_photo_is_described_from_its_exif_and_dji_xmp(tmp_path):
+    """Not thermal, so no info (what the analysis and the WebODM plan read), but its own groups:
+    the camera at the JPEG's size, its position, altitudes, rangefinder and gimbal."""
+    from .test_visual import POSE, _jpeg
+    path = tmp_path / "DJI_20261022163316_0024_V.JPG"
+    path.write_bytes(_jpeg(POSE + 'drone-dji:RelativeAltitude="+21.2" drone-dji:GpsStatus="RTK" '
+                                  'drone-dji:LRFStatus="Normal" drone-dji:LRFTargetDistance="24.5">'))
+    r = checks.inspect(path)
+    assert (r.status.kind, r.info, r.sha1 is not None) == (dataset.NOT_THERMAL, None, True)
+    v = r.visual
+    assert (v["thermal"], v["temperature"], v["exif"], v["file"]["kind"]) == (None, None, None, "not_thermal")
+    assert (v["camera"]["model"], v["camera"]["width"], v["camera"]["height"], v["camera"]["focal_source"]) == \
+        ("M4T", 64, 48, "35 mm-equivalent focal length")
+    assert v["camera"]["utc_at_exposure"] == "2026-10-22T21:33:12.242196"
+    g = v["geospatial"]
+    assert (g["latitude"], g["longitude"], g["absolute_altitude_m"], g["relative_altitude_m"], g["gps_status"]) == \
+        (42.1, -88.1, 250.0, 21.2, "RTK")
+    assert g["rangefinder"]["distance_m"] == 24.5
+    assert (v["attitude"]["gimbal_pitch"], v["attitude"]["gimbal_yaw"]) == (-90.0, 0.0)
+    assert checks.analyze([r], []) == checks.analyze([dataclasses.replace(r, visual=None)], [])  # the same findings
+
+
+def test_a_jpeg_without_dji_xmp_has_no_visual_groups(tmp_path):
+    from .test_visual import _jpeg
+    path = tmp_path / "photo.jpg"
+    path.write_bytes(_jpeg(None))
+    r = checks.inspect(path)
+    assert (r.status.kind, r.info, r.visual) == (dataset.NOT_THERMAL, None, None)
+
+
+@pytest.mark.flight
+def test_a_flights_visual_photos_have_their_positions():
+    v = checks.inspect(flight_visual()[0]).visual
+    assert v is not None and v["geospatial"]["latitude"] is not None and v["camera"]["capture_time"]

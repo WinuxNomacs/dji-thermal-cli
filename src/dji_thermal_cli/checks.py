@@ -1,6 +1,7 @@
 """`check`: a dataset's errors and anomalies, each with the options that address it.
 
-inspect() looks at one file (its content-based kind, its listing, a hash of its bytes);
+inspect() looks at one file (its content-based kind, its listing, a hash of its bytes; for a
+drone's visual photo, what its EXIF and DJI XMP say);
 analyze() compares the files with each other and returns findings:
 
 - error:   a file that can't be used (named like an image but isn't one, unreadable, corrupt,
@@ -54,6 +55,7 @@ class FileReport:
     status: dataset.FileStatus
     info: dict | None                   # listing.describe() groups, for thermal files
     sha1: str | None
+    visual: dict | None = None          # listing.describe_visual() groups, for a drone's other photos
 
 
 def inspect(path: Path, unit: str = "C") -> FileReport:
@@ -63,9 +65,15 @@ def inspect(path: Path, unit: str = "C") -> FileReport:
     except OSError:
         sha1 = None
     info, status = listing.describe(path, unit, stats=True, exif_all=False, decode=True)
+    visual = None
     if info is not None:
         status = dataset.FileStatus(path, dataset.THERMAL, "", info["thermal"]["plugin"], info["file"]["warnings"])
-    return FileReport(str(path), status, info, sha1)
+    elif status.kind == dataset.NOT_THERMAL:
+        try:
+            visual = listing.describe_visual(path, status.warnings)
+        except (OSError, ValueError):           # unreadable metadata: the photo is listed without it
+            visual = None
+    return FileReport(str(path), status, info, sha1, visual)
 
 
 # --- analysis -----------------------------------------------------------------------------
