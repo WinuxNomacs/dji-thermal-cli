@@ -611,6 +611,9 @@ data = dtc.rjpeg_copy("flight/DJI_0001_T.JPG", settings, picture=rgb)   # an R-J
   for k in models.covering(-88.0767, 42.1034):
       print(models.files[k], models.pixels(-88.0767, 42.1034)[k, 0])
   ```
+- **Palettes:** `palette_luts()` gives DJI's palettes by name (as `PALETTES`), each a
+  256-colour RGB table (uint8, shape (256, 3)), from the built-in tables, without a frame:
+  what the iirp and hirp cameras' frames give (M2EA, M30T, M3T/M3TD, H20N, H30T, M4T).
 - **Errors:** a missing path raises `FileNotFoundError`, a mosaic that can't be built raises
   `MosaicError`, and `describe` of a non-thermal file raises `FileProblem`. Within a dataset a
   bad file never raises: it is reported in the result and the rest carries on.
