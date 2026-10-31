@@ -6,12 +6,12 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-10-31
+
 ### Added
 
 - `palette_luts()`: DJI's palettes by name, each a 256-colour RGB table, from the built-in
   tables, without a frame (what the iirp and hirp cameras' frames give).
-
-## [1.9.2] - 2026-10-30
 
 ### Fixed
 
@@ -191,8 +191,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.2...HEAD
-[1.9.2]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.1...v1.9.2
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.1...v1.10.0
 [1.9.1]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.7.0...v1.8.0
