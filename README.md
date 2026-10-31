@@ -588,6 +588,10 @@ data = dtc.rjpeg_copy("flight/DJI_0001_T.JPG", settings, picture=rgb)   # an R-J
   private with `strip_location`, and an RGB array as its picture or DJI's; `RJpegCopyError`
   says why one can't be made). The others return a result object (`ListResult`, `CheckResult`, `Measurement`,
   `ProcessReport`, `MosaicReport`).
+- **A check's reports:** `report.reports` has a `FileReport` per JPEG. A thermal frame's
+  `info` holds its groups, as `describe` gives them. A drone's visual photo (a `_V` or `_W`
+  image) has `info` None and `visual` holding its groups from the EXIF and DJI XMP: camera,
+  geospatial and attitude, with no thermal or temperature group.
 - **MosaicOptions** holds what the `--mosaic-*` options set: `heights` (`"auto"` or
   `"plane"`), `height_cell`, `dsm`, `dsm_offset`, `visual` and `visual_gsd` among them.
 - **The visual mosaic:** with `MosaicOptions(visual=True)`, `report.visual` is a

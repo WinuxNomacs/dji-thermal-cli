@@ -57,7 +57,7 @@ def describe(path: Path, unit: str = "C", stats: bool = True, exif_all: bool = F
         return None, dataset.FileStatus(path, dataset.CORRUPT, f"{type(e).__name__}: {e}", rj.plugin if "rj" in locals() else "")
     exif = Image.open(io.BytesIO(data)).getexif()
     xmp = djixmp.fields(data)
-    info["camera"] = _camera(exif, xmp, rj)
+    info["camera"] = _camera(exif, xmp, rj.width, rj.height)
     info["geospatial"] = _geospatial(exif, xmp)
     info["attitude"] = _attitude(xmp)
     info["exif"] = _all_tags(exif, data) if exif_all else None
@@ -101,16 +101,40 @@ def _stats(rj, unit: str) -> dict:
             "std": _f32(v.std()), "valid_pixels": int(valid.size)}
 
 
-def _camera(exif, xmp: dict, rj) -> dict:
+def describe_visual(path: Path, warnings: list[str] | None = None) -> dict | None:
+    """The groups of a drone's visual (RGB) photo, from its EXIF and DJI XMP: file, camera,
+    geospatial and attitude, with no thermal, temperature or exif group (None). None for a JPEG
+    without DJI XMP."""
+    data = path.read_bytes()
+    xmp = djixmp.fields(data)
+    if not xmp:
+        return None
+    image = Image.open(io.BytesIO(data))
+    exif = image.getexif()
+    return {
+        "file": {"path": str(path), "name": path.name, "size_bytes": len(data), "kind": dataset.NOT_THERMAL,
+                 "warnings": list(warnings or [])},
+        "camera": _camera(exif, xmp, *image.size, visual=True),
+        "thermal": None,
+        "temperature": None,
+        "geospatial": _geospatial(exif, xmp),
+        "attitude": _attitude(xmp),
+        "exif": None,
+    }
+
+
+def _camera(exif, xmp: dict, width: int, height: int, visual: bool = False) -> dict:
+    """visual: an RGB photo, its focal length in pixels from the 35 mm equivalent (see
+    mosaic.read_pose)"""
     sub = exif.get_ifd(IFD.Exif)
     model = str(exif.get(272, "")).strip("\0 ")
     focal, focal35 = _num(sub.get(37386)), _num(sub.get(41989))
-    focal_px, focal_source = mosaic.focal_length_px(model, rj.width, rj.height, focal, focal35)
+    focal_px, focal_source = mosaic.focal_length_px("" if visual else model, width, height, focal, focal35)
     return {
         "make": _str(exif.get(271)), "model": model or None, "software": _str(exif.get(305)),
         "camera_serial": xmp.get("CameraSerialNumber") or _str(sub.get(42033)),
         "drone_model": xmp.get("DroneModel"), "drone_serial": xmp.get("DroneSerialNumber"),
-        "width": rj.width, "height": rj.height,
+        "width": width, "height": height,
         "focal_length_mm": focal, "focal_length_35mm": focal35,
         "focal_px": None if focal_px is None else round(focal_px, 2), "focal_source": focal_source or None,
         "capture_time": _str(sub.get(36867)) or _str(exif.get(306)),     # DateTimeOriginal, else DateTime
