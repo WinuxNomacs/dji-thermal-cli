@@ -206,3 +206,20 @@ def test_core_measure_matches_process(tmp_path):
     r = core.process_file(src, tmp_path, src.parent, core.MeasurementOverrides(use_rangefinder=True), None, None, None,
                           (("temp_c", "tiff"),))
     np.testing.assert_array_equal(tifffile.imread(r.outputs[0]), dtc.measure(src).temperature)
+
+
+def test_palette_luts_are_dji_palettes_by_name_without_a_frame():
+    luts = dtc.palette_luts()
+    assert list(luts) == list(dtc.PALETTES)
+    for lut in luts.values():
+        assert lut.shape == (256, 3) and lut.dtype == np.uint8
+    assert len({lut.tobytes() for lut in luts.values()}) == len(luts)
+    white = luts["whitehot"].astype(int)
+    assert (white[:, 0] == white[:, 1]).all() and (np.diff(white[:, 0]) >= 0).all()
+
+
+@pytest.mark.flight
+def test_palette_luts_are_what_a_flight_frame_gives():
+    lut = tsdk.open(_flight()[0].read_bytes()).get_pseudo_color_lut()
+    for i, table in enumerate(dtc.palette_luts().values()):
+        np.testing.assert_array_equal(table, lut[:, i, :].T)

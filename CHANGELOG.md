@@ -6,6 +6,11 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `palette_luts()`: DJI's palettes by name, each a 256-colour RGB table, from the built-in
+  tables, without a frame (what the iirp and hirp cameras' frames give).
+
 ## [1.9.2] - 2026-10-30
 
 ### Fixed

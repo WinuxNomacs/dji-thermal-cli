@@ -40,7 +40,7 @@ __all__ = [
     "ListResult", "CheckResult", "Measurement", "ProcessReport", "MosaicReport", "VisualReport",
     "Normalization", "scan", "classify", "describe", "list_dataset", "check", "measure", "process",
     "make_mosaic", "normalization", "FrameModels", "read_frame_models", "rjpeg_copy", "RJpegCopyError",
-    "PALETTES", "palette_index", "parse_outputs", "check_sdk", "NativeError", "NativeSdkError", "NativeCrash",
+    "PALETTES", "palette_index", "palette_luts", "parse_outputs", "check_sdk", "NativeError", "NativeSdkError", "NativeCrash",
 ]
 
 FrameModels = _mosaic.FrameModels
@@ -229,6 +229,15 @@ def palette_index(palette: int | str) -> int:
     if key in PALETTES:
         return PALETTES.index(key)
     raise SettingsError(f"palette must be 0-{len(PALETTES) - 1} or one of {', '.join(PALETTES)}")
+
+
+def palette_luts() -> dict[str, np.ndarray]:
+    """DJI's palettes by name (as PALETTES), each a uint8 (256, 3) RGB table, from the built-in
+    tables: what get_pseudo_color_lut gives for the iirp and hirp cameras (M2EA, M30T, M3T,
+    M3TD, H20N, H30T, M4T), without a frame."""
+    from .tsdk import iirp_isp, tables
+    lut = iirp_isp.pseudo_color_lut(tables.load())           # (3, palettes, 256)
+    return {name: np.ascontiguousarray(lut[:, i, :].T) for i, name in enumerate(PALETTES)}
 
 
 def parse_outputs(specs: Iterable[str | tuple[str, str]]) -> tuple[tuple[str, str], ...]:
