@@ -1,14 +1,15 @@
 version: 2
+# Monthly: its pull requests run no CI (see ci.yml), and each is checked locally before merging
 updates:
   # keeps the workflows' SHA-pinned actions current
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     groups:
       actions:
         patterns: ["*"]
   - package-ecosystem: uv
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
