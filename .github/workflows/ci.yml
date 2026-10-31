@@ -1,14 +1,20 @@
 name: CI
 
+# Runs only when it is worth its minutes: called by the release workflow before a release
+# is published (a pushed vX.Y.Z tag), started by hand (Actions > CI > Run workflow, on any
+# branch), or on a pull request from a fork (an outside contribution). Pushes to branches
+# and Dependabot's pull requests run nothing: the full suite runs locally before a merge.
+
 on:
-  push:
+  workflow_call:
+  workflow_dispatch:
   pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -16,6 +22,7 @@ env:
 
 jobs:
   lint:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,6 +34,7 @@ jobs:
       - run: uv run --locked ruff check src tests scripts
 
   test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
     # Without the DJI Thermal SDK (not redistributable) the native comparisons skip; the
     # rest, including the built-in tables against the SDK's recorded digests, runs.
     strategy:
@@ -57,6 +65,7 @@ jobs:
         run: uv run --resolution lowest-direct pytest -q
 
   build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -70,7 +79,7 @@ jobs:
       - run: uvx twine@7.0.0 check --strict dist/*
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dist
+          name: ci-dist                  # not the release workflow's dist, when it calls this
           path: dist/
           if-no-files-found: error
 
@@ -85,7 +94,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: dist
+          name: ci-dist
           path: dist/
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:

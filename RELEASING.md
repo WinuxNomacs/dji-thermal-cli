@@ -1,7 +1,10 @@
 # Releasing
 
 Releases are published by `.github/workflows/release.yml` when a `vX.Y.Z` tag is pushed:
-tests, build, the distribution check, TestPyPI, then PyPI. No API token is
+CI (`.github/workflows/ci.yml`: lint, the tests on Linux, Windows and macOS, the build and
+its smoke test), then the build, the distribution check, TestPyPI, then PyPI. Nothing else
+runs GitHub Actions: pushing a branch runs nothing, nor do Dependabot's pull requests; CI
+also runs when started by hand (Actions > CI > Run workflow) and on pull requests from forks. No API token is
 stored anywhere: PyPI trusts the workflow itself (Trusted Publishing). Only the maintainer
 can push a `v*` tag (a tag rule), so pushing the tag is the release decision: nothing waits
 for a further approval.
@@ -33,9 +36,11 @@ for a further approval.
 
 ## Each release
 
-Versions follow PEP 440: a release candidate `X.Y.ZrcN` (tag `vX.Y.ZrcN`) first, to try the
-whole pipeline (PyPI marks it as a pre-release, so `pip install` skips it unless asked),
-then `X.Y.Z` itself. A version number is used once, on TestPyPI and PyPI alike.
+Versions follow PEP 440. A tag is pushed only for a version that is meant to be published,
+once the local checks below pass: each tag runs the whole pipeline. When the workflows
+themselves changed, a release candidate `X.Y.ZrcN` (tag `vX.Y.ZrcN`) can go first to try them
+(PyPI marks it as a pre-release, so `pip install` skips it unless asked). A version number
+is used once, on TestPyPI and PyPI alike.
 
 1. On a branch: set `version` in `pyproject.toml`, run `uv lock`, and move the
    `[Unreleased]` notes in `CHANGELOG.md` under the new version. Merge to `main`.
@@ -58,9 +63,11 @@ then `X.Y.Z` itself. A version number is used once, on TestPyPI and PyPI alike.
    it with "Interrupted.". On Linux, run the same with the native comparisons too (they run
    on Linux only). On Windows, run the same without them (`set` the variables in `cmd`, or
    `$env:` in PowerShell).
-4. Push `main`, wait for CI to pass on all three systems, then tag and push the tag:
-   `git tag -s vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. This publishes: TestPyPI, then
-   PyPI, without stopping.
+4. Push `main` (this runs nothing), then tag and push the tag:
+   `git tag -s vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. This runs CI on all three
+   systems and, if it passes, publishes: TestPyPI, then PyPI, without stopping. If CI fails,
+   nothing is published: fix it and release a new version (the tag's version is used once
+   only if it reached TestPyPI; otherwise delete the tag and push it again).
 5. Watch the Release workflow, then check the release installs:
    `uvx dji-thermal-cli@X.Y.Z --version`.
 6. Create the GitHub release from the tag with the changelog notes.

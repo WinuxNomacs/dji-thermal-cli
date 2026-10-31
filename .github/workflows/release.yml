@@ -1,8 +1,10 @@
 name: Release
 
-# Push a tag vX.Y.Z matching pyproject.toml's version. The build is published to TestPyPI,
-# then to PyPI. Only the maintainer can push v* tags (a tag rule). Publishing uses Trusted
-# Publishing (OIDC, no API tokens) and uploads digital attestations (PEP 740).
+# Push a tag vX.Y.Z matching pyproject.toml's version. CI runs first (ci.yml: lint, the
+# tests on Linux, Windows and macOS, the build and its smoke test); then the build is
+# published to TestPyPI, then to PyPI. Only the maintainer can push v* tags (a tag rule).
+# Publishing uses Trusted Publishing (OIDC, no API tokens) and uploads digital attestations
+# (PEP 740).
 
 on:
   push:
@@ -14,7 +16,36 @@ env:
   UV_VERSION: "0.12.5"
 
 jobs:
+  # First, so a mistyped tag costs seconds, not the CI matrix
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Tag matches the package version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(uv version --short)
+          if [ "$TAG" != "v$version" ]; then
+            echo "tag $TAG does not match version $version"; exit 1
+          fi
+
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   build:
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -26,15 +57,6 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false              # no cache can influence a release build
-      - name: Tag matches the package version
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          version=$(uv version --short)
-          if [ "$TAG" != "v$version" ]; then
-            echo "tag $TAG does not match version $version"; exit 1
-          fi
-      - run: uv run --locked pytest -q
       - run: uv build --no-sources
       - run: uv run --no-project python scripts/check_dist.py dist
       - run: uvx twine@7.0.0 check --strict dist/*
