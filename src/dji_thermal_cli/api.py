@@ -38,12 +38,13 @@ from . import rjpeg as _rjpeg, webodm as _webodm
 __all__ = [
     "Settings", "MosaicOptions", "Event", "SettingsError", "MosaicError", "FileProblem",
     "ListResult", "CheckResult", "Measurement", "ProcessReport", "MosaicReport", "VisualReport",
-    "Normalization", "scan", "classify", "describe", "list_dataset", "check", "measure", "process",
+    "Normalization", "Alignment", "scan", "classify", "describe", "list_dataset", "check", "measure", "process",
     "make_mosaic", "normalization", "FrameModels", "read_frame_models", "rjpeg_copy", "RJpegCopyError",
     "PALETTES", "palette_index", "palette_luts", "parse_outputs", "check_sdk", "NativeError", "NativeSdkError", "NativeCrash",
 ]
 
 FrameModels = _mosaic.FrameModels
+Alignment = _mosaic.Alignment
 read_frame_models = _mosaic.read_frame_models
 
 PALETTES = tuple(core.PSEUDO_COLOR_NAMES)
@@ -182,7 +183,11 @@ class MosaicOptions:
     GeoTIFF (WGS84 UTM or lat/lon, metres) to project onto instead, with dsm_offset metres added
     to its altitudes (None: estimated from the rangefinder; see mosaic._dsm_surface). visual:
     also the mosaic of the visual (RGB) frames taken with the thermal ones (see visual), at
-    visual_gsd metres per pixel (None: the visual frames' own)."""
+    visual_gsd metres per pixel (None: the visual frames' own). alignment: the frames' alignment
+    from an earlier run (MosaicReport.alignment, Normalization.alignment, Alignment.load), used
+    instead of aligning them again when it was made for the same frames and the same gsd,
+    heights and height_cell (else they are aligned afresh, and the report's alignment says
+    why); needs align, and isn't used with a dsm."""
 
     max_pitch: float = _mosaic.DEFAULT_MAX_PITCH
     align: bool = True
@@ -195,6 +200,7 @@ class MosaicOptions:
     dsm_offset: float | None = None
     visual: bool = False
     visual_gsd: float | None = None
+    alignment: Alignment | None = None
 
     def __post_init__(self):
         chosen = tuple(dict.fromkeys(str(u).upper() for u in self.units))
@@ -207,6 +213,8 @@ class MosaicOptions:
             raise SettingsError("visual_gsd needs visual")
         if self.visual_gsd is not None and self.visual_gsd <= 0:
             raise SettingsError("visual_gsd must be positive")
+        if self.alignment is not None and not self.align:
+            raise SettingsError("alignment needs align")
         if self.heights not in ("auto", "plane"):
             raise SettingsError(f"heights must be 'auto' or 'plane', not {self.heights!r}")
         if not 8 <= self.height_cell <= 1024:
@@ -535,6 +543,12 @@ class MosaicReport:
     visual: VisualReport | None = None          # with MosaicOptions.visual, when there were visual frames
     visual_note: str = ""                       # why there is no visual mosaic, when asked for
 
+    @property
+    def alignment(self) -> Alignment | None:
+        """The frames' alignment (None without align, or onto a DSM), for a later run's
+        MosaicOptions.alignment; save() keeps it in a file."""
+        return self.mosaic.alignment
+
 
 @dataclasses.dataclass
 class VisualReport:
@@ -582,10 +596,12 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
     try:
         if as_converted_dir is None:
             m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=options.normalize,
-                              progress=report, jobs=worker_count(jobs, len(frames)), **heights)
+                              progress=report, jobs=worker_count(jobs, len(frames)), alignment=options.alignment,
+                              **heights)
         else:
             m, mc = _mosaic.build_both(frames, converted, gsd=options.gsd, align=options.align, progress=report,
-                                       jobs=worker_count(jobs, len(frames)), **heights)
+                                       jobs=worker_count(jobs, len(frames)), alignment=options.alignment,
+                                       **heights)
     except ValueError as e:
         raise MosaicError(f"Mosaic failed: {e}", counts) from None
     visual = note = None
@@ -681,6 +697,7 @@ class Normalization:
     frames: int                                 # frames placed and compared
     without_offset: int                         # thermal frames that got no offset
     report: dict                                # the mosaic's frame_offsets report
+    alignment: Alignment | None = None          # the frames' alignment, for MosaicOptions.alignment
 
     def apply(self, overrides: core.MeasurementOverrides) -> core.MeasurementOverrides:
         """overrides with the normalization's ambient and reflected temperature filled in."""
@@ -693,7 +710,7 @@ class Normalization:
 def normalization(path: str | os.PathLike, settings: Settings = Settings(), options: MosaicOptions = MosaicOptions(),
                   jobs: int | None = None, progress: ProgressFn | None = None, *, _found=None) -> Normalization:
     """The per-frame normalization of a dataset (see Normalization), for process(normalize=...)
-    or make_mosaic(MosaicOptions(normalize=True)). Uses options' max_pitch and align; the
+    or make_mosaic(MosaicOptions(normalize=True)). Uses options' max_pitch, align and alignment; the
     replacement settings are not applied while comparing frames."""
     heights = _height_options(options)
     root = _existing(path)
@@ -708,13 +725,14 @@ def normalization(path: str | os.PathLike, settings: Settings = Settings(), opti
         raise MosaicError("No frames to compare for normalization.", counts)
     try:
         m = _mosaic.build(frames, gsd=options.gsd, align=options.align, normalize=False, check_misalignment=False,
-                          progress=report, jobs=worker_count(jobs, len(frames)), **heights)
+                          progress=report, jobs=worker_count(jobs, len(frames)), alignment=options.alignment,
+                          **heights)
     except ValueError as e:
         raise MosaicError(f"Normalization failed: {e}", counts) from None
     offsets = {src_root / row["file"]: float(row["temperature_offset_c"]) for row in m.frames}
     thermal = counts["frames"] + counts["oblique"] + counts["unusable"]
     return Normalization(overrides.ambient_temp, overrides.reflection, offsets, len(offsets),
-                         thermal - len(offsets), m.report["frame_offsets"])
+                         thermal - len(offsets), m.report["frame_offsets"], m.alignment)
 
 
 def _build_stages(settings: Settings, options: MosaicOptions, median_ambient: bool, check: bool) -> list[str]:

@@ -436,17 +436,7 @@ def test_alignment_recovers_boresight(monkeypatch):
     """Frames taken with a camera boresight (0.6, -0.4 deg) and up to ~0.8 deg of heading
     jitter that the metadata doesn't report: alignment finds the boresight and brings the
     mosaic back onto the known field."""
-    bias = (math.radians(0.6), math.radians(-0.4))
-    rng = np.random.default_rng(3)
-    true_rotation = mosaic.rotation
-    frames = []
-    for i in range(9):
-        yaw = 5.4 if (i // 3) % 2 == 0 else -174.6          # two opposite passes, as DJI reports them
-        monkeypatch.setattr(mosaic, "rotation", lambda y, p, r: true_rotation(y, p, r) @ mosaic._boresight(*bias))
-        f = _frame(f"f{i}", 3.5 * (i % 3), -3.5 * (i // 3), yaw=yaw + rng.normal(0, 0.4), roll=180.0)
-        monkeypatch.setattr(mosaic, "rotation", true_rotation)
-        f.pose.yaw = yaw
-        frames.append(f)
+    frames = _boresight_flight(monkeypatch)
 
     def field_error(m):
         g = m.grid
@@ -757,3 +747,115 @@ def test_build_both_reports_compositing_both_mosaics_as_one_stage(synthetic):
     composite = [(d, t) for s, d, t in events if s == "composite"]
     assert composite[0] == (0, 12) and composite[-1] == (12, 12)
     assert [d for d, _ in composite] == sorted(d for d, _ in composite)
+
+
+def _boresight_flight(monkeypatch):
+    """Nine frames in two opposite passes, taken with a camera boresight and heading jitter the
+    metadata doesn't report: what alignment corrects."""
+    bias = (math.radians(0.6), math.radians(-0.4))
+    rng = np.random.default_rng(3)
+    true_rotation = mosaic.rotation
+    frames = []
+    for i in range(9):
+        yaw = 5.4 if (i // 3) % 2 == 0 else -174.6
+        monkeypatch.setattr(mosaic, "rotation", lambda y, p, r: true_rotation(y, p, r) @ mosaic._boresight(*bias))
+        f = _frame(f"f{i}", 3.5 * (i % 3), -3.5 * (i // 3), yaw=yaw + rng.normal(0, 0.4), roll=180.0)
+        monkeypatch.setattr(mosaic, "rotation", true_rotation)
+        f.pose.yaw = yaw
+        frames.append(f)
+    return frames
+
+
+def _without_saved_flag(report):
+    return {**report, "alignment": {k: v for k, v in report["alignment"].items() if k != "saved_alignment_used"}}
+
+
+def test_a_saved_alignment_gives_the_same_mosaic_without_aligning_again(monkeypatch, tmp_path):
+    """A build's alignment, kept in memory or saved and read back, places the same frames as that
+    build did: the same mosaic, with no align stage, and the report says the saved one was used.
+    The frames' temperatures may differ (normalized), as the alignment needs only their geometry."""
+    frames = _boresight_flight(monkeypatch)
+    first = mosaic.build(frames)
+    assert first.alignment is not None and first.alignment.frames == tuple(f.name for f in frames)
+    first.alignment.save(tmp_path / "alignment.json")
+    loaded = mosaic.Alignment.load(tmp_path / "alignment.json")
+    for saved in (first.alignment, loaded):
+        stages = []
+        again = mosaic.build(frames, alignment=saved, progress=lambda stage, *a, **k: stages.append(stage))
+        assert "align" not in stages
+        np.testing.assert_array_equal(again.temperature, first.temperature)
+        assert again.report["alignment"]["saved_alignment_used"] is True
+        assert _without_saved_flag(again.report) == first.report
+        assert again.alignment is saved
+    warmer = [mosaic.Frame(f.name, f.temperature + np.float32(0.5 * k), f.pose) for k, f in enumerate(frames)]
+    normalized, _ = mosaic.build_both(warmer, frames, alignment=loaded)
+    assert normalized.report["alignment"]["saved_alignment_used"] is True
+    np.testing.assert_array_equal(np.isfinite(normalized.temperature), np.isfinite(first.temperature))
+
+
+def test_a_saved_alignment_keeps_the_surface_heights(tmp_path):
+    """The heights estimated from parallax are saved with the alignment and projected onto again."""
+    zone, north = geo.utm_zone(LAT, LON)
+    centre = np.array(geo.utm(LAT - 4.0 / 111132.0, LON + 4.0 / (111320.0 * math.cos(math.radians(LAT))), zone, north))
+
+    def roof(e, n):
+        return 2.0 * (np.abs(e - centre[0]) < 3.0) * (np.abs(n - centre[1]) < 3.0)
+
+    frames = [_frame(f"f{i}", 4.0 * (i % 3), -4.0 * (i // 3), yaw=5.4 if (i // 3) % 2 == 0 else -174.6,
+                     roll=180.0, surface=roof) for i in range(9)]
+    first = mosaic.build(frames, check_misalignment=False)
+    assert first.heights is not None
+    first.alignment.save(tmp_path / "alignment.json")
+    again = mosaic.build(frames, check_misalignment=False, alignment=mosaic.Alignment.load(tmp_path / "alignment.json"))
+    np.testing.assert_array_equal(again.heights.z, first.heights.z)
+    np.testing.assert_array_equal(again.temperature, first.temperature)
+
+
+@pytest.mark.parametrize("change, reason", [
+    (lambda frames: (frames[:-1], {}), "it was made for other frames (9, not 8)"),
+    (lambda frames: (frames, {"heights": "plane"}), "it was made with heights 'auto', not 'plane'"),
+    (lambda frames: (frames, {"gsd": 0.05}), "it was made with gsd None, not 0.05"),
+    (lambda frames: ([dataclasses.replace(f, pose=dataclasses.replace(f.pose, abs_alt=f.pose.abs_alt + 1))
+                      if f.name == "f4" else f for f in frames], {}), "the position or attitude of f4 has changed"),
+])
+def test_a_saved_alignment_that_doesnt_fit_the_build_is_not_used(monkeypatch, change, reason):
+    """Other frames (one removed), other placement settings or a frame's pose changed: the frames
+    are aligned afresh, and the report says why the saved alignment wasn't used."""
+    frames = _boresight_flight(monkeypatch)
+    saved = mosaic.build(frames, check_misalignment=False).alignment
+    changed, options = change(frames)
+    stages = []
+    m = mosaic.build(changed, check_misalignment=False, alignment=saved,
+                     progress=lambda stage, *a, **k: stages.append(stage), **options)
+    assert "align" in stages
+    assert m.report["alignment"]["saved_alignment_not_used"] == reason
+    assert "saved_alignment_used" not in m.report["alignment"]
+    assert m.alignment is not saved
+
+
+def test_no_alignment_is_kept_without_aligning_or_onto_a_dsm(synthetic, tmp_path):
+    frames, plain = synthetic
+    assert plain.alignment is None
+    dsm = tmp_path / "dsm.tif"
+    zone, north = geo.utm_zone(LAT, LON)
+    e, n = geo.utm(LAT, LON, zone, north)
+    _write_dsm(dsm, np.full((60, 60), GROUND), e - 20.0, n + 20.0, 1.0, 1.0, geo.epsg(zone, north))
+    m = mosaic.build(frames, check_misalignment=False, dsm=mosaic.read_dsm(dsm), dsm_offset=0.0,
+                     alignment=mosaic.build(frames, check_misalignment=False).alignment)
+    assert m.alignment is None
+    assert m.report["alignment"]["saved_alignment_not_used"] == "the frames are projected onto a DSM"
+
+
+@pytest.mark.parametrize("content", ["not json", "[]", '{"version": 99}', '{"version": 1, "frames": []}'])
+def test_a_file_that_isnt_a_saved_alignment_is_refused(tmp_path, content):
+    path = tmp_path / "alignment.json"
+    path.write_text(content)
+    with pytest.raises(ValueError):
+        mosaic.Alignment.load(path)
+
+
+def test_mosaic_options_refuse_an_alignment_without_align(synthetic):
+    frames, _ = synthetic
+    saved = mosaic.build(frames, check_misalignment=False).alignment
+    with pytest.raises(api.SettingsError, match="alignment needs align"):
+        api.MosaicOptions(align=False, alignment=saved)

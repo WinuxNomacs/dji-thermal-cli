@@ -94,3 +94,29 @@ def test_process_normalize_and_max_pitch(tmp_path):
     assert recorded == pytest.approx(norm.offsets_c[r.src], abs=1e-4)
     ambient = float(re.search(r'dtc:AmbientTemperatureC="([-0-9.]+)"', text).group(1))
     assert ambient == pytest.approx(norm.ambient_c, abs=1e-3)
+
+
+def test_normalizing_aligns_once_for_the_mosaic_and_saves_the_alignment_for_later(tmp_path):
+    """process --normalize --mosaic aligns the frames once: the mosaic uses normalizing's alignment
+    and is the mosaic make_mosaic aligns for itself. --save-alignment keeps it, and a later
+    --alignment builds the same mosaic again without aligning; another --mosaic-gsd aligns afresh."""
+    flight = _flight()
+    saved = tmp_path / "alignment.json"
+    proc = _cli("process", "--input-dir", flight, "--output-dir", tmp_path / "once", "-o", "temp_c", "--normalize",
+                "--mosaic", "--mosaic-normalize", "--save-alignment", saved, "--quiet")
+    assert proc.returncode == 0, proc.stderr
+    assert "(the saved alignment)" in proc.stdout and f"Alignment saved: {saved}" in proc.stdout
+    alone = dtc.make_mosaic(flight, tmp_path / "alone", options=dtc.MosaicOptions(normalize=True))
+    assert "saved_alignment_used" not in alone.mosaic.report["alignment"]
+    np.testing.assert_array_equal(tifffile.imread(tmp_path / "once" / "mosaic_temp_c.tif"),
+                                  tifffile.imread(alone.files[0][0]))
+    stages = []
+    again = dtc.make_mosaic(flight, tmp_path / "again", options=dtc.MosaicOptions(
+        normalize=True, alignment=dtc.Alignment.load(saved)),
+        progress=lambda e: stages.append(e.data["stage"]) if e.kind == "mosaic" else None)
+    assert "align" not in stages
+    np.testing.assert_array_equal(again.mosaic.temperature, alone.mosaic.temperature)
+    other = _cli("process", "--input-dir", flight, "--output-dir", tmp_path / "other", "--mosaic", "--alignment", saved,
+                 "--mosaic-gsd", "0.05", "--quiet")
+    assert other.returncode == 0, other.stderr
+    assert "saved alignment not used, aligned afresh: it was made with gsd None, not 0.05" in other.stdout

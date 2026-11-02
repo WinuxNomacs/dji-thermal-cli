@@ -201,6 +201,15 @@ How it works:
   - Blocks whose offsets disagree, usually parallax from roofs and trees, are down-weighted.
   - The fitted corrections are in the per-frame table, and the boresight and before/after
     offsets are in the report.
+  - Aligning is most of a mosaic's time, so it's done once where it can be: `process
+    --normalize --mosaic` places the mosaic's frames as normalizing aligned them.
+    `--save-alignment PATH` keeps the alignment (from `--normalize` or `--mosaic`) in a JSON
+    file, and a later run's `--alignment PATH` places the frames with it instead of aligning
+    them again. It is used only for the same frames, with the same positions and attitudes,
+    `--mosaic-gsd`, `--mosaic-heights` and `--mosaic-height-cell` (not with `--mosaic-dsm`);
+    otherwise the frames are aligned afresh and the report says why. The frames'
+    temperatures may differ (other measurement parameters, normalized): the overlaps are
+    matched on their edges.
 - **Heights (`--mosaic-heights auto`, the default):**
   - A plane can't represent roofs and trees: a frame seeing a roof from the side places it
     off where the frame beside it does, so a straight roof bends into a crescent or steps at
@@ -594,6 +603,12 @@ data = dtc.rjpeg_copy("flight/DJI_0001_T.JPG", settings, picture=rgb)   # an R-J
   geospatial and attitude, with no thermal or temperature group.
 - **MosaicOptions** holds what the `--mosaic-*` options set: `heights` (`"auto"` or
   `"plane"`), `height_cell`, `dsm`, `dsm_offset`, `visual` and `visual_gsd` among them.
+- **A saved alignment:** `MosaicReport.alignment` and `Normalization.alignment` (also in
+  `ProcessReport.normalization`) are the frames' `Alignment`, with `save(path)` and
+  `Alignment.load(path)`; `MosaicOptions(alignment=...)` gives it to `make_mosaic` or
+  `normalization`, which use it instead of aligning when it fits (as `--alignment` above;
+  `report.mosaic.report["alignment"]` has `saved_alignment_used`, or
+  `saved_alignment_not_used` with the reason).
 - **The visual mosaic:** with `MosaicOptions(visual=True)`, `report.visual` is a
   `VisualReport` (its `mosaic` holds the colours as `rgb` and each pixel's frame as
   `source`, -1 where none; `file`, `sidecar`, `preview`), or None with
