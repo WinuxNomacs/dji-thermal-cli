@@ -502,6 +502,7 @@ class Mosaic:
     heights: Heights | None = None      # the surface the frames were projected onto (None: the plane)
     source_px: np.ndarray | None = None  # float32 (height, width, 2): the source frame's column and row, NaN where none
     placed: list[_Placed] | None = None  # the frames as placed (index = source band value), for the frame models
+    alignment: Alignment | None = None  # the alignment it was laid out with, for a later build (see Alignment)
 
 
 def _grid(placed: list[_Placed], gsd: float, zone: int, north: bool) -> Grid:
@@ -515,7 +516,8 @@ def _grid(placed: list[_Placed], gsd: float, zone: int, north: bool) -> Grid:
 def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | None = None,
           check_misalignment: bool = True, align: bool = True, normalize: bool = False,
           progress: Callable[..., None] | None = None, jobs: int = 1, heights: str = "auto",
-          height_cell: int = HEIGHT_CELL_PX, dsm: Dsm | None = None, dsm_offset: float | None = None) -> Mosaic:
+          height_cell: int = HEIGHT_CELL_PX, dsm: Dsm | None = None, dsm_offset: float | None = None,
+          alignment: Alignment | None = None) -> Mosaic:
     """Composite the frames, projected onto the ground plane. align: first correct the
     frames' placement from their overlaps (see _align), and with heights="auto" estimate the
     surface's heights above the plane (roofs, trees) on cells height_cell pixels wide and
@@ -524,8 +526,11 @@ def build(frames: list[Frame], gsd: float | None = None, ground_alt: float | Non
     remove each frame's temperature offset against its neighbours (see _frame_offsets).
     progress: called as progress(stage, done, total, unit, **extra) as the "align",
     "composite" and "check" stages go (see api.Event); it doesn't change the result. jobs:
-    threads matching overlaps (see _measure_blocks); nor does it."""
-    layout = _layout(frames, gsd, ground_alt, align, progress, jobs, heights, height_cell, dsm, dsm_offset)
+    threads matching overlaps (see _measure_blocks); nor does it. alignment: an alignment a
+    build of the same frames found before (Mosaic.alignment), used instead of aligning them
+    again when it fits (see Alignment.mismatch); the report's alignment says which."""
+    layout = _layout(frames, gsd, ground_alt, align, progress, jobs, heights, height_cell, dsm, dsm_offset,
+                     alignment)
     composite = _reporter(progress, "composite", "frames")
     if composite:
         composite(0, len(layout.placed))
@@ -538,12 +543,13 @@ def build_both(frames: list[Frame], as_converted: list[Frame], gsd: float | None
                ground_alt: float | None = None, check_misalignment: bool = True, align: bool = True,
                progress: Callable[..., None] | None = None, jobs: int = 1, heights: str = "auto",
                height_cell: int = HEIGHT_CELL_PX, dsm: Dsm | None = None,
-               dsm_offset: float | None = None) -> tuple[Mosaic, Mosaic]:
+               dsm_offset: float | None = None, alignment: Alignment | None = None) -> tuple[Mosaic, Mosaic]:
     """The normalized mosaic of frames (as build(normalize=True)) and the mosaic of the same
     frames measured another way (as_converted, matched by name), laid out once: the second
     gets the first's placement, alignment and misalignment check, and only its compositing
-    is its own (a frame missing from as_converted is left out of it)."""
-    layout = _layout(frames, gsd, ground_alt, align, progress, jobs, heights, height_cell, dsm, dsm_offset)
+    is its own (a frame missing from as_converted is left out of it). alignment: as build's."""
+    layout = _layout(frames, gsd, ground_alt, align, progress, jobs, heights, height_cell, dsm, dsm_offset,
+                     alignment)
     by_name = {f.name: f for f in as_converted}
     other = [dataclasses.replace(pl, frame=by_name[pl.frame.name]) for pl in layout.placed
              if pl.frame.name in by_name]
@@ -568,6 +574,7 @@ class _Layout:
     ground_source: str
     heights: Heights | None = None
     heights_report: dict | None = None
+    state: Alignment | None = None      # the alignment, for a later build
 
 
 def _reporter(progress, stage, unit, **extra):
@@ -575,13 +582,23 @@ def _reporter(progress, stage, unit, **extra):
 
 
 def _layout(frames, gsd, ground_alt, align, progress, jobs, heights="auto", height_cell=HEIGHT_CELL_PX,
-            dsm=None, dsm_offset=None) -> _Layout:
-    """The frames placed over the ground plane (and aligned) and the grid they cover."""
+            dsm=None, dsm_offset=None, saved: Alignment | None = None) -> _Layout:
+    """The frames placed over the ground plane (and aligned, or placed as saved says) and the
+    grid they cover."""
     if not frames:
         raise ValueError("no frames to mosaic")
     lat = float(np.mean([f.pose.lat for f in frames]))
     lon = float(np.mean([f.pose.lon for f in frames]))
     zone, north = geo.utm_zone(lat, lon)
+    asked = {"gsd": gsd, "ground_alt": ground_alt, "heights": heights, "height_cell": height_cell}
+    not_used = None
+    if align and saved is not None:
+        not_used = saved.mismatch(frames, asked, dsm)
+        if not_used is None:
+            layout = saved._layout(frames, zone, north, gsd)
+            if layout is not None:
+                return layout
+            not_used = "a frame it placed can't be placed now"
 
     if ground_alt is not None:
         ground_source = "given"
@@ -611,14 +628,134 @@ def _layout(frames, gsd, ground_alt, align, progress, jobs, heights="auto", heig
             pl.heights = surface
     elif not align:
         heights_report = {"method": "plane", "reason": "the heights are estimated when aligning"}
+    state = None
     if align:
-        placed, surface, alignment = _align(frames, placed, grid, ground_alt, zone, north, progress=progress,
-                                            jobs=jobs, heights=heights, height_cell=height_cell, fixed=surface)
+        placed, surface, alignment, bias = _align(frames, placed, grid, ground_alt, zone, north, progress=progress,
+                                                  jobs=jobs, heights=heights, height_cell=height_cell, fixed=surface)
         if heights_report:
             alignment["heights"] = heights_report
         heights_report = alignment["heights"]
         grid = _grid(placed, gsd, zone, north)
-    return _Layout(placed, dropped, grid, alignment, ground_alt, ground_source, surface, heights_report)
+        if dsm is None:     # a DSM's surface isn't kept: a build onto it aligns again
+            state = Alignment(tuple(pl.frame.name for pl in placed), tuple(dropped),
+                              tuple(_pose_key(pl.frame.pose) for pl in placed), asked, ground_alt, ground_source,
+                              bias, np.array([pl.shift for pl in placed]).reshape(-1, 2),
+                              np.array([pl.rot for pl in placed], float), surface, copy.deepcopy(alignment))
+        if not_used:
+            alignment["saved_alignment_not_used"] = not_used
+    return _Layout(placed, dropped, grid, alignment, ground_alt, ground_source, surface, heights_report, state)
+
+
+ALIGNMENT_VERSION = 1
+
+
+def _pose_key(p: Pose) -> tuple:
+    """What placing a frame reads from its pose, as JSON keeps it."""
+    return tuple(None if v is None else int(v) if k in ("width", "height") else float(v)
+                 for k, v in (("lat", p.lat), ("lon", p.lon), ("abs_alt", p.abs_alt), ("yaw", p.yaw),
+                              ("pitch", p.pitch), ("roll", p.roll), ("focal_px", p.focal_px), ("width", p.width),
+                              ("height", p.height), ("ground_alt", p.ground_alt), ("takeoff_alt", p.takeoff_alt)))
+
+
+@dataclasses.dataclass(frozen=True)
+class Alignment:
+    """A flight's alignment as a build found it (see _align: the boresight, each frame's shift
+    and rotation, the surface's heights), with what it was found from: the frames, their poses
+    and the placement settings. A later build of the same frames with the same settings places
+    them with it instead of aligning them again (build(alignment=...)); the alignment needs
+    only the frames' geometry, and the overlaps are matched on the temperature's gradient, so
+    the frames' temperatures may differ (normalized, measured with other parameters). Saved
+    and read as JSON (save, load). Not made for a build onto a DSM."""
+    frames: tuple[str, ...]             # the frames placed, in order
+    dropped: tuple[str, ...]            # the frames with no ground footprint
+    poses: tuple[tuple, ...]            # each placed frame's pose (see _pose_key)
+    settings: dict                      # what build was asked: gsd, ground_alt, heights, height_cell
+    ground_alt: float
+    ground_source: str
+    bias: tuple[float, float]           # the boresight's pitch and yaw, radians
+    shifts: np.ndarray                  # (frames, 2) metres east, north
+    rots: np.ndarray                    # (frames,) radians
+    surface: Heights | None             # None: the plane
+    report: dict                        # the build's alignment report
+
+    def mismatch(self, frames: list[Frame], settings: dict, dsm=None) -> str | None:
+        """Why it can't be used for a build of frames asked settings (as its own), or None."""
+        if dsm is not None:
+            return "the frames are projected onto a DSM"
+        for key, value in settings.items():
+            if self.settings.get(key) != value:
+                return f"it was made with {key} {self.settings.get(key)!r}, not {value!r}"
+        names = {f.name for f in frames}
+        if names != set(self.frames) | set(self.dropped):
+            return f"it was made for other frames ({len(self.frames) + len(self.dropped)}, not {len(names)})"
+        poses = dict(zip(self.frames, self.poses))
+        for f in frames:
+            if f.name in poses and tuple(poses[f.name]) != _pose_key(f.pose):
+                return f"the position or attitude of {f.name} has changed"
+        return None
+
+    def _layout(self, frames: list[Frame], zone: int, north: bool, gsd: float | None) -> _Layout | None:
+        """frames (those it fits, see mismatch) placed as it says; None if one can't be."""
+        by_name = {f.name: f for f in frames}
+        placed = []
+        for k, name in enumerate(self.frames):
+            pl = _place(by_name[name], self.ground_alt, zone, north, self.bias)
+            if pl is None:
+                return None
+            pl.shift, pl.rot, pl.heights = self.shifts[k].copy(), float(self.rots[k]), self.surface
+            placed.append(pl)
+        if gsd is None:
+            gsd = max(round(float(np.median([pl.h / pl.frame.pose.focal_px for pl in placed])), 3), 0.001)
+        report = dict(copy.deepcopy(self.report), saved_alignment_used=True)
+        return _Layout(placed, list(self.dropped), _grid(placed, gsd, zone, north), report, self.ground_alt,
+                       self.ground_source, self.surface, report["heights"], self)
+
+    def to_json(self) -> dict:
+        s = self.surface
+        return {
+            "version": ALIGNMENT_VERSION, "frames": list(self.frames), "dropped": list(self.dropped),
+            "poses": [list(p) for p in self.poses], "settings": self.settings, "ground_alt": self.ground_alt,
+            "ground_source": self.ground_source, "boresight_rad": list(self.bias),
+            "shifts_m": self.shifts.tolist(), "rotations_rad": self.rots.tolist(),
+            "surface": None if s is None else {"origin_utm": [s.e0, s.n0], "cell_m": s.cell,
+                                               "height_above_plane_m": s.z.tolist()},
+            "report": self.report,
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> Alignment:
+        """From to_json's dict; ValueError when it isn't one this version reads."""
+        if not isinstance(data, dict) or data.get("version") != ALIGNMENT_VERSION:
+            raise ValueError(f"not a dji-thermal-cli alignment (version {ALIGNMENT_VERSION})")
+        try:
+            s = data["surface"]
+            surface = None if s is None else Heights(float(s["origin_utm"][0]), float(s["origin_utm"][1]),
+                                                     float(s["cell_m"]), np.asarray(s["height_above_plane_m"], float))
+            frames = tuple(str(f) for f in data["frames"])
+            shifts = np.asarray(data["shifts_m"], float).reshape(-1, 2)
+            rots = np.asarray(data["rotations_rad"], float).reshape(-1)
+            poses = tuple(tuple(p) for p in data["poses"])
+            if not (len(frames) == len(shifts) == len(rots) == len(poses)):
+                raise ValueError("its frames, poses, shifts and rotations don't match")
+            bias = tuple(float(b) for b in data["boresight_rad"])
+            return cls(frames, tuple(str(f) for f in data["dropped"]), poses, dict(data["settings"]),
+                       float(data["ground_alt"]), str(data["ground_source"]), (bias[0], bias[1]), shifts, rots,
+                       surface, dict(data["report"]))
+        except (KeyError, TypeError, IndexError) as e:
+            raise ValueError(f"a dji-thermal-cli alignment with a missing or wrong field ({e})") from None
+
+    def save(self, path: str | Path) -> None:
+        with files.replaced_when_done(Path(path)) as tmp:
+            tmp.write_text(json.dumps(self.to_json()), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | Path) -> Alignment:
+        """From a file save wrote; ValueError when it can't be read as one."""
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise ValueError(f"{path}: {e}") from None
+        return cls.from_json(data)
 
 
 def _check(layout: _Layout, check_misalignment: bool, progress, jobs) -> dict | None:
@@ -697,7 +834,7 @@ def _composite(layout: _Layout, placed: list[_Placed], normalize: bool, composit
     return Mosaic(
         grid, temp, np.where(covered, source, np.nan).astype(np.float32),
         np.where(covered, best_angle, np.nan).astype(np.float32), table, layout.ground_alt, layout.ground_source,
-        report, layout.heights, source_px, list(placed),
+        report, layout.heights, source_px, list(placed), layout.state,
     )
 
 
@@ -937,7 +1074,8 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
     throughout, the heights not estimated (the report's "heights" left to the caller).
     progress: as build's, for the "align" stage: per round, the pairs measured, then the
     solve's reweighting steps.
-    Returns the placed frames, their heights (None on the plane) and the report.
+    Returns the placed frames, their heights (None on the plane), the report and the boresight
+    (pitch, yaw radians).
     """
     if heights not in ("auto", "plane"):
         raise ValueError(f"heights must be 'auto' or 'plane', not {heights!r}")
@@ -989,10 +1127,10 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
             failed = f"the surface reaches {surface.z.max():.1f} m above the plane, within 1 m of a camera"
         if failed:
             placed = [_place(by_name[pl.frame.name], ground, zone, north) for pl in placed]
-            placed, _, result = _align(frames, placed, grid, ground, zone, north, progress=progress, jobs=jobs,
-                                       heights="plane")
+            placed, _, result, bias = _align(frames, placed, grid, ground, zone, north, progress=progress,
+                                             jobs=jobs, heights="plane")
             result["heights"] = {"method": "plane", "reason": failed}
-            return placed, None, result
+            return placed, None, result, bias
         anchors = _anchors(placed, ground)
         z_seen = surface.z.ravel()[seen]
         heights_report = {
@@ -1014,7 +1152,7 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
         "before": {k: v for k, v in (before or {}).items() if k != "pairs_detail"},
         "heights": heights_report or {"method": "plane", "reason": "not asked for"},
     }
-    return placed, surface, result
+    return placed, surface, result, (float(bias[0]), float(bias[1]))
 
 
 def _anchors(placed: list[_Placed], ground: float) -> np.ndarray:

@@ -175,6 +175,8 @@ def _build_parser() -> argparse.ArgumentParser:
     proc.add_argument("--mosaic", action="store_true", help="Also stitch the nadir frames into one georeferenced mosaic: <output-dir>/mosaic_temp_c.tif (temperature, source frame and view angle bands; UTM), a .json sidecar with every frame's position, attitude and measurement parameters plus a seam/misalignment report, and mosaic_preview.png. Per-frame files are then written only for the --output options given")
     proc.add_argument("--mosaic-max-pitch", type=float, default=mosaic.DEFAULT_MAX_PITCH, metavar="DEG", help="Frames whose gimbal pitch is above this (less steeply down) are left out of the mosaic (default: %(default)g)")
     proc.add_argument("--mosaic-align", action=argparse.BooleanOptionalAction, default=True, help="Correct the frames' placement from their overlaps before compositing: a flight-wide camera boresight plus a small shift and rotation per frame (default: on)")
+    proc.add_argument("--alignment", type=Path, metavar="PATH", help="Place the frames for --normalize and --mosaic with the alignment --save-alignment saved, instead of aligning them again, when it was made for the same frames and --mosaic-gsd, --mosaic-heights and --mosaic-height-cell (else they are aligned afresh, and the mosaic's report says why). Not used with --mosaic-dsm")
+    proc.add_argument("--save-alignment", type=Path, metavar="PATH", help="Save the frames' alignment, as --normalize or --mosaic found it, to PATH (JSON), for --alignment later. --normalize with --mosaic aligns once either way")
     proc.add_argument("--mosaic-normalize", action="store_true", help="Make the frames' temperatures consistent before compositing: measure every frame with the flight's median embedded ambient/reflected temperature (unless --ambient-temp/--reflected-temp are given), then remove each frame's offset against its overlapping neighbours (camera drift between shutter recalibrations). Changes the measured values; the offsets are always reported")
     proc.add_argument("--mosaic-unit", action="append", type=_units, dest="mosaic_units", metavar="UNIT[,UNIT]", help="Temperature unit(s) of the mosaic, C, F and/or K; repeat or comma-separate for one mosaic_temp_<unit>.tif each (default: C)")
     proc.add_argument("--mosaic-heights", choices=("auto", "plane"), default="auto", help="Surface the frames are projected onto: auto = heights estimated from the frames' parallax on a grid of cells, anchored to the rangefinder, written to mosaic_heights.tif (the plane when too little overlaps); plane = a horizontal ground plane (default: %(default)s)")
@@ -332,7 +334,11 @@ def _cmd_process(args: argparse.Namespace) -> None:
     else:
         wanted = () if args.mosaic else outputs.DEFAULT_OUTPUTS
     try:
-        options = api.MosaicOptions(max_pitch=args.mosaic_max_pitch, align=args.mosaic_align,
+        saved = api.Alignment.load(args.alignment) if args.alignment else None
+    except ValueError as e:
+        _fail(e)
+    try:
+        options = api.MosaicOptions(max_pitch=args.mosaic_max_pitch, align=args.mosaic_align, alignment=saved,
                                     normalize=args.mosaic_normalize, gsd=args.mosaic_gsd,
                                     heights=args.mosaic_heights, height_cell=args.mosaic_height_cell,
                                     dsm=args.mosaic_dsm, dsm_offset=args.mosaic_dsm_offset,
@@ -343,7 +349,7 @@ def _cmd_process(args: argparse.Namespace) -> None:
     except api.SettingsError as e:
         _fail(e)
     show = _MosaicProgress(_printer(), quiet=args.quiet)
-    report = None
+    report = aligned = None
     try:
         if wanted:
             try:
@@ -359,6 +365,10 @@ def _cmd_process(args: argparse.Namespace) -> None:
                 print(f"Normalized: {n.frames} frame(s) with overlap offsets "
                       f"({min(values):+.2f} to {max(values):+.2f} C removed), {n.without_offset} without "
                       f"(oblique, unplaceable or not overlapping)" if values else "Normalized: no frame offsets found")
+                if n.alignment is not None:
+                    # the mosaic places the frames as normalizing aligned them
+                    options = dataclasses.replace(options, alignment=n.alignment)
+                    aligned = n.alignment
         if args.mosaic:
             # the scan was reported by process() already
             unreported = show if not wanted else (lambda e: e.kind in ("unreadable", "non_jpeg") or show(e))
@@ -368,10 +378,18 @@ def _cmd_process(args: argparse.Namespace) -> None:
             finally:
                 show.clear()
             _print_mosaic(rep, settings, args.mosaic_max_pitch)
+            aligned = rep.alignment
     except (FileNotFoundError, api.MosaicError) as e:
         if isinstance(e, api.MosaicError) and e.counts:
             _print_mosaic_counts(e.counts, args.mosaic_max_pitch)
         _fail(e)
+    if args.save_alignment:
+        if aligned is None:
+            print("No alignment to save (--save-alignment): it comes from --normalize or --mosaic, with "
+                  "--mosaic-align and without --mosaic-dsm.")
+        else:
+            aligned.save(args.save_alignment)
+            print(f"Alignment saved: {args.save_alignment}")
     if not wanted:
         _location_notice(settings)
         return
@@ -424,7 +442,10 @@ def _print_mosaic(rep: api.MosaicReport, settings: api.Settings, max_pitch: floa
         b, before = ali["boresight_deg"], ali["before"]
         print(f"  alignment: boresight pitch {b['pitch']:+.2f} deg, yaw {b['yaw']:+.2f} deg; per-frame shift "
               f"{ali['frame_shift_m']['median'] * 100:.0f} cm median, rotation {ali['frame_rotation_deg']['median']:.1f} deg median"
-              + (f"; offsets before: {before['median_m'] * 100:.0f} cm median" if before.get("pairs") else ""))
+              + (f"; offsets before: {before['median_m'] * 100:.0f} cm median" if before.get("pairs") else "")
+              + (" (the saved alignment)" if ali.get("saved_alignment_used") else ""))
+        if ali.get("saved_alignment_not_used"):
+            print(f"  saved alignment not used, aligned afresh: {ali['saved_alignment_not_used']}")
     fo = r["frame_offsets"]
     if fo.get("offset_c"):
         diff = fo["overlap_difference_c"]
