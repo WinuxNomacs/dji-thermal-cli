@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-11-02
+
 ### Added
 
 - A saved alignment, so that a flight's frames are aligned once: `MosaicReport.alignment` and
@@ -217,7 +219,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.11.0...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.12.0...HEAD
+[1.12.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.10.0...v1.11.0
 [1.10.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.1...v1.10.0
 [1.9.1]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.9.0...v1.9.1
