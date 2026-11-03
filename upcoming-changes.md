@@ -102,7 +102,26 @@ memory).
 ## S1: the eave smear
 
 At the house's eave the surface drops about 5 m within one 1.4 m height cell, and the RGB-only mosaic smears there.
-To be planned next.
+
+**Why:** `Heights.at` blends the cells' heights linearly, so a step is spread over a whole cell: the patio within about
+a metre of the eave is projected as if up to 5 m higher, and moves by (distance from nadir) × (height error) / (flying
+height), about 1.2 m at 10 m from nadir. Each pixel already comes from the frame nearest nadir, so only the heights can
+fix it.
+
+**Plan (2026-11-03):**
+1. After the alignment, find the cells where the surface steps sharply next to a neighbour.
+2. Inside them, decide each pixel between the upper and the lower surface by where the overlapping frames agree when
+   projected at each height, giving a fine height map along the edges only.
+3. Everywhere else, the heights and the composite stay as they are.
+
+**Decided (2026-11-03):**
+- RGB-only mosaics only (`build_alone`); thermal mosaics and the Visual tab's mosaic unchanged.
+- Up to about +10–20% on an RGB-only build's time.
+- Done when it is better than now and works for any flight, repeatably, not only for this one:
+  - no threshold tuned to this flight: each follows from the flight's own cell size, height and height noise;
+  - the same input gives the same mosaic;
+  - a synthetic test (a box building on flat ground, rendered from known cameras) shows the edge sharp;
+  - on `m4t-rgb`: the eave and garage crops better, the benchmark elsewhere no worse.
 
 ## V1: RGB-only mosaics as a feature
 
