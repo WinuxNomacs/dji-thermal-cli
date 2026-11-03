@@ -33,9 +33,10 @@ def _colour(t):
     return np.stack([60 + 180 * s, 40 + 120 * s, 200 - 150 * s], axis=-1)
 
 
-def _visual_frame(path, thermal, offset_deg=OFFSET_DEG, size=(480, 360), focal=400.0, exposure=None):
+def _visual_frame(path, thermal, offset_deg=OFFSET_DEG, size=(480, 360), focal=400.0, exposure=None, k1=0.0):
     """The visual frame taken with a synthetic thermal one: the same position and attitude, the
-    camera turned by offset_deg, a wider lens; saved as a PNG at path."""
+    camera turned by offset_deg, a wider lens (distorting by k1, see mosaic._Placed); saved as a
+    PNG at path."""
     p = thermal.pose
     w, h = size
     zone, north = geo.utm_zone(LAT, LON)
@@ -43,7 +44,8 @@ def _visual_frame(path, thermal, offset_deg=OFFSET_DEG, size=(480, 360), focal=4
     j = geo.local_to_utm(p.lat, p.lon, zone, north)
     r = mosaic.rotation(p.yaw, p.pitch, p.roll) @ mosaic._boresight(*np.radians(offset_deg))
     u, v = np.meshgrid(np.arange(w), np.arange(h))
-    rays = np.tensordot(r, np.stack([np.ones((h, w)), (u - (w - 1) / 2) / focal, (v - (h - 1) / 2) / focal]), 1)
+    x, y = mosaic._undistort((u - (w - 1) / 2) / focal, (v - (h - 1) / 2) / focal, k1)
+    rays = np.tensordot(r, np.stack([np.ones((h, w)), x, y]), 1)
     t = (p.abs_alt - GROUND) / rays[2]
     e, n = c[:, None, None] + np.tensordot(j, np.stack([rays[1] * t, rays[0] * t]), 1)
     Image.fromarray(np.rint(_colour(_field(e, n))).astype(np.uint8)).save(path)
@@ -159,6 +161,45 @@ def test_visual_frames_alone_are_aligned_smaller_and_composited_at_full_size(alo
     assert vm.report["work_size"] == [240, 180]
     assert vm.grid.gsd == pytest.approx(21.0 / 400, abs=0.001) and _colour_error(vm) < 4
     assert all(pl.frame.pose.width == 480 for pl in vm.placed)
+
+
+def test_a_wide_lens_distortion_is_found_and_corrected(flight, tmp_path):
+    """Frames from a lens distorting by k1 = 0.08: the alignment finds it, and the mosaic shows
+    the field where it is, which it doesn't with the distortion left unmodelled."""
+    thermal, _, _ = flight
+    frames = [_visual_frame(tmp_path / f"f{i}_V.png", f, offset_deg=(0.0, 0.0), k1=0.08) for i, f in enumerate(thermal)]
+    vm = visual.build_alone(frames, heights="plane")
+    assert vm.report["alignment"]["distortion_k1"] == pytest.approx(0.08, abs=0.02)
+    assert all(pl.k1 == pytest.approx(0.08, abs=0.02) for pl in vm.placed)
+    plain = visual.build_alone(frames, heights="plane", distortion=False)
+    assert "distortion_k1" not in plain.report["alignment"]
+    assert _colour_error(vm) < 4 and _colour_error(vm) < _colour_error(plain)
+    assert vm.report["misalignment"]["median_m"] < plain.report["misalignment"]["median_m"]
+
+
+def test_without_distortion_frames_are_projected_as_before(flight):
+    """k1 = 0 (the thermal mosaics') leaves the projection as the pinhole's, to the bit."""
+    _, m, _ = flight
+    pl = m.placed[0]
+    e, n = np.meshgrid(np.linspace(-3, 3, 7), np.linspace(-3, 3, 7))
+    plain = mosaic._project(pl, e, n, pl.h)
+    assert pl.k1 == 0.0
+    distorted = mosaic._project(dataclasses.replace(pl, k1=0.05), e, n, pl.h)
+    for a, b in zip(plain, mosaic._project(dataclasses.replace(pl, k1=0.0), e, n, pl.h)):
+        np.testing.assert_array_equal(a, b)
+    assert not np.allclose(plain[0], distorted[0])
+    x, y = np.array([0.1, -0.3]), np.array([0.2, 0.25])
+    assert mosaic._undistort(x, y, 0.0) == (x, y)
+    xu, yu = mosaic._undistort(x, y, 0.05)
+    np.testing.assert_allclose(xu * (1 + 0.05 * (xu ** 2 + yu ** 2)), x, atol=1e-9)
+
+
+def test_a_cell_s_rangefinder_prior_is_the_median_of_the_nearest_heights():
+    hs = mosaic.Heights(0.0, 10.0, 5.0, np.zeros((2, 2)))       # cell centres (2.5, 7.5), (7.5, 7.5), (2.5, 2.5), (7.5, 2.5)
+    anchors = np.array([[2.0, 8.0, -5.0], [3.0, 7.0, -5.5], [2.5, 9.0, -6.0], [8.0, 2.0, 1.0], [7.0, 3.0, 0.0],
+                        [9.0, 3.0, 0.5]])
+    prior = mosaic._anchor_surface(hs, anchors, k=3)
+    assert prior[0, 0] == -5.5 and prior[1, 1] == 0.5
 
 
 def test_oblique_visual_frames_are_left_out_of_a_flight_alone(alone):

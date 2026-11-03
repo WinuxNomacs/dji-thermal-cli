@@ -179,6 +179,7 @@ class _Placed:
     shift: np.ndarray = dataclasses.field(default_factory=lambda: np.zeros(2))
     rot: float = 0.0            # radians
     heights: Heights | None = None      # the surface the frame is projected onto (None: the plane)
+    k1: float = 0.0             # radial lens distortion: a pinhole point (x, y) is imaged at (x, y)(1 + k1 r^2)
 
     def corrected_footprint(self) -> np.ndarray:
         fp = self.footprint
@@ -198,9 +199,9 @@ def _boresight(pitch: float, yaw: float) -> np.ndarray:
 
 
 def _place(frame: Frame, ground: float, zone: int, north: bool, bias: tuple[float, float] = (0.0, 0.0),
-           r: np.ndarray | None = None) -> _Placed | None:
+           r: np.ndarray | None = None, k1: float = 0.0) -> _Placed | None:
     """The frame placed over the ground plane, its camera turned by the boresight bias (or
-    pointing as r says, camera body -> north/east/down)."""
+    pointing as r says, camera body -> north/east/down), its lens distorting by k1 (see _Placed)."""
     p = frame.pose
     h = p.abs_alt - ground
     if h <= 0:
@@ -213,12 +214,24 @@ def _place(frame: Frame, ground: float, zone: int, north: bool, bias: tuple[floa
     edge = np.linspace(0, 1, 9)
     u = np.concatenate([edge * (p.width - 1), np.full(9, p.width - 1.0), (1 - edge) * (p.width - 1), np.zeros(9)])
     v = np.concatenate([np.zeros(9), edge * (p.height - 1), np.full(9, p.height - 1.0), (1 - edge) * (p.height - 1)])
-    rays = r @ np.stack([np.ones_like(u), (u - cx) / p.focal_px, (v - cy) / p.focal_px])
+    x, y = _undistort((u - cx) / p.focal_px, (v - cy) / p.focal_px, k1)
+    rays = r @ np.stack([np.ones_like(u), x, y])
     if (rays[2] <= 1e-6).any():
         return None             # part of the frame sees the horizon: no finite footprint
     t = h / rays[2]
     local = np.stack([rays[1] * t, rays[0] * t])          # east, north
-    return _Placed(frame, h, c, j, np.linalg.inv(j), r.T, cx, cy, (c[:, None] + j @ local).T)
+    return _Placed(frame, h, c, j, np.linalg.inv(j), r.T, cx, cy, (c[:, None] + j @ local).T, k1=k1)
+
+
+def _undistort(x, y, k1: float):
+    """The pinhole point (x, y) a lens distorting by k1 (see _Placed) images at (x, y)."""
+    if not k1:
+        return x, y
+    xu, yu = x, y
+    for _ in range(8):
+        scale = 1 + k1 * (xu * xu + yu * yu)
+        xu, yu = x / scale, y / scale
+    return xu, yu
 
 
 def _centre_ground(pl: _Placed) -> np.ndarray:
@@ -474,8 +487,13 @@ def _project(pl: _Placed, de, dn, hz):
     right = rt[1, 0] * north + rt[1, 1] * east + rt[1, 2] * hz
     down = rt[2, 0] * north + rt[2, 1] * east + rt[2, 2] * hz
     with np.errstate(divide="ignore", invalid="ignore"):
-        uf = pl.cx + p.focal_px * right / fwd
-        vf = pl.cy + p.focal_px * down / fwd
+        if pl.k1:
+            x, y = right / fwd, down / fwd
+            scale = 1 + pl.k1 * (x * x + y * y)
+            uf, vf = pl.cx + p.focal_px * x * scale, pl.cy + p.focal_px * y * scale
+        else:
+            uf = pl.cx + p.focal_px * right / fwd
+            vf = pl.cy + p.focal_px * down / fwd
     angle = np.degrees(np.arctan2(np.hypot(east, north), hz)).astype(np.float32)
     return uf, vf, fwd, angle
 
@@ -582,9 +600,11 @@ def _reporter(progress, stage, unit, **extra):
 
 
 def _layout(frames, gsd, ground_alt, align, progress, jobs, heights="auto", height_cell=HEIGHT_CELL_PX,
-            dsm=None, dsm_offset=None, saved: Alignment | None = None) -> _Layout:
+            dsm=None, dsm_offset=None, saved: Alignment | None = None, distortion: bool = False,
+            rangefinder_prior: bool = False) -> _Layout:
     """The frames placed over the ground plane (and aligned, or placed as saved says) and the
-    grid they cover."""
+    grid they cover. distortion, rangefinder_prior: as _align's (with distortion, no saved
+    alignment is kept)."""
     if not frames:
         raise ValueError("no frames to mosaic")
     lat = float(np.mean([f.pose.lat for f in frames]))
@@ -631,12 +651,13 @@ def _layout(frames, gsd, ground_alt, align, progress, jobs, heights="auto", heig
     state = None
     if align:
         placed, surface, alignment, bias = _align(frames, placed, grid, ground_alt, zone, north, progress=progress,
-                                                  jobs=jobs, heights=heights, height_cell=height_cell, fixed=surface)
+                                                  jobs=jobs, heights=heights, height_cell=height_cell, fixed=surface,
+                                                  distortion=distortion, rangefinder_prior=rangefinder_prior)
         if heights_report:
             alignment["heights"] = heights_report
         heights_report = alignment["heights"]
         grid = _grid(placed, gsd, zone, north)
-        if dsm is None:     # a DSM's surface isn't kept: a build onto it aligns again
+        if dsm is None and not distortion:     # a DSM's surface isn't kept: a build onto it aligns again
             state = Alignment(tuple(pl.frame.name for pl in placed), tuple(dropped),
                               tuple(_pose_key(pl.frame.pose) for pl in placed), asked, ground_alt, ground_source,
                               bias, np.array([pl.shift for pl in placed]).reshape(-1, 2),
@@ -1048,11 +1069,14 @@ OBS_SIGMA_PX = 2.0
 HEIGHT_SMOOTH_M = 0.5           # expected height difference between neighbouring cells (robust: edges)
 HEIGHT_ANCHOR_M = 0.3           # rangefinder target altitude error
 HEIGHT_PRIOR_M = 5.0            # weak pull of unobserved cells to the plane
+ANCHOR_NEIGHBOURS = 5           # rangefinder heights a cell's prior is the median of (rangefinder_prior)
+PRIOR_K1 = 0.2                  # radial distortion expected of a lens (see _Placed.k1), when it is estimated
 
 
 def _align(frames, placed, grid, ground, zone, north, iterations: int | None = None,
            progress: Callable[..., None] | None = None, jobs: int = 1, heights: str = "auto",
-           height_cell: int = HEIGHT_CELL_PX, fixed: Heights | None = None):
+           height_cell: int = HEIGHT_CELL_PX, fixed: Heights | None = None, distortion: bool = False,
+           rangefinder_prior: bool = False):
     """Self-calibrate the flight from its overlaps.
 
     Unknowns: one boresight (camera-body pitch and yaw) for the whole flight, the angle between where the
@@ -1072,6 +1096,10 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
     frames, or a surface reaching the cameras) the flight is aligned on the plane instead,
     and the report says why. fixed: a surface (from a DSM) the frames are projected onto
     throughout, the heights not estimated (the report's "heights" left to the caller).
+    distortion: also estimate the lens' radial distortion, one k1 for every frame (see
+    _Placed), for a wide lens whose distortion would otherwise be taken for heights at the
+    frames' edges; the thermal lenses' isn't measurable, and they don't. rangefinder_prior: as
+    _solve's.
     progress: as build's, for the "align" stage: per round, the pairs measured, then the
     solve's reweighting steps.
     Returns the placed frames, their heights (None on the plane), the report and the boresight
@@ -1085,6 +1113,8 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
     by_name = {f.name: f for f in frames}
     n = len(placed)
     bias = np.zeros(2)
+    k1 = 0.0
+    n_global = 3 if distortion else 2
     shifts = np.zeros((n, 2))
     rots = np.zeros(n)
     surface = Heights.flat(grid, height_cell * grid.gsd) if use_heights else fixed
@@ -1104,16 +1134,19 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
             break
         step, inliers, observed = _solve(placed, obs, grid.gsd, bias, report("solve steps"),
                                          surface if use_heights else None,
-                                         _anchors(placed, ground) if use_heights else None)
+                                         _anchors(placed, ground) if use_heights else None, distortion,
+                                         rangefinder_prior)
         if not np.isfinite(step).all():
             failed = "the solve diverged"
             break
         bias += step[3 * n:3 * n + 2]
+        if distortion:
+            k1 += float(step[3 * n + 2])
         shifts += step[:3 * n].reshape(n, 3)[:, :2]
         rots += step[:3 * n].reshape(n, 3)[:, 2]
         if use_heights:
-            surface = dataclasses.replace(surface, z=surface.z + step[3 * n + 2:].reshape(surface.z.shape))
-        replaced = [_place(by_name[pl.frame.name], ground, zone, north, tuple(bias)) for pl in placed]
+            surface = dataclasses.replace(surface, z=surface.z + step[3 * n + n_global:].reshape(surface.z.shape))
+        replaced = [_place(by_name[pl.frame.name], ground, zone, north, tuple(bias), k1=k1) for pl in placed]
         for k, pl in enumerate(replaced):
             pl.shift, pl.rot, pl.heights = shifts[k].copy(), float(rots[k]), surface
         placed = replaced
@@ -1128,7 +1161,7 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
         if failed:
             placed = [_place(by_name[pl.frame.name], ground, zone, north) for pl in placed]
             placed, _, result, bias = _align(frames, placed, grid, ground, zone, north, progress=progress,
-                                             jobs=jobs, heights="plane")
+                                             jobs=jobs, heights="plane", distortion=distortion)
             result["heights"] = {"method": "plane", "reason": failed}
             return placed, None, result, bias
         anchors = _anchors(placed, ground)
@@ -1152,6 +1185,10 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
         "before": {k: v for k, v in (before or {}).items() if k != "pairs_detail"},
         "heights": heights_report or {"method": "plane", "reason": "not asked for"},
     }
+    if rangefinder_prior and heights_report:
+        heights_report["prior"] = f"the median of the {ANCHOR_NEIGHBOURS} nearest rangefinder heights"
+    if distortion:
+        result["distortion_k1"] = round(k1, 5)
     return placed, surface, result, (float(bias[0]), float(bias[1]))
 
 
@@ -1176,22 +1213,30 @@ def _anchors(placed: list[_Placed], ground: float) -> np.ndarray:
 
 def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
            report: Callable[[int, int], None] | None = None, heights: Heights | None = None,
-           anchors: np.ndarray | None = None) -> tuple[np.ndarray, float, np.ndarray | None]:
+           anchors: np.ndarray | None = None, distortion: bool = False,
+           rangefinder_prior: bool = False) -> tuple[np.ndarray, float, np.ndarray | None]:
     """Correction increments [shift E, shift N, rotation] per frame + [boresight pitch, yaw]
-    (+ with heights, one per height cell) that cancel the observed offsets, the fraction of
-    observations kept at full weight, and (with heights) each cell's observation weight.
+    (+ with distortion, the lens' k1, one for every frame; + with heights, one per height
+    cell) that cancel the observed offsets, the fraction of observations kept at full weight,
+    and (with heights) each cell's observation weight.
 
     Moving frame k's content: its correction (sampling at X + t + r perp(X - c)) moves it by
     -(t + r perp(X - c)); a boresight b moves it by G_k b (G_k: ground shift of the optical
     axis per radian); raising the surface by dz at X moves it by -(X - c_k) dz / (h_k - z(X)),
-    away from the frame's nadir. For each block, (move_b - move_a)(X) = -observed shift.
+    away from the frame's nadir; a change of k1 moves the content a frame shows at X by D_k(X),
+    found numerically (see _distortion_move), radially about where its optical axis meets the
+    ground, growing with the cube of the distance: near a frame's edges only, which is where a
+    wide lens' distortion would otherwise be taken for heights. For each block,
+    (move_b - move_a)(X) = -observed shift.
     The heights are held to their neighbours' (smoothness, robust so that roof edges stay
     sharp), to the rangefinder's (anchors: rows of E, N, height above the plane) and weakly to
-    the plane.
+    the plane, or with rangefinder_prior to the rangefinder's heights nearby (see
+    _anchor_surface): where the plane is the roof most frames' rangefinder hit, the ground
+    beyond it, which few blocks see, is pulled toward the ground rather than the roof.
     report(done, total): the reweighting steps solved.
     """
     n = len(placed)
-    n_global = 2
+    n_global = 3 if distortion else 2
     eps = 1e-4
     g = []
     for pl in placed:
@@ -1211,6 +1256,13 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
     if heights is not None:
         cells, cell_w = heights.point_weights(obs[:, 2], obs[:, 3])
         z_obs = (heights.z.ravel()[cells] * cell_w).sum(1)
+    if distortion:
+        moves_a, moves_b = np.zeros((len(obs), 2)), np.zeros((len(obs), 2))
+        for k in np.unique(np.concatenate([a, b])):
+            for which, moves in ((a, moves_a), (b, moves_b)):
+                at = which == k
+                if at.any():
+                    moves[at] = _distortion_move(placed[k], obs[at, 2], obs[at, 3])
     idx, val, rhs = [], [], []
     for comp, target in ((0, -obs[:, 4]), (1, -obs[:, 5])):
         cols, vals = [], []
@@ -1220,6 +1272,9 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
             vals += [np.full(len(k), -sign), sign * (vn if comp == 0 else -ve)]   # -t, -r perp(v): (r vn, -r ve)
         cols += [np.full(len(a), 3 * n), np.full(len(a), 3 * n + 1)]
         vals += list((g[b, comp] - g[a, comp]).T)
+        if distortion:
+            cols.append(np.full(len(a), 3 * n + 2))
+            vals.append(moves_b[:, comp] - moves_a[:, comp])
         if heights is not None:
             v = obs[:, 2 + comp]
             dz = -(v - c[b, comp]) / (h[b] - z_obs) + (v - c[a, comp]) / (h[a] - z_obs)
@@ -1237,9 +1292,10 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
     n_obs = len(b_rows)
 
     prior = np.concatenate([np.tile([1 / PRIOR_SHIFT_M, 1 / PRIOR_SHIFT_M, 1 / math.radians(PRIOR_ROT_DEG)], n),
-                            np.full(2, 1 / math.radians(PRIOR_BORESIGHT_DEG))])
+                            np.full(2, 1 / math.radians(PRIOR_BORESIGHT_DEG))] + ([[1 / PRIOR_K1]] if distortion else []))
     current = np.concatenate([np.column_stack([np.array([pl.shift for pl in placed]),
-                                               [pl.rot for pl in placed]]).ravel(), bias])
+                                               [pl.rot for pl in placed]]).ravel(), bias]
+                             + ([[placed[0].k1]] if distortion else []))
     observed = None
     if heights is not None:
         z = heights.z.ravel()
@@ -1267,6 +1323,9 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
         base = np.concatenate([base, np.ones(len(b_rows) - len(base))])
         prior = np.concatenate([prior, np.full(z.size, 1 / HEIGHT_PRIOR_M)])
         current = np.concatenate([current, z])
+    target = np.zeros(len(prior))
+    if heights is not None and rangefinder_prior and anchors is not None and len(anchors):
+        target[-heights.z.size:] = _anchor_surface(heights, anchors).ravel()
 
     m = len(prior)
     dense = m <= 3000
@@ -1280,7 +1339,7 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
     for i in range(steps):
         ww = (w * base / sigma) ** 2
         # the normal equations of the weighted rows and the priors, which act on the total correction
-        y = np.bincount(idx.ravel(), (val * (ww * b_rows)[:, None]).ravel(), minlength=m) - current * prior ** 2
+        y = np.bincount(idx.ravel(), (val * (ww * b_rows)[:, None]).ravel(), minlength=m) - (current - target) * prior ** 2
         if dense:
             normal = np.bincount(outer, (ww[:, None, None] * val[:, :, None] * val[:, None, :]).ravel(),
                                  minlength=m * m).reshape(m, m) + np.diag(prior ** 2)
@@ -1292,6 +1351,36 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
         if report:
             report(i + 1, steps)
     return x, float((w[:n_obs] == 1.0).mean()), observed
+
+
+def _anchor_surface(heights: Heights, anchors: np.ndarray, k: int = ANCHOR_NEIGHBOURS) -> np.ndarray:
+    """Each height cell's prior from the rangefinder: the median height of the k anchors
+    (rows of E, N, height) nearest its centre."""
+    rows, cols = heights.z.shape
+    e = heights.e0 + (np.arange(cols) + 0.5) * heights.cell
+    n = heights.n0 - (np.arange(rows) + 0.5) * heights.cell
+    centres = np.stack(np.meshgrid(e, n), -1).reshape(-1, 2)
+    d = np.hypot(centres[:, None, 0] - anchors[None, :, 0], centres[:, None, 1] - anchors[None, :, 1])
+    nearest = np.argsort(d, axis=1)[:, :min(k, len(anchors))]
+    return np.median(anchors[nearest, 2], axis=1).reshape(rows, cols)
+
+
+def _distortion_move(pl: _Placed, e: np.ndarray, n: np.ndarray) -> np.ndarray:
+    """How far the content frame pl shows at mosaic points (e, n) moves on the ground per unit
+    change of its k1: rows (E, N). The pixel stays; its pinhole point, and so the ground it is
+    taken to show, moves (to first order, x_u changes by -x_u r^2 per unit of k1)."""
+    hz = pl.h if pl.heights is None else np.maximum(pl.h - pl.heights.at_points(e, n), 0.1)
+    uf, vf, _, _ = _project(pl, e - pl.c[0], n - pl.c[1], hz)
+    x, y = _undistort((uf - pl.cx) / pl.frame.pose.focal_px, (vf - pl.cy) / pl.frame.pose.focal_px, pl.k1)
+    eps = 1e-3
+    r2 = x * x + y * y
+
+    def ground(x, y):
+        ray = pl.r_t.T @ np.stack([np.ones_like(x), x, y])         # north, east, down
+        t = hz / ray[2]
+        return (pl.j @ np.stack([ray[1] * t, ray[0] * t])).T
+
+    return (ground(x - eps * x * r2, y - eps * y * r2) - ground(x, y)) / eps
 
 
 def _cg(idx: np.ndarray, val: np.ndarray, ww: np.ndarray, diag: np.ndarray, y: np.ndarray, x: np.ndarray,

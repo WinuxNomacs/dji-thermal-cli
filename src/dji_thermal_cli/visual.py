@@ -183,19 +183,23 @@ def build(thermal: mosaic.Mosaic, visual: list[VisualFrame], gsd: float | None =
 def build_alone(visual: list[VisualFrame], gsd: float | None = None,
                 max_pitch: float = mosaic.DEFAULT_MAX_PITCH, progress: Callable[..., None] | None = None,
                 jobs: int = 1, heights: str = "auto", height_cell: int = mosaic.HEIGHT_CELL_PX,
-                check_misalignment: bool = True, work_px: int = WORK_PX) -> VisualMosaic:
+                check_misalignment: bool = True, work_px: int = WORK_PX, distortion: bool = True,
+                rangefinder_prior: bool = True) -> VisualMosaic:
     """The visual mosaic of a flight without thermal frames (an RGB flight): the frames laid
     out by their own overlaps, as mosaic.build lays out thermal frames (their alignment and,
     with heights="auto", the surface's heights on cells height_cell of its pixels wide), matched on their brightness decoded at most
     work_px pixels wide, then composited at full size as build's. Frames steeper than
     max_pitch (degrees, -90 straight down) are left out, as the thermal mosaic leaves them.
     progress: as mosaic.build's "align" and "check" stages, then "visual_frames" (frames
-    decoded for alignment) first and "visual_composite" last."""
+    decoded for alignment) first and "visual_composite" last. distortion, rangefinder_prior: as
+    mosaic._align's: the wide camera's distortion estimated, and the ground the images hardly see
+    pulled toward the rangefinder's heights nearby."""
     steep = [v for v in visual if v.pose.pitch <= max_pitch]
     if not steep:
         raise ValueError(f"no visual frame is pitched at or below {max_pitch:g} degrees")
     work = _work_frames(steep, work_px, mosaic._reporter(progress, "visual_frames", "frames"), jobs)
-    layout = mosaic._layout(work, None, None, True, progress, jobs, heights, height_cell)
+    layout = mosaic._layout(work, None, None, True, progress, jobs, heights, height_cell,
+                            distortion=distortion, rangefinder_prior=rangefinder_prior)
     misalignment = mosaic._check(layout, check_misalignment, progress, jobs)
     by_name = {v.name: v for v in steep}
     g = layout.grid
@@ -203,7 +207,7 @@ def build_alone(visual: list[VisualFrame], gsd: float | None = None,
     for wpl in layout.placed:
         v = by_name[wpl.frame.name]
         pl = mosaic._place(mosaic.Frame(v.name, _NO_VALUES, v.pose), layout.ground_alt, g.zone, g.north,
-                           r=wpl.r_t.T)
+                           r=wpl.r_t.T, k1=wpl.k1)
         if pl is not None:
             pl.shift, pl.rot, pl.heights = wpl.shift.copy(), wpl.rot, wpl.heights
             placed.append(pl)
