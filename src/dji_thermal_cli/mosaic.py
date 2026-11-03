@@ -22,6 +22,7 @@ image shift between overlapping frames found by phase correlation (geometric err
 from __future__ import annotations
 
 import copy
+import ast
 import ctypes
 import dataclasses
 import functools
@@ -1003,15 +1004,16 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
     the overlapping pairs measured, counted by the overlap area each samples so that the
     count moves evenly. jobs: worker processes rendering the frames and matching the pairs
     (numpy's FFTs on blocks this small hold the GIL, so threads barely help); in a daemonic
-    process, which can't start processes, or with 1, they're matched in this one. The result
-    is the same for any number."""
+    process, which can't start processes, from a script that would start them outside
+    `if __name__ == "__main__":`, or with 1, they're matched in this one. The result is the
+    same for any number."""
     overlaps = _overlaps(placed, grid, block)
     area = sum((r.stop - r.start) * (c.stop - c.start) for _, _, r, c in overlaps)
     obs, sampled, done = [], 0, 0
     if report:
         report(0, len(overlaps))
     jobs = max(1, min(jobs, len(overlaps)))
-    if jobs > 1 and not multiprocessing.current_process().daemon:
+    if jobs > 1 and not processes_unavailable():
         results = _match_in_processes(placed, grid, overlaps, block, min_peak, jobs)
     else:
         results = _match_here(placed, grid, overlaps, block, min_peak)
@@ -1053,6 +1055,45 @@ def _match_here(placed, grid, overlaps, block, min_peak):
         ga, va = cut(a, rows, cols)
         gb, vb = cut(b, rows, cols)
         yield _match_pair(pair, ga, va, gb, vb, grid, block, min_peak)
+
+
+def processes_unavailable() -> bool:
+    """True when worker processes can't be started from here, so the work runs in this
+    process: in a daemonic process (a Celery worker's, a multiprocessing pool's), or when the
+    workers would run the calling script again. That is when they import it (spawn on Windows
+    and macOS, forkserver on Linux since Python 3.14) and it starts them outside
+    `if __name__ == "__main__":`; that case warns."""
+    if multiprocessing.current_process().daemon:
+        return True
+    if (multiprocessing.get_start_method(allow_none=True) or multiprocessing.get_all_start_methods()[0]) == "fork":
+        return False
+    main = sys.modules.get("__main__")
+    path = getattr(main, "__file__", None)
+    frame, depth = sys._getframe(), 1
+    while frame and not (frame.f_globals is getattr(main, "__dict__", None) and frame.f_code.co_name == "<module>"):
+        frame, depth = frame.f_back, depth + 1
+    if not path or frame is None:              # interactive, -c, or the script has finished: nothing to run again
+        return False
+    try:
+        tree = ast.parse(Path(path).read_bytes())
+    except (OSError, SyntaxError, ValueError):
+        return False
+    if any(_main_guard(node) and node.body[0].lineno <= frame.f_lineno <= node.body[-1].end_lineno
+           for node in ast.walk(tree)):
+        return False
+    warnings.warn("dji_thermal_cli works in this process only: worker processes would run this script again, "
+                  'as it starts them outside `if __name__ == "__main__":`', RuntimeWarning, stacklevel=depth)
+    return True
+
+
+def _main_guard(node) -> bool:
+    """Whether node is `if __name__ == "__main__":` (either way round)."""
+    if not (isinstance(node, ast.If) and isinstance(node.test, ast.Compare) and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.Eq)):
+        return False
+    sides = [node.test.left, node.test.comparators[0]]
+    return (any(isinstance(s, ast.Name) and s.id == "__name__" for s in sides)
+            and any(isinstance(s, ast.Constant) and s.value == "__main__" for s in sides))
 
 
 # Matching in worker processes: the frames' pixels go to the workers in shared memory, the workers render

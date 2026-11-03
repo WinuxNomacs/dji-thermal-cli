@@ -8,8 +8,7 @@ The order of work, top first. Each phase is planned with the user before it is b
 sections below.
 
 **Up next**:
-1. **The release** of P1, S1 and V1 (still to check: P1's worker processes on Windows and macOS, and the
-   `__main__` guard; see P1).
+1. **The release** of P1, S1 and V1 as 1.13.0 (see "The release of P1, S1 and V1").
 
 **Then**: nothing planned yet.
 
@@ -19,6 +18,23 @@ sections below.
 All of it is built on the branch `rgb-mosaic-trial` (decided 2026-11-03), which already holds the trial:
 `visual.build_alone` (d753692), and the lens distortion and rangefinder prior (8e5acef), both off unless asked for, so
 thermal mosaics are unchanged by them.
+
+## The release of P1, S1 and V1
+
+**Decided (2026-11-03):**
+- **The version is 1.13.0**, a minor bump: new features (RGB-only mosaics, `lens_k1`) and faster mosaics, with
+  nothing removed. `height_cell` defaulting to None gives the same cells as before for thermal mosaics.
+- **A script without `if __name__ == "__main__":`** (the user's choice: fall back): where workers would import it and
+  run it again (spawn, forkserver), the work runs in the calling process with a `RuntimeWarning`
+  (`mosaic.processes_unavailable`, used by `_measure_blocks` and `api._run_all`). The script's module-level line
+  that is running is looked up in its source, inside or outside the guard. Before, such a script crashed with
+  forkserver on Linux's Python 3.14, and with spawn on Windows and macOS.
+- **The worker processes are checked on Windows** before the release (the user gave access). macOS uses spawn, as
+  Windows does, and the same shared memory API, so Windows covers it; nothing is run on the Mac.
+
+**Steps:** the fallback on `rgb-mosaic-trial`; the full suite; Windows; merge `rgb-mosaic-trial` into `main`;
+`release/1.13.0` (version, lock file, changelog), its release checks, and the merge into `main`. The user pushes and
+tags.
 
 ## The RGB-only trial (built, on `rgb-mosaic-trial`)
 
@@ -82,11 +98,8 @@ moving more than a fraction of a thermal pixel. The same holds for RGB-only mosa
 The mosaics are identical to the pixel on both test flights. Thermal went from 96 s to 35 s, and an RGB matching
 round from 109 s to 28 s, on 8 workers; the laptop's timings vary by up to 2× under a long load. Tests:
 `test_build_in_several_processes_gives_the_same_mosaic` and `test_a_daemonic_process_matches_the_overlaps_itself` in
-`tests/test_mosaic.py`. Still to check before the release:
-- the worker processes on Windows and macOS (spawn, shared memory);
-- a script calling the library without `if __name__ == "__main__":` now fails when it builds a mosaic with jobs > 1:
-  the workers (forkserver on Linux since Python 3.14, spawn on Windows and macOS) import it again. The changelog
-  should say so, or the library fall back to this process when the workers can't start.
+`tests/test_mosaic.py`. The checks it left for the release (Windows, the `__main__` guard) are in "The release of
+P1, S1 and V1".
 
 **Tried and dropped:**
 - the RGB composite in processes, by bands of rows: 39 s against 30 s with threads, since each band decodes its frames

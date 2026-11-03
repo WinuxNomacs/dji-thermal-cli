@@ -547,7 +547,7 @@ rangefinder reading in its `lrf_m` column.
 Files are processed in parallel by a pool of worker processes (`--jobs N`, default
 `min(CPU count, 8)`; `--jobs 1` runs them one at a time in the same process, as does a daemonic process such as
 a Celery worker's, which cannot start processes of its own); a mosaic
-matches its frames' overlaps in as many threads. Files that
+matches its frames' overlaps in as many worker processes. Files that
 can't be converted are listed as `[skip, <reason>]` and the rest of the batch continues.
 
 Run `dji-thermal-cli process --help` / `... list --help` for the full
@@ -698,8 +698,12 @@ data = dtc.rjpeg_copy("flight/DJI_0001_T.JPG", settings, picture=rgb)   # an R-J
   `visual_decode` (frames), `align`, `check`, `visual_composite` and `write`, after `frames`
   when it was made because the dataset has no thermal frames. Each starts at `done = 0` and ends at its total. There is no overall
   percentage, as the stages' share of the time varies with the flight.
-- **Parallelism:** `jobs` as on the command line (`1` runs in the calling process, as does
-  any job in a daemonic process, such as a Celery worker's; a mosaic still aligns in threads).
+- **Parallelism:** `jobs` as on the command line, in worker processes (`1` runs in the calling
+  process). The work also runs in the calling process, at any `jobs`, when it can't start processes:
+  in a daemonic process, such as a Celery worker's, or from a script that calls the API outside
+  `if __name__ == "__main__":`. Where the workers import the script again (on Windows and macOS,
+  and on Linux since Python 3.14), they would run it again, so the API warns
+  (`RuntimeWarning`) and goes on in one process. Put the calls under that guard to use the workers.
 - The API never prints or exits. The command line is a thin layer over it and writes
   byte-identical files.
 

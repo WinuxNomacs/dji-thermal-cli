@@ -21,6 +21,12 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- Mosaics are faster: the frames' overlaps are matched in worker processes rather than threads
+  (`jobs`), with the frames in shared memory; the thermal test flight's mosaic
+  took 35 s instead of 96 s on 8 workers. The mosaics are unchanged, to the pixel.
+- A script calling the API outside `if __name__ == "__main__":` works in its own process,
+  with a `RuntimeWarning`, where worker processes would import it and run it again (on
+  Windows and macOS, and on Linux since Python 3.14); before, such a script failed there.
 - `MosaicOptions.height_cell` defaults to None: 64 for a thermal mosaic, 32 for a visual
   mosaic on its own. `--mosaic-height-cell` likewise.
 

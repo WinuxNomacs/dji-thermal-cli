@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import dataclasses
 import math
-import multiprocessing
 import os
 from collections import Counter
 from collections.abc import Callable, Iterable
@@ -939,11 +938,11 @@ def worker_count(requested: int | None, n_jobs: int) -> int:
 
 def _run_all(fn, arglist: list[tuple], jobs: int | None):
     """Yield (index, ok, result or error text) for fn(*args) over arglist, as each finishes,
-    in jobs worker processes (1: in this process). A daemonic process (a Celery worker's, a
-    multiprocessing pool's) cannot start processes, so it runs them in this process. An
-    unexpected exception only fails its own item."""
+    in jobs worker processes (1: in this process). Where they can't be started (a daemonic
+    process, a script starting them outside `if __name__ == "__main__":`), it runs them in
+    this process. An unexpected exception only fails its own item."""
     workers = worker_count(jobs, len(arglist))
-    if workers <= 1 or multiprocessing.current_process().daemon:
+    if workers <= 1 or _mosaic.processes_unavailable():
         for i, a in enumerate(arglist):
             try:
                 yield i, True, fn(*a)
