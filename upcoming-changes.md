@@ -151,10 +151,31 @@ fix it.
 
 ## V1: RGB-only mosaics as a feature
 
-To be planned after S1. Known so far:
-- an option in the API and a command-line flag;
-- k1 in the visual frame models (`visual_pairs.json`), so that a pixel lookup in the analyzer is exact;
-- the README, docs and changelog.
+`visual.build_alone` reachable from the API and the command line.
 
-The analyzer's side (RGB-only flights, a dataset without temperatures, the viewer and compare page) is planned in
-dji-thermal-ui's own `upcoming-changes.md`.
+**Decided (2026-11-03):** automatic, plus a flag. `--mosaic` on a flight with no thermal frames makes the RGB-only
+mosaic by itself; `--mosaic-visual-only` makes it on a flight with thermal frames too, in place of the thermal
+mosaic. The API has the same two ways.
+
+**Design:**
+- **API:** `MosaicOptions.visual_only`. `make_mosaic` makes the RGB-only mosaic when it is set, or when the flight has
+  no thermal frames but has visual ones (today: "No frames to mosaic."). Its `MosaicReport` then has `mosaic` and
+  `preview` None, no `files`, and `visual` set, as the paired visual mosaic's; the counts as for a thermal mosaic.
+- **Options that apply:** `max_pitch`, `visual_gsd` (its pixel size), `heights`, `height_cell`, the location removed
+  (`Settings.strip_location`), compression, jobs, progress. `height_cell` defaults to None: 64 for thermal mosaics, 32
+  for RGB-only (S1). The thermal-only ones (units, palette, normalize, gsd) are not used; `dsm`, `alignment`,
+  `as_converted_dir` and `align=False` with `visual_only` are refused (SettingsError), and on a flight without
+  thermal frames give MosaicError saying why.
+- **Files:** the same as the paired visual mosaic's (`mosaic_visual.tif`, its JSON sidecar and
+  `mosaic_visual_preview.png`); the sidecar's `laid_out` says how it was laid out.
+- **Progress:** "visual_frames" (files read), then build_alone's "visual_decode" (renamed from "visual_frames", not
+  yet released), "align", "check" and "visual_composite", then "write".
+- **k1:** written in the sidecar's frame models (each frame's `lens_k1`, read as 0 when absent), so
+  `read_frame_models(...).pixels` is exact for an RGB-only mosaic. (The backlog said `visual_pairs.json`: that is the
+  analyzer's file of thermal-to-visual pairs, which an RGB-only mosaic doesn't have, and the paired mosaic has no k1.)
+- **Command line:** `--mosaic-visual-only`, and `--mosaic` falling back to it; the summary printed says the RGB
+  mosaic was laid out by its own frames (frames used, alignment, heights, misalignment).
+- The README and the changelog.
+
+The analyzer's side (RGB-only flights, a dataset without temperatures, the viewer and compare page) is to be planned in
+dji-thermal-ui's own `upcoming-changes.md` once this is released.
