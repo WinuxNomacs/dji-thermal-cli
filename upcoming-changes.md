@@ -123,6 +123,18 @@ fix it.
   - a synthetic test (a box building on flat ground, rendered from known cameras) shows the edge sharp;
   - on `m4t-rgb`: the eave and garage crops better, the benchmark elsewhere no worse.
 
+**First attempt (2026-11-03), on the branch `s1-steps-wip` (5222a39), not merged:**
+- Each step pixel chooses between the blend and the lowest or highest of the 4 × 4 cells around it, by the frames'
+  agreement with the frame nearest nadir, smoothed by semi-global matching. A second pass uses only the frames that
+  see the pixel past the first pass's surface (depth buffers), and so does the composite.
+- On a synthetic box (5 m high, 8 m wide, sharp edges) it works: pixels more than 1 m off in the edge band go from 16%
+  to 1.3%.
+- On `m4t-rgb` the crops get worse (doubled objects, roof spread over the ground, holes where no frame is judged to see
+  a pixel), and it takes up to 194 s.
+- What a height sweep showed: on open ground and on the roof the frames agree best at the right height (lawn −5.4 m,
+  as now; roof 2.4 m); beside walls and in tall plants they don't, and the cells around a step are often too blurred
+  to hold the step's true heights. The 4 × 4 test flags 36–70% of the mosaic as steps.
+
 ## V1: RGB-only mosaics as a feature
 
 To be planned after S1. Known so far:
