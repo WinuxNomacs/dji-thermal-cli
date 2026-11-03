@@ -68,9 +68,9 @@ Each pair cuts its blocks from its own overlap, so a frame's same ground is tran
 
 numpy only, no new dependency.
 
-**Open decision:** may tier 3 change thermal mosaics at all, compared to what this branch makes today for the same
-flight and settings? Recommended: within a tolerance (the frames agreeing no worse, no mosaic pixel moving more than
-a fraction of a thermal pixel); otherwise tier 3 is for RGB-only flights alone.
+**Decided (2026-11-03):** tier 2 leaves the output identical to what this branch makes today for the same flight and
+settings; tier 3 may change thermal mosaics within a tolerance: the frames agreeing no worse, and no mosaic pixel
+moving more than a fraction of a thermal pixel. The same holds for RGB-only mosaics, in their own pixels.
 
 ## S1: the eave smear
 
