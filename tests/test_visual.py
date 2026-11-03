@@ -128,6 +128,48 @@ def test_a_coarser_mosaic_decodes_its_jpegs_smaller(flight, tmp_path):
     assert coarse.grid.gsd == pytest.approx(4 * 21.0 / 400) and _colour_error(coarse) < 6
 
 
+@pytest.fixture(scope="module")
+def alone(flight, tmp_path_factory):
+    """The flight's visual frames as JPEGs, their camera pointing where the gimbal says."""
+    thermal, _, _ = flight
+    folder = tmp_path_factory.mktemp("alone")
+    frames = []
+    for i, f in enumerate(thermal):
+        v = _visual_frame(folder / f"f{i}_V.png", f, offset_deg=(0.0, 0.0))
+        with Image.open(v.path) as im:
+            im.save(folder / f"f{i}_V.jpg", quality=95)
+        frames.append(dataclasses.replace(v, name=f"f{i}_V.jpg", path=folder / f"f{i}_V.jpg"))
+    return frames
+
+
+def test_a_flight_of_visual_frames_alone_is_laid_out_by_its_own_overlaps(alone):
+    """Without thermal frames, the visual frames are aligned on their brightness, and the mosaic
+    shows the field where it is."""
+    vm = visual.build_alone(alone, heights="plane")
+    assert vm.report["frames_used"] == vm.report["frames_contributing"] == 6
+    assert vm.report["work_size"] == [480, 360] and vm.report["frames_oblique"] == []
+    assert vm.report["misalignment"]["median_m"] < 0.02
+    assert vm.grid.gsd == pytest.approx(21.0 / 400, abs=0.001)
+    assert _colour_error(vm) < 4
+
+
+def test_visual_frames_alone_are_aligned_smaller_and_composited_at_full_size(alone):
+    """work_px caps the size the frames are matched at; the mosaic keeps their own pixel size."""
+    vm = visual.build_alone(alone, heights="plane", work_px=240)
+    assert vm.report["work_size"] == [240, 180]
+    assert vm.grid.gsd == pytest.approx(21.0 / 400, abs=0.001) and _colour_error(vm) < 4
+    assert all(pl.frame.pose.width == 480 for pl in vm.placed)
+
+
+def test_oblique_visual_frames_are_left_out_of_a_flight_alone(alone):
+    frames = alone
+    tilted = dataclasses.replace(frames[0], pose=dataclasses.replace(frames[0].pose, pitch=-60.0))
+    vm = visual.build_alone([tilted] + frames[1:], heights="plane")
+    assert vm.report["frames_oblique"] == [tilted.name] and vm.report["frames_used"] == 5
+    with pytest.raises(ValueError, match="pitched"):
+        visual.build_alone([tilted])
+
+
 def test_pairs_are_the_frames_exposed_together(flight, tmp_path):
     """A visual frame pairs with the thermal frame exposed closest to it, within 0.25 s, once;
     without exposure times, with the same capture number in the same folder."""

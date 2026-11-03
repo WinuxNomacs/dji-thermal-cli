@@ -40,6 +40,7 @@ MIN_OFFSET_PAIRS = 5            # pairs measured to correct the cameras' offset
 OFFSET_MIN_PEAK = 0.05          # weakest phase-correlation peak trusted (edges of two kinds of image)
 STRIP_ROWS = 256                # mosaic rows composited at once
 PREVIEW_PX = 2048               # the preview's longer side, at most
+WORK_PX = 1280                  # widest a visual frame is decoded to lay out a flight of its own (build_alone)
 BANDS = ("red", "green", "blue", "alpha")
 _NO_VALUES = np.zeros((0, 0), np.float32)
 _CAPTURE = re.compile(r"_(\d{4,})_[A-Z]+\.[^./]+$", re.IGNORECASE)
@@ -177,6 +178,93 @@ def build(thermal: mosaic.Mosaic, visual: list[VisualFrame], gsd: float | None =
     }
     return VisualMosaic(grid, rgb, source, table, report, thermal.ground_alt, thermal.ground_alt_source,
                         thermal.heights, placed)
+
+
+def build_alone(visual: list[VisualFrame], gsd: float | None = None,
+                max_pitch: float = mosaic.DEFAULT_MAX_PITCH, progress: Callable[..., None] | None = None,
+                jobs: int = 1, heights: str = "auto", height_cell: int = mosaic.HEIGHT_CELL_PX,
+                check_misalignment: bool = True, work_px: int = WORK_PX) -> VisualMosaic:
+    """The visual mosaic of a flight without thermal frames (an RGB flight): the frames laid
+    out by their own overlaps, as mosaic.build lays out thermal frames (their alignment and,
+    with heights="auto", the surface's heights on cells height_cell of its pixels wide), matched on their brightness decoded at most
+    work_px pixels wide, then composited at full size as build's. Frames steeper than
+    max_pitch (degrees, -90 straight down) are left out, as the thermal mosaic leaves them.
+    progress: as mosaic.build's "align" and "check" stages, then "visual_frames" (frames
+    decoded for alignment) first and "visual_composite" last."""
+    steep = [v for v in visual if v.pose.pitch <= max_pitch]
+    if not steep:
+        raise ValueError(f"no visual frame is pitched at or below {max_pitch:g} degrees")
+    work = _work_frames(steep, work_px, mosaic._reporter(progress, "visual_frames", "frames"), jobs)
+    layout = mosaic._layout(work, None, None, True, progress, jobs, heights, height_cell)
+    misalignment = mosaic._check(layout, check_misalignment, progress, jobs)
+    by_name = {v.name: v for v in steep}
+    g = layout.grid
+    placed, frames = [], []
+    for wpl in layout.placed:
+        v = by_name[wpl.frame.name]
+        pl = mosaic._place(mosaic.Frame(v.name, _NO_VALUES, v.pose), layout.ground_alt, g.zone, g.north,
+                           r=wpl.r_t.T)
+        if pl is not None:
+            pl.shift, pl.rot, pl.heights = wpl.shift.copy(), wpl.rot, wpl.heights
+            placed.append(pl)
+            frames.append(v)
+    if gsd is None:
+        gsd = max(round(float(np.median([pl.h / pl.frame.pose.focal_px for pl in placed])), 3), 0.001)
+    grid = mosaic._grid(placed, gsd, g.zone, g.north)
+    rgb, source = _composite(placed, frames, grid, mosaic._reporter(progress, "visual_composite", "frames"), jobs)
+
+    covered = source >= 0
+    used = np.bincount(source[covered], minlength=len(placed))
+    table = []
+    for k, (pl, v) in enumerate(zip(placed, frames)):
+        p = v.pose
+        table.append({
+            "index": k, "file": v.name, "pixels_used": int(used[k]),
+            "lat": p.lat, "lon": p.lon, "abs_alt_m": p.abs_alt, "height_above_ground_m": round(pl.h, 3),
+            "utm_e": round(float(pl.c[0]), 3), "utm_n": round(float(pl.c[1]), 3),
+            "gimbal_yaw": p.yaw, "gimbal_pitch": p.pitch, "gimbal_roll": p.roll,
+            "focal_px": round(p.focal_px, 2), "width": p.width, "height": p.height,
+            "alignment_shift_m": [round(float(s), 3) for s in pl.shift],
+            "alignment_rotation_deg": round(math.degrees(pl.rot), 3),
+            **p.record,
+        })
+    report = {
+        "laid_out": "by the visual frames' own overlaps",
+        "frames_used": len(placed),
+        "frames_contributing": int((used > 0).sum()),
+        "work_size": [work[0].pose.width, work[0].pose.height],
+        "max_pitch": max_pitch,
+        "frames_oblique": [v.name for v in visual if v.pose.pitch > max_pitch],
+        "frames_without_footprint": layout.dropped,
+        "alignment": layout.alignment,
+        "heights": layout.heights_report,
+        "misalignment": misalignment,
+    }
+    return VisualMosaic(grid, rgb, source, table, report, layout.ground_alt, layout.ground_source,
+                        layout.heights, placed)
+
+
+def _work_frames(visual: list[VisualFrame], work_px: int, report, jobs: int) -> list[mosaic.Frame]:
+    """The frames as mosaic.Frame for laying out: their brightness (0 to 255) decoded at most
+    work_px pixels wide, posed at that size."""
+    def one(v: VisualFrame) -> mosaic.Frame:
+        scale = 1
+        while scale < 8 and v.pose.width / scale > work_px:
+            scale *= 2
+        pixels, factor = _decode(v, scale, "L")
+        h, w = pixels.shape
+        pose = dataclasses.replace(v.pose, width=w, height=h, focal_px=v.pose.focal_px / factor)
+        return mosaic.Frame(v.name, pixels.astype(np.float32), pose)
+
+    if report:
+        report(0, len(visual))
+    out = []
+    with ThreadPoolExecutor(max(1, jobs)) as pool:
+        for done, f in enumerate(pool.map(one, visual), 1):
+            out.append(f)
+            if report:
+                report(done, len(visual))
+    return out
 
 
 def _place(tpl, v: VisualFrame, ground: float, g: mosaic.Grid, offset: tuple[float, float]):
@@ -376,9 +464,13 @@ def write(m: VisualMosaic, path: Path, compression: str = "deflate", located: bo
     frame covers) and its JSON sidecar, with the frames' models as the thermal mosaic's.
     located=False: as mosaic.write's."""
     g = m.grid
-    onto = "a horizontal plane" if m.heights is None else "the thermal mosaic's surface (see its heights)"
-    method = (f"each frame placed as its thermal frame in the thermal mosaic, the cameras' offset corrected, "
-              f"onto {onto}; one frame per pixel (most nadir), bilinear")
+    if "laid_out" in m.report:
+        onto = "a horizontal plane" if m.heights is None else "the surface estimated from them (see its heights)"
+        method = f"the frames aligned by their own overlaps, onto {onto}; one frame per pixel (most nadir), bilinear"
+    else:
+        onto = "a horizontal plane" if m.heights is None else "the thermal mosaic's surface (see its heights)"
+        method = (f"each frame placed as its thermal frame in the thermal mosaic, the cameras' offset corrected, "
+                  f"onto {onto}; one frame per pixel (most nadir), bilinear")
     if located:
         info = {
             "method": method, "crs": f"EPSG:{g.epsg}", "gsd_m": g.gsd, "width": g.width, "height": g.height,
