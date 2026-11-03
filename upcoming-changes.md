@@ -7,19 +7,18 @@ Deferred work, tracked here so it isn't lost between sessions.
 The order of work, top first. Each phase is planned with the user before it is built; the details are in the
 sections below.
 
-**Up next**:
-1. **The release** of P1, S1 and V1 as 1.13.0 (see "The release of P1, S1 and V1").
+**Up next**: nothing planned yet. The analyzer's side of RGB-only flights is planned in dji-thermal-ui.
 
 **Then**: nothing planned yet.
 
 **Done:** P1 (performance, 2026-11-03), S1 (the eave smear, 2026-11-03: finer height cells for RGB-only mosaics), V1
-(RGB-only mosaics in the API and on the command line, 2026-11-03).
+(RGB-only mosaics in the API and on the command line, 2026-11-03), and their release as 1.13.0 (2026-11-03).
 
 All of it is built on the branch `rgb-mosaic-trial` (decided 2026-11-03), which already holds the trial:
 `visual.build_alone` (d753692), and the lens distortion and rangefinder prior (8e5acef), both off unless asked for, so
 thermal mosaics are unchanged by them.
 
-## The release of P1, S1 and V1
+## The release of P1, S1 and V1 (done: 1.13.0)
 
 **Decided (2026-11-03):**
 - **The version is 1.13.0**, a minor bump: new features (RGB-only mosaics, `lens_k1`) and faster mosaics, with
@@ -99,7 +98,7 @@ The mosaics are identical to the pixel on both test flights. Thermal went from 9
 round from 109 s to 28 s, on 8 workers; the laptop's timings vary by up to 2× under a long load. Tests:
 `test_build_in_several_processes_gives_the_same_mosaic` and `test_a_daemonic_process_matches_the_overlaps_itself` in
 `tests/test_mosaic.py`. The checks it left for the release (Windows, the `__main__` guard) are in "The release of
-P1, S1 and V1".
+P1, S1 and V1 (done: 1.13.0)".
 
 **Tried and dropped:**
 - the RGB composite in processes, by bands of rows: 39 s against 30 s with threads, since each band decodes its frames
