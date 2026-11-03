@@ -22,12 +22,14 @@ image shift between overlapping frames found by phase correlation (geometric err
 from __future__ import annotations
 
 import copy
+import ctypes
 import dataclasses
 import functools
 import io
 import json
 import math
 import multiprocessing
+import sys
 import warnings
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
@@ -1081,8 +1083,23 @@ def _lay_out(arrays_spec):
     return layout, at
 
 
+def _keep_freed_memory() -> None:
+    """In a worker process on Linux (glibc): keep freed blocks of up to 32 MB (the most every glibc allows)
+    on the heap for reuse, and the heap's free top unreturned. By default the arrays over 128 kB were mapped
+    afresh or the heap trimmed, and their pages faulted in again, which made the blocks' FFTs about 3 times
+    slower (on WSL2); either setting alone doesn't help."""
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mallopt(-3, 32 << 20)          # M_MMAP_THRESHOLD
+        libc.mallopt(-1, 64 << 20)          # M_TRIM_THRESHOLD
+    except (OSError, AttributeError):       # not glibc
+        pass
+
+
 def _worker_start(names, layouts, placed, grid):
     from multiprocessing import shared_memory
+    if sys.platform.startswith("linux"):
+        _keep_freed_memory()
     shms = [shared_memory.SharedMemory(name=n) for n in names]
     pixels, grads, valids = (_views(shm.buf, lay) for shm, lay in zip(shms, layouts))
     _WORKER.update(shms=shms, grads=grads, valids=valids, grid=grid, placed=[
