@@ -1606,7 +1606,8 @@ FRAME_MODELS_VERSION = 1
 
 def _frame_models(m: Mosaic) -> dict:
     """How each placed frame sees the ground, for FrameModels: its camera (UTM position, height
-    above the ground plane, local-to-UTM map, NED-to-camera rotation with the boresight, lens),
+    above the ground plane, local-to-UTM map, NED-to-camera rotation with the boresight, lens
+    and its distortion k1, when estimated),
     its alignment correction, the surface it was projected onto, and its corrected footprint's
     corners in lon/lat."""
     g, h = m.grid, m.heights
@@ -1621,6 +1622,7 @@ def _frame_models(m: Mosaic) -> dict:
             "local_to_utm": pl.j.tolist(), "ned_to_camera": pl.r_t.tolist(),
             "alignment_shift_m": pl.shift.tolist(), "alignment_rotation_rad": pl.rot,
             "footprint_lonlat": np.column_stack([lon, lat]).tolist(),
+            **({"lens_k1": pl.k1} if pl.k1 else {}),
         })
     return {
         "version": FRAME_MODELS_VERSION, "crs": f"EPSG:{g.epsg}",
@@ -1664,7 +1666,8 @@ class FrameModels:
             placed.append(_Placed(
                 Frame(f["file"], np.zeros((0, 0), np.float32), pose), f["height_m"], np.asarray(f["camera_utm"], float),
                 j, np.linalg.inv(j), np.asarray(f["ned_to_camera"], float), *f["principal_point_px"],
-                np.zeros((0, 2)), np.asarray(f["alignment_shift_m"], float), f["alignment_rotation_rad"], heights))
+                np.zeros((0, 2)), np.asarray(f["alignment_shift_m"], float), f["alignment_rotation_rad"], heights,
+                f.get("lens_k1", 0.0)))
             footprints.append(np.asarray(f["footprint_lonlat"], float))
         return cls(tuple(f["file"] for f in fm["frames"]), tuple(footprints), tuple(placed), zone, north)
 

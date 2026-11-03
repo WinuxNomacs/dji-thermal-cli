@@ -191,7 +191,7 @@ def build_alone(visual: list[VisualFrame], gsd: float | None = None,
     with heights="auto", the surface's heights on cells height_cell of its pixels wide), matched on their brightness decoded at most
     work_px pixels wide, then composited at full size as build's. Frames steeper than
     max_pitch (degrees, -90 straight down) are left out, as the thermal mosaic leaves them.
-    progress: as mosaic.build's "align" and "check" stages, then "visual_frames" (frames
+    progress: as mosaic.build's "align" and "check" stages, then "visual_decode" (frames
     decoded for alignment) first and "visual_composite" last. distortion, rangefinder_prior: as
     mosaic._align's: the wide camera's distortion estimated, and the ground the images hardly see
     pulled toward the rangefinder's heights nearby. The height cells are half as wide as the
@@ -202,7 +202,7 @@ def build_alone(visual: list[VisualFrame], gsd: float | None = None,
     steep = [v for v in visual if v.pose.pitch <= max_pitch]
     if not steep:
         raise ValueError(f"no visual frame is pitched at or below {max_pitch:g} degrees")
-    work = _work_frames(steep, work_px, mosaic._reporter(progress, "visual_frames", "frames"), jobs)
+    work = _work_frames(steep, work_px, mosaic._reporter(progress, "visual_decode", "frames"), jobs)
     layout = mosaic._layout(work, None, None, True, progress, jobs, heights, height_cell,
                             distortion=distortion, rangefinder_prior=rangefinder_prior)
     misalignment = mosaic._check(layout, check_misalignment, progress, jobs)

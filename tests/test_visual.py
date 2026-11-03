@@ -323,6 +323,94 @@ def test_options_are_checked():
         dtc.MosaicOptions(visual_gsd=0.01)
     with pytest.raises(dtc.SettingsError, match="positive"):
         dtc.MosaicOptions(visual=True, visual_gsd=0)
+    assert dtc.MosaicOptions(visual_only=True, visual_gsd=0.01).visual_gsd == 0.01
+
+
+@pytest.mark.parametrize("options, why", [
+    ({"align": False}, "needs align"),
+    ({"dsm": __file__}, "DSM is used for thermal mosaics only"),
+])
+def test_a_mosaic_of_the_visual_frames_alone_refuses_the_thermal_mosaics_options(options, why):
+    with pytest.raises(dtc.SettingsError, match=f"visual_only: .*{why}"):
+        dtc.MosaicOptions(visual_only=True, **options)
+
+
+def _rgb_jpeg(path, thermal, exposure):
+    """The visual frame taken with a synthetic thermal one, as the drone writes it: a JPEG
+    whose EXIF and DJI XMP give its pose, focal length and rangefinder."""
+    w, h = 480, 360
+    v = _visual_frame(path.with_suffix(".png"), thermal, offset_deg=(0.0, 0.0), size=(w, h),
+                      focal=24 * math.hypot(w, h) / mosaic.FULL_FRAME_DIAGONAL_MM)
+    p = thermal.pose
+    exif = Image.Exif()
+    exif[272] = "M4T"
+    exif.get_ifd(0x8769).update({37386: 6.72, 41989: 24})
+    buf = io.BytesIO()
+    with Image.open(v.path) as im:
+        im.save(buf, "JPEG", quality=95, exif=exif)
+    v.path.unlink()
+    path.write_bytes(_with_xmp(buf.getvalue(), _xmp(
+        f'drone-dji:GpsLatitude="{p.lat:.9f}" drone-dji:GpsLongitude="{p.lon:.9f}" '
+        f'drone-dji:AbsoluteAltitude="{p.abs_alt:.3f}" drone-dji:GimbalYawDegree="{p.yaw}" '
+        f'drone-dji:GimbalPitchDegree="{p.pitch}" drone-dji:GimbalRollDegree="{p.roll}" '
+        f'drone-dji:LRFStatus="Normal" drone-dji:LRFTargetAbsAlt="{GROUND:.3f}" '
+        f'drone-dji:UTCAtExposure="{exposure.isoformat()}" drone-dji:ImageSource="WideCamera">')))
+
+
+@pytest.fixture(scope="module")
+def rgb_flight(flight, tmp_path_factory):
+    """A folder of the flight's visual frames alone, as JPEGs from the drone (no thermal frames)."""
+    thermal, _, _ = flight
+    folder = tmp_path_factory.mktemp("rgb")
+    for i, f in enumerate(thermal):
+        _rgb_jpeg(folder / f"DJI_2026102221331{i}_000{i}_V.JPG", f, START + datetime.timedelta(seconds=2 * i))
+    return folder
+
+
+def test_make_mosaic_lays_out_a_flight_without_thermal_frames_by_its_own_overlaps(rgb_flight, tmp_path):
+    """A flight of visual frames only: make_mosaic makes their mosaic alone (no thermal mosaic),
+    with its stages and its files, and the frames' lens distortion in its frame models."""
+    events = []
+    report = dtc.make_mosaic(rgb_flight, tmp_path, dtc.Settings(), dtc.MosaicOptions(heights="plane"),
+                             progress=lambda e: e.kind == "mosaic" and events.append(e.data))
+    assert report.visual_only and report.mosaic is None and report.preview is None and report.files == []
+    assert report.alignment is None and (report.frames, report.not_thermal) == (0, 6)
+    v = report.visual
+    assert (v.frames, v.skipped) == (6, 0) and v.mosaic.report["laid_out"] == "by the visual frames' own overlaps"
+    assert v.mosaic.report["frames_used"] == 6 and v.mosaic.report["misalignment"]["median_m"] < 0.02
+    stages = list(dict.fromkeys(d["stage"] for d in events))
+    assert stages == ["frames", "visual_frames", "visual_decode", "align", "check", "visual_composite", "write"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "mosaic_visual.json", "mosaic_visual.tif", "mosaic_visual_preview.png"]
+    models = json.loads(v.sidecar.read_text())["frame_models"]["frames"]
+    k1 = v.mosaic.report["alignment"]["distortion_k1"]
+    assert all(f["lens_k1"] == pytest.approx(k1, abs=1e-5) for f in models)
+
+
+def test_a_mosaic_of_the_visual_frames_alone_has_its_own_height_cells(rgb_flight, tmp_path):
+    """visual_only's height cells are build_alone's unless height_cell says otherwise; a flight
+    with thermal frames gets no thermal mosaic with it."""
+    report = dtc.make_mosaic(rgb_flight, tmp_path / "a", options=dtc.MosaicOptions(visual_only=True))
+    cell = report.visual.mosaic.report["heights"]["cell_m"]
+    wide = dtc.make_mosaic(rgb_flight, tmp_path / "b", options=dtc.MosaicOptions(visual_only=True, height_cell=64))
+    assert wide.visual.mosaic.report["heights"]["cell_m"] == pytest.approx(2 * cell, rel=0.01)
+    assert report.visual_only and not list((tmp_path / "a").glob("mosaic_temp_*"))
+
+
+def test_frame_models_find_a_point_through_the_lens_distortion(flight, tmp_path):
+    """read_frame_models of a mosaic whose lens distorts finds a ground point at the pixel the
+    mosaic projected it to."""
+    thermal, _, _ = flight
+    frames = [_visual_frame(tmp_path / f"f{i}_V.png", f, offset_deg=(0.0, 0.0), k1=0.08) for i, f in enumerate(thermal)]
+    vm = visual.build_alone(frames, heights="plane", check_misalignment=False)
+    _, sidecar = visual.write(vm, tmp_path / "mosaic_visual.tif")
+    models = dtc.read_frame_models(sidecar)
+    pl = vm.placed[0]
+    g = vm.grid
+    e, n = pl.c[0] + 1.5, pl.c[1] - 2.0
+    lat, lon = geo.utm_inverse(np.array([e]), np.array([n]), g.zone, g.north)
+    u, v, _, _ = mosaic._project(pl, np.array([e - pl.c[0]]), np.array([n - pl.c[1]]), pl.h)
+    assert pl.k1 != 0 and models.pixels(lon, lat)[0, 0] == pytest.approx([u[0], v[0]], abs=0.01)
 
 
 @pytest.mark.flight
@@ -361,7 +449,22 @@ def test_the_command_line_prints_the_visual_mosaic(tmp_path):
     assert "cameras' offset: pitch " in proc.stdout or "cameras' offset: not corrected, " in proc.stdout
 
 
+def test_the_command_line_mosaics_a_flight_without_thermal_frames(rgb_flight, tmp_path):
+    proc = _cli("process", "--input-dir", rgb_flight, "--output-dir", tmp_path, "--mosaic", "--quiet",
+                "--mosaic-heights", "plane")
+    assert proc.returncode == 0, proc.stderr
+    assert "Visual mosaic, laid out by the visual frames' own overlaps: 6 visual frames." in proc.stdout
+    assert "mosaic_visual.tif  (" in proc.stdout and "lens distortion k1 " in proc.stdout
+    assert "Mosaic: 0 nadir frames" not in proc.stdout
+
+
+def test_the_command_line_refuses_a_visual_mosaic_alone_without_alignment(tmp_path):
+    proc = _cli("process", "--input-dir", tmp_path, "--output-dir", tmp_path / "out", "--mosaic-visual-only",
+                "--no-mosaic-align")
+    assert proc.returncode != 0 and "--mosaic-visual-only: " in proc.stderr and "needs --mosaic-align" in proc.stderr
+
+
 def test_the_visual_pixel_size_needs_the_visual_mosaic(tmp_path):
     proc = _cli("process", "--input-dir", tmp_path, "--output-dir", tmp_path / "out", "--mosaic",
                 "--mosaic-visual-gsd", "0.02")
-    assert proc.returncode != 0 and "visual_gsd needs visual" in proc.stderr
+    assert proc.returncode != 0 and "--mosaic-visual-gsd needs visual or --mosaic-visual-only" in proc.stderr

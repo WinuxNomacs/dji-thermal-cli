@@ -51,7 +51,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import api, core, listing, mosaic, outputs, units
+from . import api, core, listing, mosaic, outputs, units, visual
 from ._version import __version__
 
 
@@ -182,10 +182,11 @@ def _build_parser() -> argparse.ArgumentParser:
     proc.add_argument("--mosaic-heights", choices=("auto", "plane"), default="auto", help="Surface the frames are projected onto: auto = heights estimated from the frames' parallax on a grid of cells, anchored to the rangefinder, written to mosaic_heights.tif (the plane when too little overlaps); plane = a horizontal ground plane (default: %(default)s)")
     proc.add_argument("--mosaic-dsm", type=Path, metavar="PATH", help="Project the frames onto this surface model instead of estimating heights: a GeoTIFF in WGS84 UTM or lat/lon, altitudes in metres (e.g. ODM's dsm.tif)")
     proc.add_argument("--mosaic-dsm-offset", type=float, metavar="METRES", help="Metres added to the DSM's altitudes to match the frames' (default: estimated from the rangefinder)")
-    proc.add_argument("--mosaic-height-cell", type=int, default=mosaic.HEIGHT_CELL_PX, metavar="PIXELS", help="Size of the height cells, in mosaic pixels (default: %(default)d)")
+    proc.add_argument("--mosaic-height-cell", type=int, default=None, metavar="PIXELS", help=f"Size of the height cells, in mosaic pixels (default: {mosaic.HEIGHT_CELL_PX}; {visual.ALONE_HEIGHT_CELL_PX} of the alignment's pixels for --mosaic-visual-only)")
     proc.add_argument("--mosaic-gsd", type=float, default=None, metavar="METRES", help="Mosaic pixel size (default: the frames' median ground sample distance)")
     proc.add_argument("--mosaic-visual", action="store_true", help="Also mosaic the visual (RGB) frames the drone took with the thermal ones (M4T, M30T, M3T, H20T, H30T wide camera; zoom frames are left out): <output-dir>/mosaic_visual.tif (red, green, blue, alpha; UTM) with a .json sidecar and mosaic_visual_preview.png. Each visual frame is placed as its thermal frame is in the thermal mosaic, the two cameras' offset measured and corrected, so the two mosaics line up")
     proc.add_argument("--mosaic-visual-gsd", type=float, default=None, metavar="METRES", help="The visual mosaic's pixel size (default: the visual frames' median ground sample distance)")
+    proc.add_argument("--mosaic-visual-only", action="store_true", help="Mosaic only the visual (RGB) frames, laid out by their own overlaps instead of by a thermal mosaic, at their own detail: <output-dir>/mosaic_visual.tif with a .json sidecar and mosaic_visual_preview.png, and no thermal mosaic. --mosaic does this by itself for a flight with no thermal frames. Uses --mosaic-max-pitch, --mosaic-heights, --mosaic-height-cell and --mosaic-visual-gsd; implies --mosaic")
     proc.add_argument("--rjpeg-picture", choices=api.RJPEG_PICTURES, default="palette", help="The rjpeg output's visible picture: palette = coloured as the pseudo output (--palette, --range-min/--range-max), the default; original = DJI's own. DJI's tools colour it from the measurements either way")
     proc.add_argument("--compression", choices=outputs.COMPRESSIONS, default="deflate", help="TIFF/EXR compression: deflate = lossless Deflate (EXR: ZIP), the default; none = uncompressed. PNG is always compressed")
     proc.add_argument("--jobs", "-j", type=_positive_int, default=None, help="Worker processes, and the mosaic's matching threads (default: min(CPU count, 8); 1 = in this process)")
@@ -231,7 +232,8 @@ _FLAGS = {"replace_above_value": "--replace-above-value", "replace_below_value":
           "unit": "--input-unit", "units": "--mosaic-unit", "gsd": "--mosaic-gsd", "palette": "--palette",
           "heights": "--mosaic-heights", "height_cell": "--mosaic-height-cell",
           "dsm": "--mosaic-dsm", "dsm_offset": "--mosaic-dsm-offset",
-          "distance": "--distance"}
+          "visual_only": "--mosaic-visual-only", "visual_gsd": "--mosaic-visual-gsd", "align": "--mosaic-align",
+          "alignment": "--alignment", "distance": "--distance"}
 
 
 def _fail(e: Exception) -> None:
@@ -292,7 +294,7 @@ class _MosaicProgress:
 
     STAGES = {"ambient": "reading ambient temperatures", "frames": "reading frames", "align": "aligning",
               "composite": "compositing", "check": "checking alignment", "visual_frames": "reading visual frames",
-              "visual_offset": "measuring the visual camera's offset", "visual_composite": "compositing visual frames",
+              "visual_offset": "measuring the visual camera's offset", "visual_decode": "decoding visual frames", "visual_composite": "compositing visual frames",
               "write": "writing"}
 
     def __init__(self, show, out=None, quiet: bool = False):
@@ -329,6 +331,7 @@ class _MosaicProgress:
 
 def _cmd_process(args: argparse.Namespace) -> None:
     settings = _settings(args)
+    args.mosaic = args.mosaic or args.mosaic_visual_only
     if args.outputs:
         wanted = tuple(dict.fromkeys(o for group in args.outputs for o in group))
     else:
@@ -343,6 +346,7 @@ def _cmd_process(args: argparse.Namespace) -> None:
                                     heights=args.mosaic_heights, height_cell=args.mosaic_height_cell,
                                     dsm=args.mosaic_dsm, dsm_offset=args.mosaic_dsm_offset,
                                     visual=args.mosaic_visual, visual_gsd=args.mosaic_visual_gsd,
+                                    visual_only=args.mosaic_visual_only,
                                     units=tuple(u for group in (args.mosaic_units or [["C"]]) for u in group))
         if args.mosaic or args.normalize:
             api._height_options(options)        # a DSM that can't be used fails before any frame is converted
@@ -421,6 +425,9 @@ def _print_mosaic_counts(counts: dict, max_pitch: float, visual: bool = False) -
 
 
 def _print_mosaic(rep: api.MosaicReport, settings: api.Settings, max_pitch: float) -> None:
+    if rep.visual_only:
+        _print_visual_alone(rep, settings)
+        return
     m = rep.mosaic
     g, r = m.grid, m.report
     _print_mosaic_counts({"frames": rep.frames, "oblique": rep.oblique, "unusable": rep.unusable,
@@ -481,6 +488,36 @@ def _print_visual(v: api.VisualReport, settings: api.Settings) -> None:
               f"{off['residual_m']['median'] * 100:.0f} cm after")
     else:
         print(f"  cameras' offset: not corrected, {off['reason']}")
+
+
+def _print_visual_alone(rep: api.MosaicReport, settings: api.Settings) -> None:
+    v = rep.visual
+    m = v.mosaic
+    g, r = m.grid, m.report
+    print(f"\nVisual mosaic, laid out by the visual frames' own overlaps: {r['frames_used']} visual frames"
+          + (f", {len(r['frames_oblique'])} oblique left out (pitch above {r['max_pitch']:g} deg)" if r["frames_oblique"] else "")
+          + (f", {len(r['frames_without_footprint'])} without a footprint" if r["frames_without_footprint"] else "")
+          + (f", {v.skipped} other JPEGs ignored" if v.skipped else "") + ".")
+    crs = "" if settings.strip_location else f", EPSG:{g.epsg}"
+    print(f"  {v.file}  ({g.width}x{g.height} px, {g.gsd * 100:.1f} cm/px{crs})\n  {v.sidecar}")
+    print(f"  {v.preview}" + (f"  (1/{v.preview_reduction} size)" if v.preview_reduction > 1 else ""))
+    ground = f"from the {m.ground_alt_source}" if settings.strip_location else f"{m.ground_alt:.2f} m ({m.ground_alt_source})"
+    print(f"  ground plane {ground}; {r['frames_contributing']}/{r['frames_used']} frames contribute")
+    ali, hr, mis = r["alignment"], r["heights"], r["misalignment"]
+    if ali:
+        b, before = ali["boresight_deg"], ali["before"]
+        print(f"  alignment: boresight pitch {b['pitch']:+.2f} deg, yaw {b['yaw']:+.2f} deg; per-frame shift "
+              f"{ali['frame_shift_m']['median'] * 100:.0f} cm median, rotation {ali['frame_rotation_deg']['median']:.1f} deg median"
+              + (f"; lens distortion k1 {ali['distortion_k1']:+.3f}" if "distortion_k1" in ali else "")
+              + (f"; offsets before: {before['median_m'] * 100:.0f} cm median" if before.get("pairs") else ""))
+    if hr and "range_m" in hr:
+        low_h, high_h = hr["range_m"]
+        print(f"  heights: {hr['cell_m'] * 100:.0f} cm cells, {low_h:+.1f} to {high_h:+.1f} m above the ground plane")
+    elif hr:
+        print(f"  heights: {hr['method']}")
+    if mis and mis.get("pairs"):
+        print(f"  misalignment between overlapping frames: {mis['median_m'] * 100:.1f} cm median, "
+              f"{mis['p90_m'] * 100:.1f} cm p90 ({mis['pairs']} pairs)")
 
 
 TABLE_COLUMNS = (   # (header, flattened key, format); {u} is the temperature unit

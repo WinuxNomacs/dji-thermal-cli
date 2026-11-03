@@ -8,12 +8,13 @@ The order of work, top first. Each phase is planned with the user before it is b
 sections below.
 
 **Up next**:
-1. **V1, RGB-only mosaics as a feature:** `visual.build_alone` reachable from the API and the command line.
+1. **The release** of P1, S1 and V1 (still to check: P1's worker processes on Windows and macOS, and the
+   `__main__` guard; see P1).
 
-**Then**:
-2. **The release** of P1, S1 and V1.
+**Then**: nothing planned yet.
 
-**Done:** P1 (performance, 2026-11-03), S1 (the eave smear, 2026-11-03: finer height cells for RGB-only mosaics).
+**Done:** P1 (performance, 2026-11-03), S1 (the eave smear, 2026-11-03: finer height cells for RGB-only mosaics), V1
+(RGB-only mosaics in the API and on the command line, 2026-11-03).
 
 All of it is built on the branch `rgb-mosaic-trial` (decided 2026-11-03), which already holds the trial:
 `visual.build_alone` (d753692), and the lens distortion and rangefinder prior (8e5acef), both off unless asked for, so
@@ -149,7 +150,7 @@ fix it.
 - Test: `test_a_flight_of_its_own_estimates_its_heights_on_cells_half_the_thermal_mosaics` (`tests/test_visual.py`).
 - The first attempt stays on `s1-steps-wip`, unmerged.
 
-## V1: RGB-only mosaics as a feature
+## V1: RGB-only mosaics as a feature (done)
 
 `visual.build_alone` reachable from the API and the command line.
 
@@ -176,6 +177,13 @@ mosaic. The API has the same two ways.
 - **Command line:** `--mosaic-visual-only`, and `--mosaic` falling back to it; the summary printed says the RGB
   mosaic was laid out by its own frames (frames used, alignment, heights, misalignment).
 - The README and the changelog.
+
+**Done (2026-11-03)** as designed, on `rgb-mosaic-trial`: `api.py` (`MosaicOptions.visual_only`, `_visual_only`,
+`_read_visual`, `_write_visual`), `cli.py` (`--mosaic-visual-only`, `_print_visual_alone`), `mosaic.py` (`lens_k1`),
+the README and the changelog. On `m4t-rgb`, `process --mosaic` makes it in 7 minutes, with the S1 figures (0.3 cm
+median, 1.2 cm p90). Tests in `tests/test_visual.py`: the automatic case, `visual_only`'s height cells, the refused
+options, k1 through `read_frame_models`, and the command line's two cases. The progress steps start again at 1 when
+the RGB-only mosaic follows the thermal frames' reading (the automatic case).
 
 The analyzer's side (RGB-only flights, a dataset without temperatures, the viewer and compare page) is to be planned in
 dji-thermal-ui's own `upcoming-changes.md` once this is released.
