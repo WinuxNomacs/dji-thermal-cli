@@ -41,6 +41,7 @@ OFFSET_MIN_PEAK = 0.05          # weakest phase-correlation peak trusted (edges 
 STRIP_ROWS = 256                # mosaic rows composited at once
 PREVIEW_PX = 2048               # the preview's longer side, at most
 WORK_PX = 1280                  # widest a visual frame is decoded to lay out a flight of its own (build_alone)
+ALONE_HEIGHT_CELL_PX = 32       # build_alone's height cell, in work pixels: half the thermal mosaics' (see build_alone)
 BANDS = ("red", "green", "blue", "alpha")
 _NO_VALUES = np.zeros((0, 0), np.float32)
 _CAPTURE = re.compile(r"_(\d{4,})_[A-Z]+\.[^./]+$", re.IGNORECASE)
@@ -182,7 +183,7 @@ def build(thermal: mosaic.Mosaic, visual: list[VisualFrame], gsd: float | None =
 
 def build_alone(visual: list[VisualFrame], gsd: float | None = None,
                 max_pitch: float = mosaic.DEFAULT_MAX_PITCH, progress: Callable[..., None] | None = None,
-                jobs: int = 1, heights: str = "auto", height_cell: int = mosaic.HEIGHT_CELL_PX,
+                jobs: int = 1, heights: str = "auto", height_cell: int = ALONE_HEIGHT_CELL_PX,
                 check_misalignment: bool = True, work_px: int = WORK_PX, distortion: bool = True,
                 rangefinder_prior: bool = True) -> VisualMosaic:
     """The visual mosaic of a flight without thermal frames (an RGB flight): the frames laid
@@ -193,7 +194,11 @@ def build_alone(visual: list[VisualFrame], gsd: float | None = None,
     progress: as mosaic.build's "align" and "check" stages, then "visual_frames" (frames
     decoded for alignment) first and "visual_composite" last. distortion, rangefinder_prior: as
     mosaic._align's: the wide camera's distortion estimated, and the ground the images hardly see
-    pulled toward the rangefinder's heights nearby."""
+    pulled toward the rangefinder's heights nearby. The height cells are half as wide as the
+    thermal mosaics' by default: an RGB flight's frames overlap enough to estimate them, and a
+    roof's edge, which a cell spreads over its width, smears the ground beside it less (on the
+    M4T's wide camera at 21 m, cells of 0.7 m instead of 1.4 m: the frames' misalignment 4 to 3 mm
+    median, 17 to 12 mm p90). A flight with little overlap may do better with height_cell=64."""
     steep = [v for v in visual if v.pose.pitch <= max_pitch]
     if not steep:
         raise ValueError(f"no visual frame is pitched at or below {max_pitch:g} degrees")

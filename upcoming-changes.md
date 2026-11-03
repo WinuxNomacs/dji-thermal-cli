@@ -8,13 +8,12 @@ The order of work, top first. Each phase is planned with the user before it is b
 sections below.
 
 **Up next**:
-1. **S1, the eave smear:** RGB-only mosaics smear where the surface drops several metres within one height cell.
+1. **V1, RGB-only mosaics as a feature:** `visual.build_alone` reachable from the API and the command line.
 
 **Then**:
-2. **V1, RGB-only mosaics as a feature:** `visual.build_alone` reachable from the API and the command line.
-3. **The release** of P1, S1 and V1.
+2. **The release** of P1, S1 and V1.
 
-**Done:** P1 (performance, 2026-11-03).
+**Done:** P1 (performance, 2026-11-03), S1 (the eave smear, 2026-11-03: finer height cells for RGB-only mosaics).
 
 All of it is built on the branch `rgb-mosaic-trial` (decided 2026-11-03), which already holds the trial:
 `visual.build_alone` (d753692), and the lens distortion and rangefinder prior (8e5acef), both off unless asked for, so
@@ -82,8 +81,11 @@ moving more than a fraction of a thermal pixel. The same holds for RGB-only mosa
 The mosaics are identical to the pixel on both test flights. Thermal went from 96 s to 35 s, and an RGB matching
 round from 109 s to 28 s, on 8 workers; the laptop's timings vary by up to 2× under a long load. Tests:
 `test_build_in_several_processes_gives_the_same_mosaic` and `test_a_daemonic_process_matches_the_overlaps_itself` in
-`tests/test_mosaic.py`. Still to check before the release: the worker processes on Windows and macOS (spawn, shared
-memory).
+`tests/test_mosaic.py`. Still to check before the release:
+- the worker processes on Windows and macOS (spawn, shared memory);
+- a script calling the library without `if __name__ == "__main__":` now fails when it builds a mosaic with jobs > 1:
+  the workers (forkserver on Linux since Python 3.14, spawn on Windows and macOS) import it again. The changelog
+  should say so, or the library fall back to this process when the workers can't start.
 
 **Tried and dropped:**
 - the RGB composite in processes, by bands of rows: 39 s against 30 s with threads, since each band decodes its frames
@@ -99,7 +101,7 @@ memory).
   by a median of 0.39 px and 6 px at the 99th percentile.
 - The composite's remaining cost is projecting every full-size pixel; a coarse grid interpolated would cut it.
 
-## S1: the eave smear
+## S1: the eave smear (done)
 
 At the house's eave the surface drops about 5 m within one 1.4 m height cell, and the RGB-only mosaic smears there.
 
@@ -134,6 +136,18 @@ fix it.
 - What a height sweep showed: on open ground and on the roof the frames agree best at the right height (lawn −5.4 m,
   as now; roof 2.4 m); beside walls and in tall plants they don't, and the cells around a step are often too blurred
   to hold the step's true heights. The 4 × 4 test flags 36–70% of the mosaic as steps.
+
+**Done (2026-11-03), the user's option 1:** `build_alone` estimates its heights on cells of 32 work pixels
+(`visual.ALONE_HEIGHT_CELL_PX`), half the thermal mosaics' 64; thermal mosaics and the Visual tab's are unchanged, and
+`height_cell` still sets it.
+- On `m4t-rgb` (cells 1.41 → 0.70 m): the band bent beside the eave about half as wide, the patio's paving nearly
+  straight; the garage, tree and roof-ridge crops no worse (the tree's and ridge's seams gone). Cells seen by two
+  frames 380 → 1213; the frames' misalignment 4 → 3 mm median, 17 → 12 mm p90; rangefinder misfit 0.262 → 0.240 m.
+- On synthetic flights the gain depends on overlap: with 36 frames the frames agree better (16 → 12 mm median), with
+  9 slightly worse; a box's edge isn't sharper on either. So the smear is smaller, not gone: placing the steps
+  themselves needs dense reconstruction near them (option 2: many heights per pixel), beyond the time agreed.
+- Test: `test_a_flight_of_its_own_estimates_its_heights_on_cells_half_the_thermal_mosaics` (`tests/test_visual.py`).
+- The first attempt stays on `s1-steps-wip`, unmerged.
 
 ## V1: RGB-only mosaics as a feature
 

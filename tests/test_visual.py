@@ -177,6 +177,17 @@ def test_a_wide_lens_distortion_is_found_and_corrected(flight, tmp_path):
     assert vm.report["misalignment"]["median_m"] < plain.report["misalignment"]["median_m"]
 
 
+def test_a_flight_of_its_own_estimates_its_heights_on_cells_half_the_thermal_mosaics(flight, tmp_path):
+    """build_alone's height cells are ALONE_HEIGHT_CELL_PX work pixels wide, half the thermal
+    mosaics' unless asked otherwise."""
+    thermal, _, _ = flight
+    frames = [_visual_frame(tmp_path / f"f{i}_V.png", f, offset_deg=(0.0, 0.0)) for i, f in enumerate(thermal)]
+    fine = visual.build_alone(frames, check_misalignment=False)
+    coarse = visual.build_alone(frames, check_misalignment=False, height_cell=mosaic.HEIGHT_CELL_PX)
+    assert visual.ALONE_HEIGHT_CELL_PX == mosaic.HEIGHT_CELL_PX // 2
+    assert fine.report["heights"]["cell_m"] == pytest.approx(coarse.report["heights"]["cell_m"] / 2, rel=0.01)
+
+
 def test_without_distortion_frames_are_projected_as_before(flight):
     """k1 = 0 (the thermal mosaics') leaves the projection as the pinhole's, to the bit."""
     _, m, _ = flight
