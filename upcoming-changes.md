@@ -8,12 +8,13 @@ The order of work, top first. Each phase is planned with the user before it is b
 sections below.
 
 **Up next**:
-1. **P1, performance:** the mosaic pipeline faster, accuracy held by a fixed benchmark.
+1. **S1, the eave smear:** RGB-only mosaics smear where the surface drops several metres within one height cell.
 
 **Then**:
-2. **S1, the eave smear:** RGB-only mosaics smear where the surface drops several metres within one height cell.
-3. **V1, RGB-only mosaics as a feature:** `visual.build_alone` reachable from the API and the command line.
-4. **The release** of P1, S1 and V1.
+2. **V1, RGB-only mosaics as a feature:** `visual.build_alone` reachable from the API and the command line.
+3. **The release** of P1, S1 and V1.
+
+**Done:** P1 (performance, 2026-11-03).
 
 All of it is built on the branch `rgb-mosaic-trial` (decided 2026-11-03), which already holds the trial:
 `visual.build_alone` (d753692), and the lens distortion and rangefinder prior (8e5acef), both off unless asked for, so
@@ -36,7 +37,7 @@ saw the trial's mosaics and decided they become a feature.
 - **Not WebODM's DSM:** the user doesn't want to depend on it, as it is specific to WebODM.
 - **Tests:** six in `tests/test_visual.py`.
 
-## P1: performance
+## P1: performance (done)
 
 Requested 2026-11-03, before S1: S1 needs many full runs, and its fix will likely add work.
 
@@ -72,32 +73,36 @@ numpy only, no new dependency.
 settings; tier 3 may change thermal mosaics within a tolerance: the frames agreeing no worse, and no mosaic pixel
 moving more than a fraction of a thermal pixel. The same holds for RGB-only mosaics, in their own pixels.
 
-**Progress (2026-11-03):**
-- **Tier 2 built** (8f2213d, ca5f6d8), the mosaics identical to the pixel on both test flights:
-  - pairs matched in worker processes, 8 blocks at a time;
-  - heights interpolated without BLAS;
-  - glibc keeping freed memory in the workers.
-  
-  The thermal mosaic went from 96 s to 35 s, and an RGB matching round from 109 s to 28 s, on 8 workers. The
-  laptop's timings vary by up to 2× under a long load, so whole RGB runs aren't comparable yet.
-- **Tried and dropped:**
-  - the RGB composite in processes, by bands of rows: 39 s against 30 s with threads, since each band decodes its
-    frames again;
-  - glibc's settings in the calling process: no gain for the composite.
-- **Tier 3 is waiting on the tolerance.** Today's alignment, with its blocks only shifted by 16 or 32 px, moves
-  mosaic content by a median of 0.5 thermal pixels and 6 at the 99th percentile. That is the method's own spread,
-  so no result-changing step can keep every pixel within a fraction of a pixel.
-  
-  Proposed instead: frames agreeing no worse, held-out rangefinder error no worse, and content moving less than
-  that spread. Sparse early rounds (a quarter of the blocks before the last round) take thermal from 96 s to 24 s
-  and move content by a median of 0.39 px and 6 px at the 99th percentile. They're kept as a patch until this is
-  decided.
-- **Next tier 3 candidate:** the composite's and renders' projection computed on a coarse grid and interpolated.
+**Done (2026-11-03), tier 2 only:** 8f2213d and ca5f6d8 on `rgb-mosaic-trial`, in `mosaic.py`:
+- pairs matched in worker processes (`_match_in_processes`: the frames in shared memory, each rendered once), 8
+  blocks at a time (`MATCH_BATCH`), and in this process when it is daemonic or jobs is 1;
+- `Heights.at` interpolating without BLAS;
+- glibc keeping freed memory in the workers (`_keep_freed_memory`).
+
+The mosaics are identical to the pixel on both test flights. Thermal went from 96 s to 35 s, and an RGB matching
+round from 109 s to 28 s, on 8 workers; the laptop's timings vary by up to 2× under a long load. Tests:
+`test_build_in_several_processes_gives_the_same_mosaic` and `test_a_daemonic_process_matches_the_overlaps_itself` in
+`tests/test_mosaic.py`. Still to check before the release: the worker processes on Windows and macOS (spawn, shared
+memory).
+
+**Tried and dropped:**
+- the RGB composite in processes, by bands of rows: 39 s against 30 s with threads, since each band decodes its frames
+  again;
+- glibc's settings in the calling process: no gain for the composite.
+
+**Tier 3 not built:** the user found the speed enough for now (2026-11-03). What was learnt, in case it comes back:
+- Today's alignment, with its blocks only shifted by 16 or 32 px, moves mosaic content by a median of 0.5 thermal
+  pixels and 6 at the 99th percentile. That is the method's own spread, so no result-changing step can keep every
+  pixel within a fraction of a pixel. A tolerance would need to be restated as: frames agreeing no worse, held-out
+  rangefinder error no worse, content moving less than that spread.
+- Sparse early rounds (a quarter of the blocks before the last round) took thermal from 96 s to 24 s, moving content
+  by a median of 0.39 px and 6 px at the 99th percentile.
+- The composite's remaining cost is projecting every full-size pixel; a coarse grid interpolated would cut it.
 
 ## S1: the eave smear
 
 At the house's eave the surface drops about 5 m within one 1.4 m height cell, and the RGB-only mosaic smears there.
-To be planned after P1.
+To be planned next.
 
 ## V1: RGB-only mosaics as a feature
 
