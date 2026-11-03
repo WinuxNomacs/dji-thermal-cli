@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import types
 
 import numpy as np
 import pytest
@@ -707,13 +708,27 @@ def test_build_without_alignment_reports_no_align_stage(synthetic):
     assert list(dict.fromkeys(stages)) == ["composite", "check"]
 
 
-def test_build_in_several_threads_gives_the_same_mosaic(synthetic):
+def test_build_in_several_processes_gives_the_same_mosaic(synthetic):
     frames, _ = synthetic
     one = mosaic.build(frames, jobs=1)
     four = mosaic.build(frames, jobs=4)
     np.testing.assert_array_equal(one.temperature, four.temperature)
     assert one.report == four.report
 
+
+def test_a_daemonic_process_matches_the_overlaps_itself(synthetic, monkeypatch):
+    """A daemonic process (a Celery worker's) can't start processes: it matches them in its own."""
+    frames, _ = synthetic
+    one = mosaic.build(frames, jobs=1)
+
+    def no_processes(*a, **k):
+        raise AssertionError("a process pool was started")
+
+    monkeypatch.setattr(mosaic, "ProcessPoolExecutor", no_processes)
+    monkeypatch.setattr(mosaic.multiprocessing, "current_process", lambda: types.SimpleNamespace(daemon=True))
+    four = mosaic.build(frames, jobs=4)
+    np.testing.assert_array_equal(one.temperature, four.temperature)
+    assert one.report == four.report
 
 
 def test_build_both_gives_the_normalized_and_the_as_converted_mosaic_from_one_layout(synthetic):

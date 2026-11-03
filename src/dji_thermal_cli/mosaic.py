@@ -27,10 +27,10 @@ import functools
 import io
 import json
 import math
-import threading
+import multiprocessing
 import warnings
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -42,6 +42,7 @@ from . import djixmp, files, geo, tiffin, tiffout, tsdk, units
 FULL_FRAME_DIAGONAL_MM = math.hypot(36.0, 24.0)
 DEFAULT_MAX_PITCH = -80.0
 HEIGHT_CELL_PX = 64             # the cell of the surface heights (see _align), in mosaic pixels
+MATCH_BATCH = 8                 # blocks phase-correlated at once (see _match_pair)
 
 # Thermal sensors by EXIF Model: (native width in pixels, pixel pitch in mm), from DJI's spec
 # pages (enterprise.dji.com/<product>/specs; XT S: its spec sheet). Super-resolution images
@@ -280,17 +281,16 @@ class Heights:
         i0 = np.minimum(np.floor(f), max(count - 2, 0)).astype(np.intp)
         return i0, f - i0 if count > 1 else np.zeros_like(f)
 
-    def _matrix(self, coord: np.ndarray, axis: int) -> np.ndarray:
-        i0, w = self._weights(coord, axis)
-        m = np.zeros((coord.size, self.z.shape[axis]))
-        at = np.arange(coord.size)
-        m[at, i0] = 1 - w
-        m[at, np.minimum(i0 + 1, self.z.shape[axis] - 1)] += w
-        return m
-
     def at(self, e: np.ndarray, n: np.ndarray) -> np.ndarray:
-        """The heights at every (n[i], e[j]) for 1-D e and n: an (n.size, e.size) array."""
-        return self._matrix(n, 0) @ self.z @ self._matrix(e, 1).T
+        """The heights at every (n[i], e[j]) for 1-D e and n: an (n.size, e.size) array. (Interpolated
+        directly rather than as a product of matrices: BLAS's threads, left spinning between the calls
+        of the frames' renders and composite, slowed the work around them.)"""
+        i0, wi = self._weights(n, 0)
+        j0, wj = self._weights(e, 1)
+        rows, cols = self.z.shape
+        i1, j1 = np.minimum(i0 + 1, rows - 1), np.minimum(j0 + 1, cols - 1)
+        zn = self.z[i0] * (1 - wi)[:, None] + self.z[i1] * wi[:, None]
+        return zn[:, j0] * (1 - wj) + zn[:, j1] * wj
 
     def point_weights(self, e: np.ndarray, n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """For points (e[k], n[k]): the 4 cells (flat indices) their height interpolates and the
@@ -941,15 +941,8 @@ def _phase_shift(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
     return dy, dx, peak
 
 
-def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_peak: float = 0.1,
-                    report: Callable[[int, int], None] | None = None, jobs: int = 1) -> np.ndarray:
-    """Misalignment between overlapping frames, in blocks (half-overlapping) fully covered by
-    both frames of a pair. Rows: (a, b, block centre E, N, shift E, N), the shift being where
-    frame b shows the block's content relative to frame a, in metres. report(done, total):
-    the overlapping pairs measured, counted by the overlap area each samples so that the
-    count moves evenly. jobs: threads matching pairs at once (numpy's FFTs and array work
-    release the GIL); the result is the same for any number."""
-    step = block // 2
+def _overlaps(placed: list[_Placed], grid: Grid, block: int) -> list[tuple[int, int, slice, slice]]:
+    """The pairs of frames whose windows overlap by at least a block each way: (a, b, rows, cols)."""
     windows = [_window(pl, grid) for pl in placed]
     overlaps = []
     for a in range(len(placed)):
@@ -959,90 +952,195 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
             cols = slice(max(ca.start, cb.start), min(ca.stop, cb.stop))
             if rows.stop - rows.start >= block and cols.stop - cols.start >= block:
                 overlaps.append((a, b, rows, cols))
+    return overlaps
+
+
+def _render(pl: _Placed, grid: Grid):
+    """A frame rendered over its window as blocks are matched on: the gradient magnitude of its
+    bilinear sampling, and where it is valid."""
+    wr, wc = _window(pl, grid)
+    t, _, valid = _sample(pl, grid, wr, wc, bilinear=True)
+    gy, gx = np.gradient(t.astype(np.float64))
+    return np.sqrt(gy * gy + gx * gx), valid
+
+
+def _match_pair(pair, ga, va, gb, vb, grid: Grid, block: int, min_peak: float):
+    """One overlapping pair's blocks matched (see _measure_blocks), from both frames' renders cut to
+    the overlap; None when no block is fully covered by both."""
+    a, b, rows, cols = pair
+    step = block // 2
+    both = va & vb
+    # blocks fully covered by both frames, from a summed-area table of the uncovered pixels
+    gaps = np.zeros((both.shape[0] + 1, both.shape[1] + 1), np.int64)
+    gaps[1:, 1:] = (~both).cumsum(0).cumsum(1)
+    ys = np.arange(0, both.shape[0] - block + 1, step)
+    xs = np.arange(0, both.shape[1] - block + 1, step)
+    y, x = (g.ravel() for g in np.meshgrid(ys, xs, indexing="ij"))
+    full = (gaps[y + block, x + block] - gaps[y, x + block] - gaps[y + block, x] + gaps[y, x]) == 0
+    y, x = y[full], x[full]
+    if not y.size:
+        return None
+    win = np.lib.stride_tricks.sliding_window_view
+    wa, wb = win(ga, (block, block)), win(gb, (block, block))
+    # a few blocks at a time, which stay in the processor's cache (the result is the same)
+    dy, dx, peak = (np.concatenate(r) for r in zip(*(_phase_shift(wa[y[i:i + MATCH_BATCH], x[i:i + MATCH_BATCH]],
+                                                                  wb[y[i:i + MATCH_BATCH], x[i:i + MATCH_BATCH]])
+                                                     for i in range(0, y.size, MATCH_BATCH))))
+    keep = peak >= min_peak
+    e = grid.e0 + (cols.start + x[keep] + block / 2) * grid.gsd
+    n = grid.n0 - (rows.start + y[keep] + block / 2) * grid.gsd
+    return np.column_stack([np.full(e.size, a), np.full(e.size, b), e, n,
+                            dx[keep] * grid.gsd, -dy[keep] * grid.gsd])
+
+
+def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_peak: float = 0.1,
+                    report: Callable[[int, int], None] | None = None, jobs: int = 1) -> np.ndarray:
+    """Misalignment between overlapping frames, in blocks (half-overlapping) fully covered by
+    both frames of a pair. Rows: (a, b, block centre E, N, shift E, N), the shift being where
+    frame b shows the block's content relative to frame a, in metres. report(done, total):
+    the overlapping pairs measured, counted by the overlap area each samples so that the
+    count moves evenly. jobs: worker processes rendering the frames and matching the pairs
+    (numpy's FFTs on blocks this small hold the GIL, so threads barely help); in a daemonic
+    process, which can't start processes, or with 1, they're matched in this one. The result
+    is the same for any number."""
+    overlaps = _overlaps(placed, grid, block)
     area = sum((r.stop - r.start) * (c.stop - c.start) for _, _, r, c in overlaps)
-    # each frame is rendered once, over its window, by the first pair that needs it, as the
-    # gradient magnitude that blocks are matched on, and its pairs' overlaps are cut from that;
-    # a render is dropped once all its pairs are measured
-    uses = {}
-    for a, b, _, _ in overlaps:
-        uses[a] = uses.get(a, 0) + 1
-        uses[b] = uses.get(b, 0) + 1
-    renders, lock = {}, threading.Lock()
-
-    def render(k):
-        with lock:
-            fut = renders.get(k)
-            mine = fut is None
-            if mine:
-                fut = renders[k] = Future()
-        if mine:
-            wr, wc = windows[k]
-            try:
-                t, _, valid = _sample(placed[k], grid, wr, wc, bilinear=True)
-                gy, gx = np.gradient(t.astype(np.float64))
-                fut.set_result((wr.start, wc.start, np.sqrt(gy * gy + gx * gx), valid))
-            except BaseException as e:
-                fut.set_exception(e)
-        return fut.result()
-
-    def release(k):
-        with lock:
-            uses[k] -= 1
-            if not uses[k]:
-                del renders[k]
-
-    def cut(k, rows, cols):
-        r0, c0, g, valid = render(k)
-        rs, cs = slice(rows.start - r0, rows.stop - r0), slice(cols.start - c0, cols.stop - c0)
-        return g[rs, cs], valid[rs, cs]
-
-    def measure(pair):
-        a, b, rows, cols = pair
-        try:
-            ga, va = cut(a, rows, cols)
-            gb, vb = cut(b, rows, cols)
-        finally:
-            release(a)
-            release(b)
-        both = va & vb
-        # blocks fully covered by both frames, from a summed-area table of the uncovered pixels
-        gaps = np.zeros((both.shape[0] + 1, both.shape[1] + 1), np.int64)
-        gaps[1:, 1:] = (~both).cumsum(0).cumsum(1)
-        ys = np.arange(0, both.shape[0] - block + 1, step)
-        xs = np.arange(0, both.shape[1] - block + 1, step)
-        y, x = (g.ravel() for g in np.meshgrid(ys, xs, indexing="ij"))
-        full = (gaps[y + block, x + block] - gaps[y, x + block] - gaps[y + block, x] + gaps[y, x]) == 0
-        y, x = y[full], x[full]
-        if not y.size:
-            return None
-        win = np.lib.stride_tricks.sliding_window_view
-        dy, dx, peak = _phase_shift(win(ga, (block, block))[y, x], win(gb, (block, block))[y, x])
-        keep = peak >= min_peak
-        e = grid.e0 + (cols.start + x[keep] + block / 2) * grid.gsd
-        n = grid.n0 - (rows.start + y[keep] + block / 2) * grid.gsd
-        return np.column_stack([np.full(e.size, a), np.full(e.size, b), e, n,
-                                dx[keep] * grid.gsd, -dy[keep] * grid.gsd])
-
     obs, sampled, done = [], 0, 0
     if report:
         report(0, len(overlaps))
     jobs = max(1, min(jobs, len(overlaps)))
-    pool = ThreadPoolExecutor(jobs) if jobs > 1 else None
-    try:
-        # the workers take the pairs in order, so renders live about as long as measured one by one
-        results = pool.map(measure, overlaps) if pool else map(measure, overlaps)
-        for (_, _, rows, cols), m in zip(overlaps, results):
-            if m is not None:
-                obs.append(m)
-            if report:
-                sampled += (rows.stop - rows.start) * (cols.stop - cols.start)
-                if (now := len(overlaps) * sampled // area) != done:
-                    done = now
-                    report(done, len(overlaps))
-    finally:
-        if pool:
-            pool.shutdown(cancel_futures=True)
+    if jobs > 1 and not multiprocessing.current_process().daemon:
+        results = _match_in_processes(placed, grid, overlaps, block, min_peak, jobs)
+    else:
+        results = _match_here(placed, grid, overlaps, block, min_peak)
+    for pair, m in zip(overlaps, results):
+        _, _, rows, cols = pair
+        if m is not None:
+            obs.append(m)
+        if report:
+            sampled += (rows.stop - rows.start) * (cols.stop - cols.start)
+            if (now := len(overlaps) * sampled // area) != done:
+                done = now
+                report(done, len(overlaps))
     return np.concatenate(obs).astype(np.float64) if obs else np.zeros((0, 6))
+
+
+def _match_here(placed, grid, overlaps, block, min_peak):
+    """The pairs matched one by one in this process, yielding each's result. Each frame is
+    rendered by the first pair that needs it, and dropped once all its pairs are measured."""
+    windows = [_window(pl, grid) for pl in placed]
+    uses = {}
+    for a, b, _, _ in overlaps:
+        uses[a] = uses.get(a, 0) + 1
+        uses[b] = uses.get(b, 0) + 1
+    renders = {}
+
+    def cut(k, rows, cols):
+        if k not in renders:
+            renders[k] = _render(placed[k], grid)
+        g, valid = renders[k]
+        r0, c0 = windows[k][0].start, windows[k][1].start
+        rs, cs = slice(rows.start - r0, rows.stop - r0), slice(cols.start - c0, cols.stop - c0)
+        uses[k] -= 1
+        if not uses[k]:
+            del renders[k]
+        return g[rs, cs], valid[rs, cs]
+
+    for pair in overlaps:
+        a, b, rows, cols = pair
+        ga, va = cut(a, rows, cols)
+        gb, vb = cut(b, rows, cols)
+        yield _match_pair(pair, ga, va, gb, vb, grid, block, min_peak)
+
+
+# Matching in worker processes: the frames' pixels go to the workers in shared memory, the workers render
+# each frame once into shared memory, then match the pairs in chunks from those renders.
+_WORKER: dict = {}
+
+
+def _shared(nbytes: int):
+    from multiprocessing import shared_memory
+    return shared_memory.SharedMemory(create=True, size=max(nbytes, 1))
+
+
+def _views(buf, layout):
+    """The arrays laid out in a shared buffer: layout is [(offset, shape, dtype)], None for a gap."""
+    return [None if spec is None else np.ndarray(spec[1], spec[2], buffer=buf, offset=spec[0]) for spec in layout]
+
+
+def _lay_out(arrays_spec):
+    """Byte offsets (8-aligned) for [(shape, dtype) or None]: ([(offset, shape, dtype) or None], total bytes)."""
+    layout, at = [], 0
+    for spec in arrays_spec:
+        if spec is None:
+            layout.append(None)
+            continue
+        shape, dtype = spec
+        layout.append((at, shape, np.dtype(dtype).str))
+        at += -(-int(np.prod(shape)) * np.dtype(dtype).itemsize // 8) * 8
+    return layout, at
+
+
+def _worker_start(names, layouts, placed, grid):
+    from multiprocessing import shared_memory
+    shms = [shared_memory.SharedMemory(name=n) for n in names]
+    pixels, grads, valids = (_views(shm.buf, lay) for shm, lay in zip(shms, layouts))
+    _WORKER.update(shms=shms, grads=grads, valids=valids, grid=grid, placed=[
+        None if px is None else dataclasses.replace(pl, frame=dataclasses.replace(pl.frame, temperature=px))
+        for pl, px in zip(placed, pixels)])
+
+
+def _worker_render(k):
+    g, valid = _render(_WORKER["placed"][k], _WORKER["grid"])
+    _WORKER["grads"][k][...] = g
+    _WORKER["valids"][k][...] = valid
+
+
+def _worker_match(chunk, block, min_peak):
+    grid, placed, grads, valids = _WORKER["grid"], _WORKER["placed"], _WORKER["grads"], _WORKER["valids"]
+    out = []
+    for pair in chunk:
+        a, b, rows, cols = pair
+        cuts = []
+        for k in (a, b):
+            wr, wc = _window(placed[k], grid)
+            rs, cs = slice(rows.start - wr.start, rows.stop - wr.start), slice(cols.start - wc.start, cols.stop - wc.start)
+            cuts += [grads[k][rs, cs], valids[k][rs, cs]]
+        out.append(_match_pair(pair, *cuts, grid, block, min_peak))
+    return out
+
+
+def _match_in_processes(placed, grid, overlaps, block, min_peak, jobs):
+    """The pairs matched in jobs worker processes, yielding each's result in order."""
+    used = sorted({k for a, b, _, _ in overlaps for k in (a, b)})
+    is_used = set(used)
+    windows = [_window(pl, grid) for pl in placed]
+    shapes = [(w.stop - w.start, c.stop - c.start) for w, c in windows]
+    px_layout, px_bytes = _lay_out([(pl.frame.temperature.shape, pl.frame.temperature.dtype) if k in is_used else None
+                                    for k, pl in enumerate(placed)])
+    g_layout, g_bytes = _lay_out([(shapes[k], np.float64) if k in is_used else None for k in range(len(placed))])
+    v_layout, v_bytes = _lay_out([(shapes[k], np.bool_) if k in is_used else None for k in range(len(placed))])
+    shms = []
+    try:
+        for nbytes in (px_bytes, g_bytes, v_bytes):
+            shms.append(_shared(nbytes))
+        for view, pl in zip(_views(shms[0].buf, px_layout), placed):
+            if view is not None:
+                view[...] = pl.frame.temperature
+        bare = [dataclasses.replace(pl, frame=dataclasses.replace(pl.frame, temperature=None)) for pl in placed]
+        # chunks of consecutive pairs of about equal overlap area, a few per worker so that they even out
+        sizes = np.array([(r.stop - r.start) * (c.stop - c.start) for _, _, r, c in overlaps], float)
+        bounds = np.searchsorted(np.cumsum(sizes), np.linspace(0, sizes.sum(), 4 * jobs + 1)[1:-1])
+        chunks = [list(c) for c in np.array_split(np.array(overlaps, dtype=object), bounds) if len(c)]
+        with ProcessPoolExecutor(jobs, initializer=_worker_start,
+                                 initargs=([s.name for s in shms], [px_layout, g_layout, v_layout], bare, grid)) as pool:
+            list(pool.map(_worker_render, used))
+            for results in pool.map(_worker_match, chunks, *zip(*[(block, min_peak)] * len(chunks))):
+                yield from results
+    finally:
+        for shm in shms:
+            shm.close()
+            shm.unlink()
 
 
 def _summary(obs: np.ndarray, grid: Grid) -> dict:
