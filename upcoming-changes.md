@@ -72,6 +72,28 @@ numpy only, no new dependency.
 settings; tier 3 may change thermal mosaics within a tolerance: the frames agreeing no worse, and no mosaic pixel
 moving more than a fraction of a thermal pixel. The same holds for RGB-only mosaics, in their own pixels.
 
+**Progress (2026-11-03):**
+- **Tier 2 built** (8f2213d, ca5f6d8), the mosaics identical to the pixel on both test flights:
+  - pairs matched in worker processes, 8 blocks at a time;
+  - heights interpolated without BLAS;
+  - glibc keeping freed memory in the workers.
+  
+  The thermal mosaic went from 96 s to 35 s, and an RGB matching round from 109 s to 28 s, on 8 workers. The
+  laptop's timings vary by up to 2× under a long load, so whole RGB runs aren't comparable yet.
+- **Tried and dropped:**
+  - the RGB composite in processes, by bands of rows: 39 s against 30 s with threads, since each band decodes its
+    frames again;
+  - glibc's settings in the calling process: no gain for the composite.
+- **Tier 3 is waiting on the tolerance.** Today's alignment, with its blocks only shifted by 16 or 32 px, moves
+  mosaic content by a median of 0.5 thermal pixels and 6 at the 99th percentile. That is the method's own spread,
+  so no result-changing step can keep every pixel within a fraction of a pixel.
+  
+  Proposed instead: frames agreeing no worse, held-out rangefinder error no worse, and content moving less than
+  that spread. Sparse early rounds (a quarter of the blocks before the last round) take thermal from 96 s to 24 s
+  and move content by a median of 0.39 px and 6 px at the 99th percentile. They're kept as a patch until this is
+  decided.
+- **Next tier 3 candidate:** the composite's and renders' projection computed on a coarse grid and interpolated.
+
 ## S1: the eave smear
 
 At the house's eave the surface drops about 5 m within one 1.4 m height cell, and the RGB-only mosaic smears there.
