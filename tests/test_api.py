@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -191,6 +193,30 @@ def test_jobs_in_a_daemonic_process_run_in_that_process():
     worker.join(60)
     assert worker.exitcode == 0
     assert set(pids) == {worker.pid}
+
+
+_SCRIPT = """
+import multiprocessing, os
+from dji_thermal_cli import api
+multiprocessing.set_start_method("spawn", force=True)
+with open("runs.txt", "a") as f:
+    f.write("run\\n")
+{call}
+"""
+_CALL = "print(sorted((ok, r == os.getpid()) for _, ok, r in api._run_all(os.getpid, [()] * 4, 4)))"
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+def test_a_script_without_the_main_guard_runs_the_jobs_in_its_own_process(tmp_path, guarded):
+    """Spawned workers (Windows, macOS) import the script again: without
+    `if __name__ == "__main__":` they would run it again, so its jobs run in its own process."""
+    call = f'if __name__ == "__main__":\n    {_CALL}' if guarded else _CALL
+    (tmp_path / "script.py").write_text(_SCRIPT.format(call=call))
+    proc = subprocess.run([sys.executable, "script.py"], cwd=tmp_path, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str([(True, not guarded)] * 4)
+    assert ((tmp_path / "runs.txt").read_text() == "run\n") != guarded   # the workers import it, guarded or not
+    assert ("RuntimeWarning" in proc.stderr and "__main__" in proc.stderr) != guarded
 
 
 def test_missing_path(tmp_path):

@@ -343,6 +343,43 @@ visual frames by 10 cm (median), and the pairs then agree to 2.6 cm (median, 4.5
 With `--mosaic-normalize` and the as-converted mosaic (the Python API's
 `as_converted_dir`), the visual mosaic is written once, in the output directory.
 
+### Visual mosaic on its own (RGB-only flights)
+
+A flight of visual (RGB) images alone, with no thermal frames, is mosaicked by `--mosaic`
+on its own: the visual frames are laid out by their own overlaps, as the thermal mosaic's
+frames are, and composited at their full detail. `--mosaic-visual-only` does the same on a
+flight that has thermal frames too, in place of the thermal mosaic:
+
+```
+dji-thermal-cli process --input-dir /path/to/rgb-flight --output-dir out --mosaic
+dji-thermal-cli process --input-dir /path/to/flight --output-dir out --mosaic-visual-only
+```
+
+It writes the visual mosaic's three files (above) and no thermal mosaic; the sidecar's
+report says `"laid_out": "by the visual frames' own overlaps"`, with the alignment, heights
+and misalignment as the thermal mosaic's report has them.
+
+- **Laying out:** the frames steeper than `--mosaic-max-pitch` are decoded at most 1280 px
+  wide, aligned on their brightness (the boresight, each frame's shift and rotation), with
+  the surface's heights (`--mosaic-heights`), then composited at full size, one frame per
+  pixel as above.
+- **Lens distortion:** one radial distortion (k1) for every frame, estimated with the
+  boresight (about 0.047 on the M4T's wide camera); each frame model has it as `lens_k1`,
+  so `read_frame_models` finds a point at the right pixel.
+- **Heights:** where the frames see the ground only a little, it is pulled toward the
+  median of the 5 nearest rangefinder heights, not toward the ground plane. The height
+  cells are 32 of the alignment's pixels (`--mosaic-height-cell`; 64 in a thermal mosaic):
+  a roof's edge, which a cell spreads over its width, then smears the ground beside it less.
+  A flight with little overlap may do better with 64.
+- **Pixel size:** the frames' own ground sample distance, or `--mosaic-visual-gsd`.
+- The thermal mosaic's other options (units, palette, `--mosaic-normalize`, `--mosaic-gsd`)
+  don't apply; `--mosaic-dsm`, `--alignment` and `--no-mosaic-align` can't be used with it.
+
+On a 327-image M4T flight at 21 m (151 nadir frames, no thermal ones), the mosaic is
+5305×5811 px at 0.6 cm/px, 74 MB, made in about 7 minutes on 8 workers. The frames then
+agree to 0.3 cm (median, 1.2 cm p90; 47 cm before the alignment), and the height cells are
+70 cm wide.
+
 ## Supported cameras
 
 | Camera | R-JPEG format |
@@ -510,7 +547,7 @@ rangefinder reading in its `lrf_m` column.
 Files are processed in parallel by a pool of worker processes (`--jobs N`, default
 `min(CPU count, 8)`; `--jobs 1` runs them one at a time in the same process, as does a daemonic process such as
 a Celery worker's, which cannot start processes of its own); a mosaic
-matches its frames' overlaps in as many threads. Files that
+matches its frames' overlaps in as many worker processes. Files that
 can't be converted are listed as `[skip, <reason>]` and the rest of the batch continues.
 
 Run `dji-thermal-cli process --help` / `... list --help` for the full
@@ -613,6 +650,12 @@ data = dtc.rjpeg_copy("flight/DJI_0001_T.JPG", settings, picture=rgb)   # an R-J
   `VisualReport` (its `mosaic` holds the colours as `rgb` and each pixel's frame as
   `source`, -1 where none; `file`, `sidecar`, `preview`), or None with
   `report.visual_note` saying why there is none. `read_frame_models` reads its sidecar too.
+- **The visual mosaic on its own:** with `MosaicOptions(visual_only=True)`, or for a
+  dataset with visual frames and no thermal ones, `make_mosaic` lays out the visual frames
+  by their own overlaps: `report.visual_only` is True, `report.mosaic` and `report.preview`
+  are None, `report.files` is empty, and `report.visual` is its `VisualReport`. It uses
+  `max_pitch`, `heights`, `height_cell` (None: 32 of the alignment's pixels; 64 for a
+  thermal mosaic) and `visual_gsd`.
 - **Both mosaics from one build:** `make_mosaic(..., as_converted_dir="out-raw/")`, with
   `normalize=True`, also writes the mosaic without the normalization there, laid out and
   checked once for both (`report.as_converted` is its report). It is laid out from the
@@ -651,10 +694,16 @@ data = dtc.rjpeg_copy("flight/DJI_0001_T.JPG", settings, picture=rgb)   # an R-J
   The stages, in order and each only when it runs: `ambient` (files), `frames` (files),
   `align` (per round: `pairs`, then `solve steps`), `composite` (frames), `check` (pairs),
   with `visual=True` `visual_frames` (files), `visual_offset` (pairs) and `visual_composite`
-  (frames), then `write` (files). Each starts at `done = 0` and ends at its total. There is no overall
+  (frames), then `write` (files). The visual mosaic on its own has `visual_frames` (files),
+  `visual_decode` (frames), `align`, `check`, `visual_composite` and `write`, after `frames`
+  when it was made because the dataset has no thermal frames. Each starts at `done = 0` and ends at its total. There is no overall
   percentage, as the stages' share of the time varies with the flight.
-- **Parallelism:** `jobs` as on the command line (`1` runs in the calling process, as does
-  any job in a daemonic process, such as a Celery worker's; a mosaic still aligns in threads).
+- **Parallelism:** `jobs` as on the command line, in worker processes (`1` runs in the calling
+  process). The work also runs in the calling process, at any `jobs`, when it can't start processes:
+  in a daemonic process, such as a Celery worker's, or from a script that calls the API outside
+  `if __name__ == "__main__":`. Where the workers import the script again (on Windows and macOS,
+  and on Linux since Python 3.14), they would run it again, so the API warns
+  (`RuntimeWarning`) and goes on in one process. Put the calls under that guard to use the workers.
 - The API never prints or exits. The command line is a thin layer over it and writes
   byte-identical files.
 

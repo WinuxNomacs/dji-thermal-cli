@@ -33,9 +33,10 @@ def _colour(t):
     return np.stack([60 + 180 * s, 40 + 120 * s, 200 - 150 * s], axis=-1)
 
 
-def _visual_frame(path, thermal, offset_deg=OFFSET_DEG, size=(480, 360), focal=400.0, exposure=None):
+def _visual_frame(path, thermal, offset_deg=OFFSET_DEG, size=(480, 360), focal=400.0, exposure=None, k1=0.0):
     """The visual frame taken with a synthetic thermal one: the same position and attitude, the
-    camera turned by offset_deg, a wider lens; saved as a PNG at path."""
+    camera turned by offset_deg, a wider lens (distorting by k1, see mosaic._Placed); saved as a
+    PNG at path."""
     p = thermal.pose
     w, h = size
     zone, north = geo.utm_zone(LAT, LON)
@@ -43,7 +44,8 @@ def _visual_frame(path, thermal, offset_deg=OFFSET_DEG, size=(480, 360), focal=4
     j = geo.local_to_utm(p.lat, p.lon, zone, north)
     r = mosaic.rotation(p.yaw, p.pitch, p.roll) @ mosaic._boresight(*np.radians(offset_deg))
     u, v = np.meshgrid(np.arange(w), np.arange(h))
-    rays = np.tensordot(r, np.stack([np.ones((h, w)), (u - (w - 1) / 2) / focal, (v - (h - 1) / 2) / focal]), 1)
+    x, y = mosaic._undistort((u - (w - 1) / 2) / focal, (v - (h - 1) / 2) / focal, k1)
+    rays = np.tensordot(r, np.stack([np.ones((h, w)), x, y]), 1)
     t = (p.abs_alt - GROUND) / rays[2]
     e, n = c[:, None, None] + np.tensordot(j, np.stack([rays[1] * t, rays[0] * t]), 1)
     Image.fromarray(np.rint(_colour(_field(e, n))).astype(np.uint8)).save(path)
@@ -126,6 +128,98 @@ def test_a_coarser_mosaic_decodes_its_jpegs_smaller(flight, tmp_path):
     assert image.shape == (90, 120, 3) and factor == 4
     coarse = visual.build(m, jpegs, gsd=4 * 21.0 / 400)
     assert coarse.grid.gsd == pytest.approx(4 * 21.0 / 400) and _colour_error(coarse) < 6
+
+
+@pytest.fixture(scope="module")
+def alone(flight, tmp_path_factory):
+    """The flight's visual frames as JPEGs, their camera pointing where the gimbal says."""
+    thermal, _, _ = flight
+    folder = tmp_path_factory.mktemp("alone")
+    frames = []
+    for i, f in enumerate(thermal):
+        v = _visual_frame(folder / f"f{i}_V.png", f, offset_deg=(0.0, 0.0))
+        with Image.open(v.path) as im:
+            im.save(folder / f"f{i}_V.jpg", quality=95)
+        frames.append(dataclasses.replace(v, name=f"f{i}_V.jpg", path=folder / f"f{i}_V.jpg"))
+    return frames
+
+
+def test_a_flight_of_visual_frames_alone_is_laid_out_by_its_own_overlaps(alone):
+    """Without thermal frames, the visual frames are aligned on their brightness, and the mosaic
+    shows the field where it is."""
+    vm = visual.build_alone(alone, heights="plane")
+    assert vm.report["frames_used"] == vm.report["frames_contributing"] == 6
+    assert vm.report["work_size"] == [480, 360] and vm.report["frames_oblique"] == []
+    assert vm.report["misalignment"]["median_m"] < 0.02
+    assert vm.grid.gsd == pytest.approx(21.0 / 400, abs=0.001)
+    assert _colour_error(vm) < 4
+
+
+def test_visual_frames_alone_are_aligned_smaller_and_composited_at_full_size(alone):
+    """work_px caps the size the frames are matched at; the mosaic keeps their own pixel size."""
+    vm = visual.build_alone(alone, heights="plane", work_px=240)
+    assert vm.report["work_size"] == [240, 180]
+    assert vm.grid.gsd == pytest.approx(21.0 / 400, abs=0.001) and _colour_error(vm) < 4
+    assert all(pl.frame.pose.width == 480 for pl in vm.placed)
+
+
+def test_a_wide_lens_distortion_is_found_and_corrected(flight, tmp_path):
+    """Frames from a lens distorting by k1 = 0.08: the alignment finds it, and the mosaic shows
+    the field where it is, which it doesn't with the distortion left unmodelled."""
+    thermal, _, _ = flight
+    frames = [_visual_frame(tmp_path / f"f{i}_V.png", f, offset_deg=(0.0, 0.0), k1=0.08) for i, f in enumerate(thermal)]
+    vm = visual.build_alone(frames, heights="plane")
+    assert vm.report["alignment"]["distortion_k1"] == pytest.approx(0.08, abs=0.02)
+    assert all(pl.k1 == pytest.approx(0.08, abs=0.02) for pl in vm.placed)
+    plain = visual.build_alone(frames, heights="plane", distortion=False)
+    assert "distortion_k1" not in plain.report["alignment"]
+    assert _colour_error(vm) < 4 and _colour_error(vm) < _colour_error(plain)
+    assert vm.report["misalignment"]["median_m"] < plain.report["misalignment"]["median_m"]
+
+
+def test_a_flight_of_its_own_estimates_its_heights_on_cells_half_the_thermal_mosaics(flight, tmp_path):
+    """build_alone's height cells are ALONE_HEIGHT_CELL_PX work pixels wide, half the thermal
+    mosaics' unless asked otherwise."""
+    thermal, _, _ = flight
+    frames = [_visual_frame(tmp_path / f"f{i}_V.png", f, offset_deg=(0.0, 0.0)) for i, f in enumerate(thermal)]
+    fine = visual.build_alone(frames, check_misalignment=False)
+    coarse = visual.build_alone(frames, check_misalignment=False, height_cell=mosaic.HEIGHT_CELL_PX)
+    assert visual.ALONE_HEIGHT_CELL_PX == mosaic.HEIGHT_CELL_PX // 2
+    assert fine.report["heights"]["cell_m"] == pytest.approx(coarse.report["heights"]["cell_m"] / 2, rel=0.01)
+
+
+def test_without_distortion_frames_are_projected_as_before(flight):
+    """k1 = 0 (the thermal mosaics') leaves the projection as the pinhole's, to the bit."""
+    _, m, _ = flight
+    pl = m.placed[0]
+    e, n = np.meshgrid(np.linspace(-3, 3, 7), np.linspace(-3, 3, 7))
+    plain = mosaic._project(pl, e, n, pl.h)
+    assert pl.k1 == 0.0
+    distorted = mosaic._project(dataclasses.replace(pl, k1=0.05), e, n, pl.h)
+    for a, b in zip(plain, mosaic._project(dataclasses.replace(pl, k1=0.0), e, n, pl.h)):
+        np.testing.assert_array_equal(a, b)
+    assert not np.allclose(plain[0], distorted[0])
+    x, y = np.array([0.1, -0.3]), np.array([0.2, 0.25])
+    assert mosaic._undistort(x, y, 0.0) == (x, y)
+    xu, yu = mosaic._undistort(x, y, 0.05)
+    np.testing.assert_allclose(xu * (1 + 0.05 * (xu ** 2 + yu ** 2)), x, atol=1e-9)
+
+
+def test_a_cell_s_rangefinder_prior_is_the_median_of_the_nearest_heights():
+    hs = mosaic.Heights(0.0, 10.0, 5.0, np.zeros((2, 2)))       # cell centres (2.5, 7.5), (7.5, 7.5), (2.5, 2.5), (7.5, 2.5)
+    anchors = np.array([[2.0, 8.0, -5.0], [3.0, 7.0, -5.5], [2.5, 9.0, -6.0], [8.0, 2.0, 1.0], [7.0, 3.0, 0.0],
+                        [9.0, 3.0, 0.5]])
+    prior = mosaic._anchor_surface(hs, anchors, k=3)
+    assert prior[0, 0] == -5.5 and prior[1, 1] == 0.5
+
+
+def test_oblique_visual_frames_are_left_out_of_a_flight_alone(alone):
+    frames = alone
+    tilted = dataclasses.replace(frames[0], pose=dataclasses.replace(frames[0].pose, pitch=-60.0))
+    vm = visual.build_alone([tilted] + frames[1:], heights="plane")
+    assert vm.report["frames_oblique"] == [tilted.name] and vm.report["frames_used"] == 5
+    with pytest.raises(ValueError, match="pitched"):
+        visual.build_alone([tilted])
 
 
 def test_pairs_are_the_frames_exposed_together(flight, tmp_path):
@@ -229,6 +323,94 @@ def test_options_are_checked():
         dtc.MosaicOptions(visual_gsd=0.01)
     with pytest.raises(dtc.SettingsError, match="positive"):
         dtc.MosaicOptions(visual=True, visual_gsd=0)
+    assert dtc.MosaicOptions(visual_only=True, visual_gsd=0.01).visual_gsd == 0.01
+
+
+@pytest.mark.parametrize("options, why", [
+    ({"align": False}, "needs align"),
+    ({"dsm": __file__}, "DSM is used for thermal mosaics only"),
+])
+def test_a_mosaic_of_the_visual_frames_alone_refuses_the_thermal_mosaics_options(options, why):
+    with pytest.raises(dtc.SettingsError, match=f"visual_only: .*{why}"):
+        dtc.MosaicOptions(visual_only=True, **options)
+
+
+def _rgb_jpeg(path, thermal, exposure):
+    """The visual frame taken with a synthetic thermal one, as the drone writes it: a JPEG
+    whose EXIF and DJI XMP give its pose, focal length and rangefinder."""
+    w, h = 480, 360
+    v = _visual_frame(path.with_suffix(".png"), thermal, offset_deg=(0.0, 0.0), size=(w, h),
+                      focal=24 * math.hypot(w, h) / mosaic.FULL_FRAME_DIAGONAL_MM)
+    p = thermal.pose
+    exif = Image.Exif()
+    exif[272] = "M4T"
+    exif.get_ifd(0x8769).update({37386: 6.72, 41989: 24})
+    buf = io.BytesIO()
+    with Image.open(v.path) as im:
+        im.save(buf, "JPEG", quality=95, exif=exif)
+    v.path.unlink()
+    path.write_bytes(_with_xmp(buf.getvalue(), _xmp(
+        f'drone-dji:GpsLatitude="{p.lat:.9f}" drone-dji:GpsLongitude="{p.lon:.9f}" '
+        f'drone-dji:AbsoluteAltitude="{p.abs_alt:.3f}" drone-dji:GimbalYawDegree="{p.yaw}" '
+        f'drone-dji:GimbalPitchDegree="{p.pitch}" drone-dji:GimbalRollDegree="{p.roll}" '
+        f'drone-dji:LRFStatus="Normal" drone-dji:LRFTargetAbsAlt="{GROUND:.3f}" '
+        f'drone-dji:UTCAtExposure="{exposure.isoformat()}" drone-dji:ImageSource="WideCamera">')))
+
+
+@pytest.fixture(scope="module")
+def rgb_flight(flight, tmp_path_factory):
+    """A folder of the flight's visual frames alone, as JPEGs from the drone (no thermal frames)."""
+    thermal, _, _ = flight
+    folder = tmp_path_factory.mktemp("rgb")
+    for i, f in enumerate(thermal):
+        _rgb_jpeg(folder / f"DJI_2026102221331{i}_000{i}_V.JPG", f, START + datetime.timedelta(seconds=2 * i))
+    return folder
+
+
+def test_make_mosaic_lays_out_a_flight_without_thermal_frames_by_its_own_overlaps(rgb_flight, tmp_path):
+    """A flight of visual frames only: make_mosaic makes their mosaic alone (no thermal mosaic),
+    with its stages and its files, and the frames' lens distortion in its frame models."""
+    events = []
+    report = dtc.make_mosaic(rgb_flight, tmp_path, dtc.Settings(), dtc.MosaicOptions(heights="plane"),
+                             progress=lambda e: e.kind == "mosaic" and events.append(e.data))
+    assert report.visual_only and report.mosaic is None and report.preview is None and report.files == []
+    assert report.alignment is None and (report.frames, report.not_thermal) == (0, 6)
+    v = report.visual
+    assert (v.frames, v.skipped) == (6, 0) and v.mosaic.report["laid_out"] == "by the visual frames' own overlaps"
+    assert v.mosaic.report["frames_used"] == 6 and v.mosaic.report["misalignment"]["median_m"] < 0.02
+    stages = list(dict.fromkeys(d["stage"] for d in events))
+    assert stages == ["frames", "visual_frames", "visual_decode", "align", "check", "visual_composite", "write"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "mosaic_visual.json", "mosaic_visual.tif", "mosaic_visual_preview.png"]
+    models = json.loads(v.sidecar.read_text())["frame_models"]["frames"]
+    k1 = v.mosaic.report["alignment"]["distortion_k1"]
+    assert all(f["lens_k1"] == pytest.approx(k1, abs=1e-5) for f in models)
+
+
+def test_a_mosaic_of_the_visual_frames_alone_has_its_own_height_cells(rgb_flight, tmp_path):
+    """visual_only's height cells are build_alone's unless height_cell says otherwise; a flight
+    with thermal frames gets no thermal mosaic with it."""
+    report = dtc.make_mosaic(rgb_flight, tmp_path / "a", options=dtc.MosaicOptions(visual_only=True))
+    cell = report.visual.mosaic.report["heights"]["cell_m"]
+    wide = dtc.make_mosaic(rgb_flight, tmp_path / "b", options=dtc.MosaicOptions(visual_only=True, height_cell=64))
+    assert wide.visual.mosaic.report["heights"]["cell_m"] == pytest.approx(2 * cell, rel=0.01)
+    assert report.visual_only and not list((tmp_path / "a").glob("mosaic_temp_*"))
+
+
+def test_frame_models_find_a_point_through_the_lens_distortion(flight, tmp_path):
+    """read_frame_models of a mosaic whose lens distorts finds a ground point at the pixel the
+    mosaic projected it to."""
+    thermal, _, _ = flight
+    frames = [_visual_frame(tmp_path / f"f{i}_V.png", f, offset_deg=(0.0, 0.0), k1=0.08) for i, f in enumerate(thermal)]
+    vm = visual.build_alone(frames, heights="plane", check_misalignment=False)
+    _, sidecar = visual.write(vm, tmp_path / "mosaic_visual.tif")
+    models = dtc.read_frame_models(sidecar)
+    pl = vm.placed[0]
+    g = vm.grid
+    e, n = pl.c[0] + 1.5, pl.c[1] - 2.0
+    lat, lon = geo.utm_inverse(np.array([e]), np.array([n]), g.zone, g.north)
+    u, v, _, _ = mosaic._project(pl, np.array([e - pl.c[0]]), np.array([n - pl.c[1]]), pl.h)
+    assert pl.k1 != 0 and models.pixels(lon, lat)[0, 0] == pytest.approx([u[0], v[0]], abs=0.01)
 
 
 @pytest.mark.flight
@@ -267,7 +449,22 @@ def test_the_command_line_prints_the_visual_mosaic(tmp_path):
     assert "cameras' offset: pitch " in proc.stdout or "cameras' offset: not corrected, " in proc.stdout
 
 
+def test_the_command_line_mosaics_a_flight_without_thermal_frames(rgb_flight, tmp_path):
+    proc = _cli("process", "--input-dir", rgb_flight, "--output-dir", tmp_path, "--mosaic", "--quiet",
+                "--mosaic-heights", "plane")
+    assert proc.returncode == 0, proc.stderr
+    assert "Visual mosaic, laid out by the visual frames' own overlaps: 6 visual frames." in proc.stdout
+    assert "mosaic_visual.tif  (" in proc.stdout and "lens distortion k1 " in proc.stdout
+    assert "Mosaic: 0 nadir frames" not in proc.stdout
+
+
+def test_the_command_line_refuses_a_visual_mosaic_alone_without_alignment(tmp_path):
+    proc = _cli("process", "--input-dir", tmp_path, "--output-dir", tmp_path / "out", "--mosaic-visual-only",
+                "--no-mosaic-align")
+    assert proc.returncode != 0 and "--mosaic-visual-only: " in proc.stderr and "needs --mosaic-align" in proc.stderr
+
+
 def test_the_visual_pixel_size_needs_the_visual_mosaic(tmp_path):
     proc = _cli("process", "--input-dir", tmp_path, "--output-dir", tmp_path / "out", "--mosaic",
                 "--mosaic-visual-gsd", "0.02")
-    assert proc.returncode != 0 and "visual_gsd needs visual" in proc.stderr
+    assert proc.returncode != 0 and "--mosaic-visual-gsd needs visual or --mosaic-visual-only" in proc.stderr

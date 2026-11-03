@@ -22,7 +22,7 @@ layer only converts units, applies the dataset-wide settings and writes files.
 from __future__ import annotations
 
 import dataclasses
-import multiprocessing
+import math
 import os
 from collections import Counter
 from collections.abc import Callable, Iterable
@@ -179,11 +179,15 @@ class Settings:
 class MosaicOptions:
     """How to build the mosaic. units: one GeoTIFF per unit (C, F, K). heights: "auto" projects
     the frames onto the surface estimated from their parallax (with align; see mosaic._align),
-    on cells height_cell mosaic pixels wide; "plane" onto the flat ground. dsm: a surface model
+    on cells height_cell mosaic pixels wide (None: 64, or 32 for a visual_only mosaic, whose
+    pixels are the alignment's; see visual.build_alone); "plane" onto the flat ground. dsm: a surface model
     GeoTIFF (WGS84 UTM or lat/lon, metres) to project onto instead, with dsm_offset metres added
     to its altitudes (None: estimated from the rangefinder; see mosaic._dsm_surface). visual:
     also the mosaic of the visual (RGB) frames taken with the thermal ones (see visual), at
-    visual_gsd metres per pixel (None: the visual frames' own). alignment: the frames' alignment
+    visual_gsd metres per pixel (None: the visual frames' own). visual_only: the visual frames'
+    mosaic only, laid out by their own overlaps (see visual.build_alone), with max_pitch,
+    heights, height_cell and visual_gsd; make_mosaic makes it too for a dataset without thermal
+    frames. alignment: the frames' alignment
     from an earlier run (MosaicReport.alignment, Normalization.alignment, Alignment.load), used
     instead of aligning them again when it was made for the same frames and the same gsd,
     heights and height_cell (else they are aligned afresh, and the report's alignment says
@@ -195,12 +199,13 @@ class MosaicOptions:
     gsd: float | None = None
     units: tuple[str, ...] = ("C",)
     heights: str = "auto"
-    height_cell: int = _mosaic.HEIGHT_CELL_PX
+    height_cell: int | None = None
     dsm: Path | None = None
     dsm_offset: float | None = None
     visual: bool = False
     visual_gsd: float | None = None
     alignment: Alignment | None = None
+    visual_only: bool = False
 
     def __post_init__(self):
         chosen = tuple(dict.fromkeys(str(u).upper() for u in self.units))
@@ -209,15 +214,15 @@ class MosaicOptions:
         object.__setattr__(self, "units", chosen)
         if self.gsd is not None and self.gsd <= 0:
             raise SettingsError("gsd must be positive")
-        if self.visual_gsd is not None and not self.visual:
-            raise SettingsError("visual_gsd needs visual")
+        if self.visual_gsd is not None and not (self.visual or self.visual_only):
+            raise SettingsError("visual_gsd needs visual or visual_only")
         if self.visual_gsd is not None and self.visual_gsd <= 0:
             raise SettingsError("visual_gsd must be positive")
         if self.alignment is not None and not self.align:
             raise SettingsError("alignment needs align")
         if self.heights not in ("auto", "plane"):
             raise SettingsError(f"heights must be 'auto' or 'plane', not {self.heights!r}")
-        if not 8 <= self.height_cell <= 1024:
+        if self.height_cell is not None and not 8 <= self.height_cell <= 1024:
             raise SettingsError("height_cell must be 8-1024 pixels")
         if self.dsm is not None:
             object.__setattr__(self, "dsm", Path(self.dsm))
@@ -227,6 +232,18 @@ class MosaicOptions:
                 raise SettingsError(f"dsm: no such file {self.dsm}")
         elif self.dsm_offset is not None:
             raise SettingsError("dsm_offset needs a dsm")
+        if self.visual_only and (problem := self.not_visual_only()):
+            raise SettingsError(f"visual_only: {problem}")
+
+    def not_visual_only(self) -> str:
+        """Why these options can't make a mosaic of the visual frames alone, or ""."""
+        if not self.align:
+            return "the visual frames are laid out by their overlaps, which needs align"
+        if self.dsm is not None:
+            return "a DSM is used for thermal mosaics only"
+        if self.alignment is not None:
+            return "a saved alignment is a thermal mosaic's"
+        return ""
 
 
 def palette_index(palette: int | str) -> int:
@@ -528,9 +545,9 @@ def process(path: str | os.PathLike, output_dir: str | os.PathLike, settings: Se
 
 @dataclasses.dataclass
 class MosaicReport:
-    mosaic: _mosaic.Mosaic                      # temperature (Celsius), source, view angle, report
+    mosaic: _mosaic.Mosaic | None               # temperature (Celsius), source, view angle, report; None: visual only
     files: list[tuple[Path, Path]]              # (GeoTIFF, JSON sidecar) per unit
-    preview: Path
+    preview: Path | None
     palette: str                                # the preview's palette ("grayscale" without one)
     preview_range_c: tuple[float, float]
     frames: int
@@ -540,14 +557,19 @@ class MosaicReport:
     normalize_ambient_c: tuple[float, float] | None   # (ambient, reflected) when normalize set them
     heights: Path | None = None                 # mosaic_heights.tif (None on the plane)
     as_converted: MosaicReport | None = None    # the mosaic written to as_converted_dir
-    visual: VisualReport | None = None          # with MosaicOptions.visual, when there were visual frames
+    visual: VisualReport | None = None          # with MosaicOptions.visual, when there were visual frames, or visual only
     visual_note: str = ""                       # why there is no visual mosaic, when asked for
 
     @property
+    def visual_only(self) -> bool:
+        """Whether only the visual frames were mosaicked, by their own overlaps (no thermal mosaic)."""
+        return self.mosaic is None
+
+    @property
     def alignment(self) -> Alignment | None:
-        """The frames' alignment (None without align, or onto a DSM), for a later run's
-        MosaicOptions.alignment; save() keeps it in a file."""
-        return self.mosaic.alignment
+        """The frames' alignment (None without align, onto a DSM, or visual only), for a later
+        run's MosaicOptions.alignment; save() keeps it in a file."""
+        return None if self.mosaic is None else self.mosaic.alignment
 
 
 @dataclasses.dataclass
@@ -571,6 +593,10 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
     mosaic_visual.tif (+ .json) and mosaic_visual_preview.png from the visual frames taken
     with the thermal ones (see visual); without any, MosaicReport.visual_note says why.
 
+    With options.visual_only, or for a dataset with visual frames and no thermal ones, only
+    the visual mosaic, laid out by the visual frames' own overlaps (see visual.build_alone):
+    the report's mosaic and preview are None, its files empty, and its visual the mosaic.
+
     as_converted_dir (with options.normalize): also write the mosaic without the normalization
     there, from the same layout (alignment and misalignment check), in about the time of one
     mosaic instead of two; the frames, composite and write stages then count both. The visual
@@ -586,9 +612,17 @@ def make_mosaic(path: str | os.PathLike, output_dir: str | os.PathLike, settings
     adj = settings.adjustments()
     report = _stages(progress, _build_stages(settings, options, options.normalize, check=True) + ["write"])
     parts = 1 if as_converted_dir is None else 2
+    if options.visual_only:
+        if as_converted_dir is not None:
+            raise SettingsError("as_converted_dir needs a thermal mosaic, not visual_only")
+        return _visual_only(found.jpegs, src_root, out, settings, options, compression, adj, jobs,
+                            _stages(progress, _VISUAL_ONLY_STAGES), {})
     frames, palettes, counts, overrides, normalized, others = _mosaic_frames(
         found, src_root, settings, options, adj, options.normalize, jobs, progress, _share(report, "frames", 0, parts))
     if not frames:
+        if counts.get("not_thermal") and as_converted_dir is None and not options.not_visual_only():
+            return _visual_only(others, src_root, out, settings, options, compression, adj, jobs,
+                                _stages(progress, _VISUAL_ONLY_STAGES), counts)
         raise MosaicError("No frames to mosaic.", counts)
     if as_converted_dir is not None:
         converted, _, converted_counts, _, _, _ = _mosaic_frames(
@@ -624,7 +658,7 @@ def _height_options(options: MosaicOptions) -> dict:
             dsm = _mosaic.read_dsm(options.dsm)
         except ValueError as e:
             raise SettingsError(f"dsm: {e}") from e
-    return {"heights": options.heights, "height_cell": options.height_cell, "dsm": dsm,
+    return {"heights": options.heights, "height_cell": options.height_cell or _mosaic.HEIGHT_CELL_PX, "dsm": dsm,
             "dsm_offset": options.dsm_offset}
 
 
@@ -673,14 +707,23 @@ def _write_mosaic(m: _mosaic.Mosaic, out: Path, settings: Settings, options: Mos
     visual_report = None
     if visual is not None:
         vm, read, skipped = visual
-        tif, sidecar = _visual.write(vm, out / "mosaic_visual.tif", compression, located=not adj.strip_location)
-        if report:
-            report("write", writes - 1, writes, "files")
-        visual_preview, reduction = _visual.write_preview(vm, out / "mosaic_visual_preview.png")
-        if report:
-            report("write", writes, writes, "files")
-        visual_report = VisualReport(vm, tif, sidecar, visual_preview, reduction, read, skipped)
+        visual_report = _write_visual(vm, out, compression, adj, report, writes - 2, writes, read, skipped)
     return MosaicReport(m, files, preview, palette_name, (low, high), heights=heights, visual=visual_report, **fields)
+
+
+def _write_visual(vm: _visual.VisualMosaic, out: Path, compression: str, adj: adjust.Adjustments, report,
+                  written: int, writes: int, read: int, skipped: int) -> VisualReport:
+    """Write the visual mosaic and its preview in out, the last two of writes files ("write"
+    stage; written before them)."""
+    if report and not written:
+        report("write", 0, writes, "files")
+    tif, sidecar = _visual.write(vm, out / "mosaic_visual.tif", compression, located=not adj.strip_location)
+    if report:
+        report("write", written + 1, writes, "files")
+    preview, reduction = _visual.write_preview(vm, out / "mosaic_visual_preview.png")
+    if report:
+        report("write", written + 2, writes, "files")
+    return VisualReport(vm, tif, sidecar, preview, reduction, read, skipped)
 
 
 @dataclasses.dataclass
@@ -747,25 +790,52 @@ def _visual_mosaic(m: _mosaic.Mosaic, others: list[Path], src_root: Path, option
                    report) -> tuple[tuple | None, str | None]:
     """The visual mosaic laid out by m from the JPEGs that are not thermal: ((VisualMosaic,
     frames read, skipped), None), or (None, why there is none)."""
+    frames, skipped = _read_visual(others, src_root, jobs, report)
+    if not frames:
+        return None, "no visual frames (JPEGs with a DJI camera pose that are not thermal)"
+    try:
+        vm = _visual.build(m, frames, gsd=options.visual_gsd, progress=report, jobs=worker_count(jobs, len(frames)))
+    except ValueError as e:
+        return None, str(e)
+    return (vm, len(frames), skipped), None
+
+
+_VISUAL_ONLY_STAGES = ["visual_frames", "visual_decode", "align", "check", "visual_composite", "write"]
+
+
+def _read_visual(jpegs: list[Path], src_root: Path, jobs: int | None, report) -> tuple[list, int]:
+    """The visual frames among jpegs, by name, and how many are not ones (see visual.read_visual)."""
     if report:
-        report("visual_frames", 0, len(others), "files")
+        report("visual_frames", 0, len(jpegs), "files")
     frames, skipped = [], 0
-    args = [(src, src.relative_to(src_root).as_posix()) for src in others]
+    args = [(src, src.relative_to(src_root).as_posix()) for src in jpegs]
     for done, (_, ok, payload) in enumerate(_run_all(_visual.read_visual, args, jobs), 1):
         if ok and payload[0] is not None:
             frames.append(payload[0])
         else:
             skipped += 1
         if report:
-            report("visual_frames", done, len(others), "files")
-    if not frames:
-        return None, "no visual frames (JPEGs with a DJI camera pose that are not thermal)"
+            report("visual_frames", done, len(jpegs), "files")
     frames.sort(key=lambda f: f.name)
+    return frames, skipped
+
+
+def _visual_only(jpegs: list[Path], src_root: Path, out: Path, settings: Settings, options: MosaicOptions,
+                 compression: str, adj: adjust.Adjustments, jobs: int | None, report, counts: dict) -> MosaicReport:
+    """make_mosaic's visual mosaic alone, laid out by the visual frames' own overlaps, from
+    jpegs (counts: the thermal frames' as _mosaic_frames counted them, {} when not looked for)."""
+    frames, skipped = _read_visual(jpegs, src_root, jobs, report)
+    counts = {"frames": 0, "oblique": 0, "unusable": 0, "not_thermal": len(jpegs), **counts}
+    if not frames:
+        raise MosaicError("No visual frames to mosaic (JPEGs with a DJI camera pose that are not thermal).", counts)
+    cell = {} if options.height_cell is None else {"height_cell": options.height_cell}
     try:
-        vm = _visual.build(m, frames, gsd=options.visual_gsd, progress=report, jobs=worker_count(jobs, len(frames)))
+        vm = _visual.build_alone(frames, gsd=options.visual_gsd, max_pitch=options.max_pitch, progress=report,
+                                 jobs=worker_count(jobs, len(frames)), heights=options.heights, **cell)
     except ValueError as e:
-        return None, str(e)
-    return (vm, len(frames), skipped), None
+        raise MosaicError(f"Mosaic failed: {e}", counts) from None
+    visual = _write_visual(vm, out, compression, adj, report, 0, 2, len(frames), skipped)
+    return MosaicReport(None, [], None, "", (math.nan, math.nan), normalize_ambient_c=None, visual=visual, **counts)
 
 
 def _reads_ambient(settings: Settings, median_ambient: bool) -> bool:
@@ -868,11 +938,11 @@ def worker_count(requested: int | None, n_jobs: int) -> int:
 
 def _run_all(fn, arglist: list[tuple], jobs: int | None):
     """Yield (index, ok, result or error text) for fn(*args) over arglist, as each finishes,
-    in jobs worker processes (1: in this process). A daemonic process (a Celery worker's, a
-    multiprocessing pool's) cannot start processes, so it runs them in this process. An
-    unexpected exception only fails its own item."""
+    in jobs worker processes (1: in this process). Where they can't be started (a daemonic
+    process, a script starting them outside `if __name__ == "__main__":`), it runs them in
+    this process. An unexpected exception only fails its own item."""
     workers = worker_count(jobs, len(arglist))
-    if workers <= 1 or multiprocessing.current_process().daemon:
+    if workers <= 1 or _mosaic.processes_unavailable():
         for i, a in enumerate(arglist):
             try:
                 yield i, True, fn(*a)

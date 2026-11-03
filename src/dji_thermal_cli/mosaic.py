@@ -22,15 +22,18 @@ image shift between overlapping frames found by phase correlation (geometric err
 from __future__ import annotations
 
 import copy
+import ast
+import ctypes
 import dataclasses
 import functools
 import io
 import json
 import math
-import threading
+import multiprocessing
+import sys
 import warnings
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -42,6 +45,7 @@ from . import djixmp, files, geo, tiffin, tiffout, tsdk, units
 FULL_FRAME_DIAGONAL_MM = math.hypot(36.0, 24.0)
 DEFAULT_MAX_PITCH = -80.0
 HEIGHT_CELL_PX = 64             # the cell of the surface heights (see _align), in mosaic pixels
+MATCH_BATCH = 8                 # blocks phase-correlated at once (see _match_pair)
 
 # Thermal sensors by EXIF Model: (native width in pixels, pixel pitch in mm), from DJI's spec
 # pages (enterprise.dji.com/<product>/specs; XT S: its spec sheet). Super-resolution images
@@ -179,6 +183,7 @@ class _Placed:
     shift: np.ndarray = dataclasses.field(default_factory=lambda: np.zeros(2))
     rot: float = 0.0            # radians
     heights: Heights | None = None      # the surface the frame is projected onto (None: the plane)
+    k1: float = 0.0             # radial lens distortion: a pinhole point (x, y) is imaged at (x, y)(1 + k1 r^2)
 
     def corrected_footprint(self) -> np.ndarray:
         fp = self.footprint
@@ -198,9 +203,9 @@ def _boresight(pitch: float, yaw: float) -> np.ndarray:
 
 
 def _place(frame: Frame, ground: float, zone: int, north: bool, bias: tuple[float, float] = (0.0, 0.0),
-           r: np.ndarray | None = None) -> _Placed | None:
+           r: np.ndarray | None = None, k1: float = 0.0) -> _Placed | None:
     """The frame placed over the ground plane, its camera turned by the boresight bias (or
-    pointing as r says, camera body -> north/east/down)."""
+    pointing as r says, camera body -> north/east/down), its lens distorting by k1 (see _Placed)."""
     p = frame.pose
     h = p.abs_alt - ground
     if h <= 0:
@@ -213,12 +218,24 @@ def _place(frame: Frame, ground: float, zone: int, north: bool, bias: tuple[floa
     edge = np.linspace(0, 1, 9)
     u = np.concatenate([edge * (p.width - 1), np.full(9, p.width - 1.0), (1 - edge) * (p.width - 1), np.zeros(9)])
     v = np.concatenate([np.zeros(9), edge * (p.height - 1), np.full(9, p.height - 1.0), (1 - edge) * (p.height - 1)])
-    rays = r @ np.stack([np.ones_like(u), (u - cx) / p.focal_px, (v - cy) / p.focal_px])
+    x, y = _undistort((u - cx) / p.focal_px, (v - cy) / p.focal_px, k1)
+    rays = r @ np.stack([np.ones_like(u), x, y])
     if (rays[2] <= 1e-6).any():
         return None             # part of the frame sees the horizon: no finite footprint
     t = h / rays[2]
     local = np.stack([rays[1] * t, rays[0] * t])          # east, north
-    return _Placed(frame, h, c, j, np.linalg.inv(j), r.T, cx, cy, (c[:, None] + j @ local).T)
+    return _Placed(frame, h, c, j, np.linalg.inv(j), r.T, cx, cy, (c[:, None] + j @ local).T, k1=k1)
+
+
+def _undistort(x, y, k1: float):
+    """The pinhole point (x, y) a lens distorting by k1 (see _Placed) images at (x, y)."""
+    if not k1:
+        return x, y
+    xu, yu = x, y
+    for _ in range(8):
+        scale = 1 + k1 * (xu * xu + yu * yu)
+        xu, yu = x / scale, y / scale
+    return xu, yu
 
 
 def _centre_ground(pl: _Placed) -> np.ndarray:
@@ -267,17 +284,16 @@ class Heights:
         i0 = np.minimum(np.floor(f), max(count - 2, 0)).astype(np.intp)
         return i0, f - i0 if count > 1 else np.zeros_like(f)
 
-    def _matrix(self, coord: np.ndarray, axis: int) -> np.ndarray:
-        i0, w = self._weights(coord, axis)
-        m = np.zeros((coord.size, self.z.shape[axis]))
-        at = np.arange(coord.size)
-        m[at, i0] = 1 - w
-        m[at, np.minimum(i0 + 1, self.z.shape[axis] - 1)] += w
-        return m
-
     def at(self, e: np.ndarray, n: np.ndarray) -> np.ndarray:
-        """The heights at every (n[i], e[j]) for 1-D e and n: an (n.size, e.size) array."""
-        return self._matrix(n, 0) @ self.z @ self._matrix(e, 1).T
+        """The heights at every (n[i], e[j]) for 1-D e and n: an (n.size, e.size) array. (Interpolated
+        directly rather than as a product of matrices: BLAS's threads, left spinning between the calls
+        of the frames' renders and composite, slowed the work around them.)"""
+        i0, wi = self._weights(n, 0)
+        j0, wj = self._weights(e, 1)
+        rows, cols = self.z.shape
+        i1, j1 = np.minimum(i0 + 1, rows - 1), np.minimum(j0 + 1, cols - 1)
+        zn = self.z[i0] * (1 - wi)[:, None] + self.z[i1] * wi[:, None]
+        return zn[:, j0] * (1 - wj) + zn[:, j1] * wj
 
     def point_weights(self, e: np.ndarray, n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """For points (e[k], n[k]): the 4 cells (flat indices) their height interpolates and the
@@ -474,8 +490,13 @@ def _project(pl: _Placed, de, dn, hz):
     right = rt[1, 0] * north + rt[1, 1] * east + rt[1, 2] * hz
     down = rt[2, 0] * north + rt[2, 1] * east + rt[2, 2] * hz
     with np.errstate(divide="ignore", invalid="ignore"):
-        uf = pl.cx + p.focal_px * right / fwd
-        vf = pl.cy + p.focal_px * down / fwd
+        if pl.k1:
+            x, y = right / fwd, down / fwd
+            scale = 1 + pl.k1 * (x * x + y * y)
+            uf, vf = pl.cx + p.focal_px * x * scale, pl.cy + p.focal_px * y * scale
+        else:
+            uf = pl.cx + p.focal_px * right / fwd
+            vf = pl.cy + p.focal_px * down / fwd
     angle = np.degrees(np.arctan2(np.hypot(east, north), hz)).astype(np.float32)
     return uf, vf, fwd, angle
 
@@ -582,9 +603,11 @@ def _reporter(progress, stage, unit, **extra):
 
 
 def _layout(frames, gsd, ground_alt, align, progress, jobs, heights="auto", height_cell=HEIGHT_CELL_PX,
-            dsm=None, dsm_offset=None, saved: Alignment | None = None) -> _Layout:
+            dsm=None, dsm_offset=None, saved: Alignment | None = None, distortion: bool = False,
+            rangefinder_prior: bool = False) -> _Layout:
     """The frames placed over the ground plane (and aligned, or placed as saved says) and the
-    grid they cover."""
+    grid they cover. distortion, rangefinder_prior: as _align's (with distortion, no saved
+    alignment is kept)."""
     if not frames:
         raise ValueError("no frames to mosaic")
     lat = float(np.mean([f.pose.lat for f in frames]))
@@ -631,12 +654,13 @@ def _layout(frames, gsd, ground_alt, align, progress, jobs, heights="auto", heig
     state = None
     if align:
         placed, surface, alignment, bias = _align(frames, placed, grid, ground_alt, zone, north, progress=progress,
-                                                  jobs=jobs, heights=heights, height_cell=height_cell, fixed=surface)
+                                                  jobs=jobs, heights=heights, height_cell=height_cell, fixed=surface,
+                                                  distortion=distortion, rangefinder_prior=rangefinder_prior)
         if heights_report:
             alignment["heights"] = heights_report
         heights_report = alignment["heights"]
         grid = _grid(placed, gsd, zone, north)
-        if dsm is None:     # a DSM's surface isn't kept: a build onto it aligns again
+        if dsm is None and not distortion:     # a DSM's surface isn't kept: a build onto it aligns again
             state = Alignment(tuple(pl.frame.name for pl in placed), tuple(dropped),
                               tuple(_pose_key(pl.frame.pose) for pl in placed), asked, ground_alt, ground_source,
                               bias, np.array([pl.shift for pl in placed]).reshape(-1, 2),
@@ -920,15 +944,8 @@ def _phase_shift(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
     return dy, dx, peak
 
 
-def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_peak: float = 0.1,
-                    report: Callable[[int, int], None] | None = None, jobs: int = 1) -> np.ndarray:
-    """Misalignment between overlapping frames, in blocks (half-overlapping) fully covered by
-    both frames of a pair. Rows: (a, b, block centre E, N, shift E, N), the shift being where
-    frame b shows the block's content relative to frame a, in metres. report(done, total):
-    the overlapping pairs measured, counted by the overlap area each samples so that the
-    count moves evenly. jobs: threads matching pairs at once (numpy's FFTs and array work
-    release the GIL); the result is the same for any number."""
-    step = block // 2
+def _overlaps(placed: list[_Placed], grid: Grid, block: int) -> list[tuple[int, int, slice, slice]]:
+    """The pairs of frames whose windows overlap by at least a block each way: (a, b, rows, cols)."""
     windows = [_window(pl, grid) for pl in placed]
     overlaps = []
     for a in range(len(placed)):
@@ -938,90 +955,250 @@ def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_pea
             cols = slice(max(ca.start, cb.start), min(ca.stop, cb.stop))
             if rows.stop - rows.start >= block and cols.stop - cols.start >= block:
                 overlaps.append((a, b, rows, cols))
+    return overlaps
+
+
+def _render(pl: _Placed, grid: Grid):
+    """A frame rendered over its window as blocks are matched on: the gradient magnitude of its
+    bilinear sampling, and where it is valid."""
+    wr, wc = _window(pl, grid)
+    t, _, valid = _sample(pl, grid, wr, wc, bilinear=True)
+    gy, gx = np.gradient(t.astype(np.float64))
+    return np.sqrt(gy * gy + gx * gx), valid
+
+
+def _match_pair(pair, ga, va, gb, vb, grid: Grid, block: int, min_peak: float):
+    """One overlapping pair's blocks matched (see _measure_blocks), from both frames' renders cut to
+    the overlap; None when no block is fully covered by both."""
+    a, b, rows, cols = pair
+    step = block // 2
+    both = va & vb
+    # blocks fully covered by both frames, from a summed-area table of the uncovered pixels
+    gaps = np.zeros((both.shape[0] + 1, both.shape[1] + 1), np.int64)
+    gaps[1:, 1:] = (~both).cumsum(0).cumsum(1)
+    ys = np.arange(0, both.shape[0] - block + 1, step)
+    xs = np.arange(0, both.shape[1] - block + 1, step)
+    y, x = (g.ravel() for g in np.meshgrid(ys, xs, indexing="ij"))
+    full = (gaps[y + block, x + block] - gaps[y, x + block] - gaps[y + block, x] + gaps[y, x]) == 0
+    y, x = y[full], x[full]
+    if not y.size:
+        return None
+    win = np.lib.stride_tricks.sliding_window_view
+    wa, wb = win(ga, (block, block)), win(gb, (block, block))
+    # a few blocks at a time, which stay in the processor's cache (the result is the same)
+    dy, dx, peak = (np.concatenate(r) for r in zip(*(_phase_shift(wa[y[i:i + MATCH_BATCH], x[i:i + MATCH_BATCH]],
+                                                                  wb[y[i:i + MATCH_BATCH], x[i:i + MATCH_BATCH]])
+                                                     for i in range(0, y.size, MATCH_BATCH))))
+    keep = peak >= min_peak
+    e = grid.e0 + (cols.start + x[keep] + block / 2) * grid.gsd
+    n = grid.n0 - (rows.start + y[keep] + block / 2) * grid.gsd
+    return np.column_stack([np.full(e.size, a), np.full(e.size, b), e, n,
+                            dx[keep] * grid.gsd, -dy[keep] * grid.gsd])
+
+
+def _measure_blocks(placed: list[_Placed], grid: Grid, block: int = 128, min_peak: float = 0.1,
+                    report: Callable[[int, int], None] | None = None, jobs: int = 1) -> np.ndarray:
+    """Misalignment between overlapping frames, in blocks (half-overlapping) fully covered by
+    both frames of a pair. Rows: (a, b, block centre E, N, shift E, N), the shift being where
+    frame b shows the block's content relative to frame a, in metres. report(done, total):
+    the overlapping pairs measured, counted by the overlap area each samples so that the
+    count moves evenly. jobs: worker processes rendering the frames and matching the pairs
+    (numpy's FFTs on blocks this small hold the GIL, so threads barely help); in a daemonic
+    process, which can't start processes, from a script that would start them outside
+    `if __name__ == "__main__":`, or with 1, they're matched in this one. The result is the
+    same for any number."""
+    overlaps = _overlaps(placed, grid, block)
     area = sum((r.stop - r.start) * (c.stop - c.start) for _, _, r, c in overlaps)
-    # each frame is rendered once, over its window, by the first pair that needs it, as the
-    # gradient magnitude that blocks are matched on, and its pairs' overlaps are cut from that;
-    # a render is dropped once all its pairs are measured
-    uses = {}
-    for a, b, _, _ in overlaps:
-        uses[a] = uses.get(a, 0) + 1
-        uses[b] = uses.get(b, 0) + 1
-    renders, lock = {}, threading.Lock()
-
-    def render(k):
-        with lock:
-            fut = renders.get(k)
-            mine = fut is None
-            if mine:
-                fut = renders[k] = Future()
-        if mine:
-            wr, wc = windows[k]
-            try:
-                t, _, valid = _sample(placed[k], grid, wr, wc, bilinear=True)
-                gy, gx = np.gradient(t.astype(np.float64))
-                fut.set_result((wr.start, wc.start, np.sqrt(gy * gy + gx * gx), valid))
-            except BaseException as e:
-                fut.set_exception(e)
-        return fut.result()
-
-    def release(k):
-        with lock:
-            uses[k] -= 1
-            if not uses[k]:
-                del renders[k]
-
-    def cut(k, rows, cols):
-        r0, c0, g, valid = render(k)
-        rs, cs = slice(rows.start - r0, rows.stop - r0), slice(cols.start - c0, cols.stop - c0)
-        return g[rs, cs], valid[rs, cs]
-
-    def measure(pair):
-        a, b, rows, cols = pair
-        try:
-            ga, va = cut(a, rows, cols)
-            gb, vb = cut(b, rows, cols)
-        finally:
-            release(a)
-            release(b)
-        both = va & vb
-        # blocks fully covered by both frames, from a summed-area table of the uncovered pixels
-        gaps = np.zeros((both.shape[0] + 1, both.shape[1] + 1), np.int64)
-        gaps[1:, 1:] = (~both).cumsum(0).cumsum(1)
-        ys = np.arange(0, both.shape[0] - block + 1, step)
-        xs = np.arange(0, both.shape[1] - block + 1, step)
-        y, x = (g.ravel() for g in np.meshgrid(ys, xs, indexing="ij"))
-        full = (gaps[y + block, x + block] - gaps[y, x + block] - gaps[y + block, x] + gaps[y, x]) == 0
-        y, x = y[full], x[full]
-        if not y.size:
-            return None
-        win = np.lib.stride_tricks.sliding_window_view
-        dy, dx, peak = _phase_shift(win(ga, (block, block))[y, x], win(gb, (block, block))[y, x])
-        keep = peak >= min_peak
-        e = grid.e0 + (cols.start + x[keep] + block / 2) * grid.gsd
-        n = grid.n0 - (rows.start + y[keep] + block / 2) * grid.gsd
-        return np.column_stack([np.full(e.size, a), np.full(e.size, b), e, n,
-                                dx[keep] * grid.gsd, -dy[keep] * grid.gsd])
-
     obs, sampled, done = [], 0, 0
     if report:
         report(0, len(overlaps))
     jobs = max(1, min(jobs, len(overlaps)))
-    pool = ThreadPoolExecutor(jobs) if jobs > 1 else None
-    try:
-        # the workers take the pairs in order, so renders live about as long as measured one by one
-        results = pool.map(measure, overlaps) if pool else map(measure, overlaps)
-        for (_, _, rows, cols), m in zip(overlaps, results):
-            if m is not None:
-                obs.append(m)
-            if report:
-                sampled += (rows.stop - rows.start) * (cols.stop - cols.start)
-                if (now := len(overlaps) * sampled // area) != done:
-                    done = now
-                    report(done, len(overlaps))
-    finally:
-        if pool:
-            pool.shutdown(cancel_futures=True)
+    if jobs > 1 and not processes_unavailable():
+        results = _match_in_processes(placed, grid, overlaps, block, min_peak, jobs)
+    else:
+        results = _match_here(placed, grid, overlaps, block, min_peak)
+    for pair, m in zip(overlaps, results):
+        _, _, rows, cols = pair
+        if m is not None:
+            obs.append(m)
+        if report:
+            sampled += (rows.stop - rows.start) * (cols.stop - cols.start)
+            if (now := len(overlaps) * sampled // area) != done:
+                done = now
+                report(done, len(overlaps))
     return np.concatenate(obs).astype(np.float64) if obs else np.zeros((0, 6))
+
+
+def _match_here(placed, grid, overlaps, block, min_peak):
+    """The pairs matched one by one in this process, yielding each's result. Each frame is
+    rendered by the first pair that needs it, and dropped once all its pairs are measured."""
+    windows = [_window(pl, grid) for pl in placed]
+    uses = {}
+    for a, b, _, _ in overlaps:
+        uses[a] = uses.get(a, 0) + 1
+        uses[b] = uses.get(b, 0) + 1
+    renders = {}
+
+    def cut(k, rows, cols):
+        if k not in renders:
+            renders[k] = _render(placed[k], grid)
+        g, valid = renders[k]
+        r0, c0 = windows[k][0].start, windows[k][1].start
+        rs, cs = slice(rows.start - r0, rows.stop - r0), slice(cols.start - c0, cols.stop - c0)
+        uses[k] -= 1
+        if not uses[k]:
+            del renders[k]
+        return g[rs, cs], valid[rs, cs]
+
+    for pair in overlaps:
+        a, b, rows, cols = pair
+        ga, va = cut(a, rows, cols)
+        gb, vb = cut(b, rows, cols)
+        yield _match_pair(pair, ga, va, gb, vb, grid, block, min_peak)
+
+
+def processes_unavailable() -> bool:
+    """True when worker processes can't be started from here, so the work runs in this
+    process: in a daemonic process (a Celery worker's, a multiprocessing pool's), or when the
+    workers would run the calling script again. That is when they import it (spawn on Windows
+    and macOS, forkserver on Linux since Python 3.14) and it starts them outside
+    `if __name__ == "__main__":`; that case warns."""
+    if multiprocessing.current_process().daemon:
+        return True
+    if (multiprocessing.get_start_method(allow_none=True) or multiprocessing.get_all_start_methods()[0]) == "fork":
+        return False
+    main = sys.modules.get("__main__")
+    path = getattr(main, "__file__", None)
+    frame, depth = sys._getframe(), 1
+    while frame and not (frame.f_globals is getattr(main, "__dict__", None) and frame.f_code.co_name == "<module>"):
+        frame, depth = frame.f_back, depth + 1
+    if not path or frame is None:              # interactive, -c, or the script has finished: nothing to run again
+        return False
+    try:
+        tree = ast.parse(Path(path).read_bytes())
+    except (OSError, SyntaxError, ValueError):
+        return False
+    if any(_main_guard(node) and node.body[0].lineno <= frame.f_lineno <= node.body[-1].end_lineno
+           for node in ast.walk(tree)):
+        return False
+    warnings.warn("dji_thermal_cli works in this process only: worker processes would run this script again, "
+                  'as it starts them outside `if __name__ == "__main__":`', RuntimeWarning, stacklevel=depth)
+    return True
+
+
+def _main_guard(node) -> bool:
+    """Whether node is `if __name__ == "__main__":` (either way round)."""
+    if not (isinstance(node, ast.If) and isinstance(node.test, ast.Compare) and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.Eq)):
+        return False
+    sides = [node.test.left, node.test.comparators[0]]
+    return (any(isinstance(s, ast.Name) and s.id == "__name__" for s in sides)
+            and any(isinstance(s, ast.Constant) and s.value == "__main__" for s in sides))
+
+
+# Matching in worker processes: the frames' pixels go to the workers in shared memory, the workers render
+# each frame once into shared memory, then match the pairs in chunks from those renders.
+_WORKER: dict = {}
+
+
+def _shared(nbytes: int):
+    from multiprocessing import shared_memory
+    return shared_memory.SharedMemory(create=True, size=max(nbytes, 1))
+
+
+def _views(buf, layout):
+    """The arrays laid out in a shared buffer: layout is [(offset, shape, dtype)], None for a gap."""
+    return [None if spec is None else np.ndarray(spec[1], spec[2], buffer=buf, offset=spec[0]) for spec in layout]
+
+
+def _lay_out(arrays_spec):
+    """Byte offsets (8-aligned) for [(shape, dtype) or None]: ([(offset, shape, dtype) or None], total bytes)."""
+    layout, at = [], 0
+    for spec in arrays_spec:
+        if spec is None:
+            layout.append(None)
+            continue
+        shape, dtype = spec
+        layout.append((at, shape, np.dtype(dtype).str))
+        at += -(-int(np.prod(shape)) * np.dtype(dtype).itemsize // 8) * 8
+    return layout, at
+
+
+def _keep_freed_memory() -> None:
+    """In a worker process on Linux (glibc): keep freed blocks of up to 32 MB (the most every glibc allows)
+    on the heap for reuse, and the heap's free top unreturned. By default the arrays over 128 kB were mapped
+    afresh or the heap trimmed, and their pages faulted in again, which made the blocks' FFTs about 3 times
+    slower (on WSL2); either setting alone doesn't help."""
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mallopt(-3, 32 << 20)          # M_MMAP_THRESHOLD
+        libc.mallopt(-1, 64 << 20)          # M_TRIM_THRESHOLD
+    except (OSError, AttributeError):       # not glibc
+        pass
+
+
+def _worker_start(names, layouts, placed, grid):
+    from multiprocessing import shared_memory
+    if sys.platform.startswith("linux"):
+        _keep_freed_memory()
+    shms = [shared_memory.SharedMemory(name=n) for n in names]
+    pixels, grads, valids = (_views(shm.buf, lay) for shm, lay in zip(shms, layouts))
+    _WORKER.update(shms=shms, grads=grads, valids=valids, grid=grid, placed=[
+        None if px is None else dataclasses.replace(pl, frame=dataclasses.replace(pl.frame, temperature=px))
+        for pl, px in zip(placed, pixels)])
+
+
+def _worker_render(k):
+    g, valid = _render(_WORKER["placed"][k], _WORKER["grid"])
+    _WORKER["grads"][k][...] = g
+    _WORKER["valids"][k][...] = valid
+
+
+def _worker_match(chunk, block, min_peak):
+    grid, placed, grads, valids = _WORKER["grid"], _WORKER["placed"], _WORKER["grads"], _WORKER["valids"]
+    out = []
+    for pair in chunk:
+        a, b, rows, cols = pair
+        cuts = []
+        for k in (a, b):
+            wr, wc = _window(placed[k], grid)
+            rs, cs = slice(rows.start - wr.start, rows.stop - wr.start), slice(cols.start - wc.start, cols.stop - wc.start)
+            cuts += [grads[k][rs, cs], valids[k][rs, cs]]
+        out.append(_match_pair(pair, *cuts, grid, block, min_peak))
+    return out
+
+
+def _match_in_processes(placed, grid, overlaps, block, min_peak, jobs):
+    """The pairs matched in jobs worker processes, yielding each's result in order."""
+    used = sorted({k for a, b, _, _ in overlaps for k in (a, b)})
+    is_used = set(used)
+    windows = [_window(pl, grid) for pl in placed]
+    shapes = [(w.stop - w.start, c.stop - c.start) for w, c in windows]
+    px_layout, px_bytes = _lay_out([(pl.frame.temperature.shape, pl.frame.temperature.dtype) if k in is_used else None
+                                    for k, pl in enumerate(placed)])
+    g_layout, g_bytes = _lay_out([(shapes[k], np.float64) if k in is_used else None for k in range(len(placed))])
+    v_layout, v_bytes = _lay_out([(shapes[k], np.bool_) if k in is_used else None for k in range(len(placed))])
+    shms = []
+    try:
+        for nbytes in (px_bytes, g_bytes, v_bytes):
+            shms.append(_shared(nbytes))
+        for view, pl in zip(_views(shms[0].buf, px_layout), placed):
+            if view is not None:
+                view[...] = pl.frame.temperature
+        bare = [dataclasses.replace(pl, frame=dataclasses.replace(pl.frame, temperature=None)) for pl in placed]
+        # chunks of consecutive pairs of about equal overlap area, a few per worker so that they even out
+        sizes = np.array([(r.stop - r.start) * (c.stop - c.start) for _, _, r, c in overlaps], float)
+        bounds = np.searchsorted(np.cumsum(sizes), np.linspace(0, sizes.sum(), 4 * jobs + 1)[1:-1])
+        chunks = [list(c) for c in np.array_split(np.array(overlaps, dtype=object), bounds) if len(c)]
+        with ProcessPoolExecutor(jobs, initializer=_worker_start,
+                                 initargs=([s.name for s in shms], [px_layout, g_layout, v_layout], bare, grid)) as pool:
+            list(pool.map(_worker_render, used))
+            for results in pool.map(_worker_match, chunks, *zip(*[(block, min_peak)] * len(chunks))):
+                yield from results
+    finally:
+        for shm in shms:
+            shm.close()
+            shm.unlink()
 
 
 def _summary(obs: np.ndarray, grid: Grid) -> dict:
@@ -1048,11 +1225,14 @@ OBS_SIGMA_PX = 2.0
 HEIGHT_SMOOTH_M = 0.5           # expected height difference between neighbouring cells (robust: edges)
 HEIGHT_ANCHOR_M = 0.3           # rangefinder target altitude error
 HEIGHT_PRIOR_M = 5.0            # weak pull of unobserved cells to the plane
+ANCHOR_NEIGHBOURS = 5           # rangefinder heights a cell's prior is the median of (rangefinder_prior)
+PRIOR_K1 = 0.2                  # radial distortion expected of a lens (see _Placed.k1), when it is estimated
 
 
 def _align(frames, placed, grid, ground, zone, north, iterations: int | None = None,
            progress: Callable[..., None] | None = None, jobs: int = 1, heights: str = "auto",
-           height_cell: int = HEIGHT_CELL_PX, fixed: Heights | None = None):
+           height_cell: int = HEIGHT_CELL_PX, fixed: Heights | None = None, distortion: bool = False,
+           rangefinder_prior: bool = False):
     """Self-calibrate the flight from its overlaps.
 
     Unknowns: one boresight (camera-body pitch and yaw) for the whole flight, the angle between where the
@@ -1072,6 +1252,10 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
     frames, or a surface reaching the cameras) the flight is aligned on the plane instead,
     and the report says why. fixed: a surface (from a DSM) the frames are projected onto
     throughout, the heights not estimated (the report's "heights" left to the caller).
+    distortion: also estimate the lens' radial distortion, one k1 for every frame (see
+    _Placed), for a wide lens whose distortion would otherwise be taken for heights at the
+    frames' edges; the thermal lenses' isn't measurable, and they don't. rangefinder_prior: as
+    _solve's.
     progress: as build's, for the "align" stage: per round, the pairs measured, then the
     solve's reweighting steps.
     Returns the placed frames, their heights (None on the plane), the report and the boresight
@@ -1085,6 +1269,8 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
     by_name = {f.name: f for f in frames}
     n = len(placed)
     bias = np.zeros(2)
+    k1 = 0.0
+    n_global = 3 if distortion else 2
     shifts = np.zeros((n, 2))
     rots = np.zeros(n)
     surface = Heights.flat(grid, height_cell * grid.gsd) if use_heights else fixed
@@ -1104,16 +1290,19 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
             break
         step, inliers, observed = _solve(placed, obs, grid.gsd, bias, report("solve steps"),
                                          surface if use_heights else None,
-                                         _anchors(placed, ground) if use_heights else None)
+                                         _anchors(placed, ground) if use_heights else None, distortion,
+                                         rangefinder_prior)
         if not np.isfinite(step).all():
             failed = "the solve diverged"
             break
         bias += step[3 * n:3 * n + 2]
+        if distortion:
+            k1 += float(step[3 * n + 2])
         shifts += step[:3 * n].reshape(n, 3)[:, :2]
         rots += step[:3 * n].reshape(n, 3)[:, 2]
         if use_heights:
-            surface = dataclasses.replace(surface, z=surface.z + step[3 * n + 2:].reshape(surface.z.shape))
-        replaced = [_place(by_name[pl.frame.name], ground, zone, north, tuple(bias)) for pl in placed]
+            surface = dataclasses.replace(surface, z=surface.z + step[3 * n + n_global:].reshape(surface.z.shape))
+        replaced = [_place(by_name[pl.frame.name], ground, zone, north, tuple(bias), k1=k1) for pl in placed]
         for k, pl in enumerate(replaced):
             pl.shift, pl.rot, pl.heights = shifts[k].copy(), float(rots[k]), surface
         placed = replaced
@@ -1128,7 +1317,7 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
         if failed:
             placed = [_place(by_name[pl.frame.name], ground, zone, north) for pl in placed]
             placed, _, result, bias = _align(frames, placed, grid, ground, zone, north, progress=progress,
-                                             jobs=jobs, heights="plane")
+                                             jobs=jobs, heights="plane", distortion=distortion)
             result["heights"] = {"method": "plane", "reason": failed}
             return placed, None, result, bias
         anchors = _anchors(placed, ground)
@@ -1152,6 +1341,10 @@ def _align(frames, placed, grid, ground, zone, north, iterations: int | None = N
         "before": {k: v for k, v in (before or {}).items() if k != "pairs_detail"},
         "heights": heights_report or {"method": "plane", "reason": "not asked for"},
     }
+    if rangefinder_prior and heights_report:
+        heights_report["prior"] = f"the median of the {ANCHOR_NEIGHBOURS} nearest rangefinder heights"
+    if distortion:
+        result["distortion_k1"] = round(k1, 5)
     return placed, surface, result, (float(bias[0]), float(bias[1]))
 
 
@@ -1176,22 +1369,30 @@ def _anchors(placed: list[_Placed], ground: float) -> np.ndarray:
 
 def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
            report: Callable[[int, int], None] | None = None, heights: Heights | None = None,
-           anchors: np.ndarray | None = None) -> tuple[np.ndarray, float, np.ndarray | None]:
+           anchors: np.ndarray | None = None, distortion: bool = False,
+           rangefinder_prior: bool = False) -> tuple[np.ndarray, float, np.ndarray | None]:
     """Correction increments [shift E, shift N, rotation] per frame + [boresight pitch, yaw]
-    (+ with heights, one per height cell) that cancel the observed offsets, the fraction of
-    observations kept at full weight, and (with heights) each cell's observation weight.
+    (+ with distortion, the lens' k1, one for every frame; + with heights, one per height
+    cell) that cancel the observed offsets, the fraction of observations kept at full weight,
+    and (with heights) each cell's observation weight.
 
     Moving frame k's content: its correction (sampling at X + t + r perp(X - c)) moves it by
     -(t + r perp(X - c)); a boresight b moves it by G_k b (G_k: ground shift of the optical
     axis per radian); raising the surface by dz at X moves it by -(X - c_k) dz / (h_k - z(X)),
-    away from the frame's nadir. For each block, (move_b - move_a)(X) = -observed shift.
+    away from the frame's nadir; a change of k1 moves the content a frame shows at X by D_k(X),
+    found numerically (see _distortion_move), radially about where its optical axis meets the
+    ground, growing with the cube of the distance: near a frame's edges only, which is where a
+    wide lens' distortion would otherwise be taken for heights. For each block,
+    (move_b - move_a)(X) = -observed shift.
     The heights are held to their neighbours' (smoothness, robust so that roof edges stay
     sharp), to the rangefinder's (anchors: rows of E, N, height above the plane) and weakly to
-    the plane.
+    the plane, or with rangefinder_prior to the rangefinder's heights nearby (see
+    _anchor_surface): where the plane is the roof most frames' rangefinder hit, the ground
+    beyond it, which few blocks see, is pulled toward the ground rather than the roof.
     report(done, total): the reweighting steps solved.
     """
     n = len(placed)
-    n_global = 2
+    n_global = 3 if distortion else 2
     eps = 1e-4
     g = []
     for pl in placed:
@@ -1211,6 +1412,13 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
     if heights is not None:
         cells, cell_w = heights.point_weights(obs[:, 2], obs[:, 3])
         z_obs = (heights.z.ravel()[cells] * cell_w).sum(1)
+    if distortion:
+        moves_a, moves_b = np.zeros((len(obs), 2)), np.zeros((len(obs), 2))
+        for k in np.unique(np.concatenate([a, b])):
+            for which, moves in ((a, moves_a), (b, moves_b)):
+                at = which == k
+                if at.any():
+                    moves[at] = _distortion_move(placed[k], obs[at, 2], obs[at, 3])
     idx, val, rhs = [], [], []
     for comp, target in ((0, -obs[:, 4]), (1, -obs[:, 5])):
         cols, vals = [], []
@@ -1220,6 +1428,9 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
             vals += [np.full(len(k), -sign), sign * (vn if comp == 0 else -ve)]   # -t, -r perp(v): (r vn, -r ve)
         cols += [np.full(len(a), 3 * n), np.full(len(a), 3 * n + 1)]
         vals += list((g[b, comp] - g[a, comp]).T)
+        if distortion:
+            cols.append(np.full(len(a), 3 * n + 2))
+            vals.append(moves_b[:, comp] - moves_a[:, comp])
         if heights is not None:
             v = obs[:, 2 + comp]
             dz = -(v - c[b, comp]) / (h[b] - z_obs) + (v - c[a, comp]) / (h[a] - z_obs)
@@ -1237,9 +1448,10 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
     n_obs = len(b_rows)
 
     prior = np.concatenate([np.tile([1 / PRIOR_SHIFT_M, 1 / PRIOR_SHIFT_M, 1 / math.radians(PRIOR_ROT_DEG)], n),
-                            np.full(2, 1 / math.radians(PRIOR_BORESIGHT_DEG))])
+                            np.full(2, 1 / math.radians(PRIOR_BORESIGHT_DEG))] + ([[1 / PRIOR_K1]] if distortion else []))
     current = np.concatenate([np.column_stack([np.array([pl.shift for pl in placed]),
-                                               [pl.rot for pl in placed]]).ravel(), bias])
+                                               [pl.rot for pl in placed]]).ravel(), bias]
+                             + ([[placed[0].k1]] if distortion else []))
     observed = None
     if heights is not None:
         z = heights.z.ravel()
@@ -1267,6 +1479,9 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
         base = np.concatenate([base, np.ones(len(b_rows) - len(base))])
         prior = np.concatenate([prior, np.full(z.size, 1 / HEIGHT_PRIOR_M)])
         current = np.concatenate([current, z])
+    target = np.zeros(len(prior))
+    if heights is not None and rangefinder_prior and anchors is not None and len(anchors):
+        target[-heights.z.size:] = _anchor_surface(heights, anchors).ravel()
 
     m = len(prior)
     dense = m <= 3000
@@ -1280,7 +1495,7 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
     for i in range(steps):
         ww = (w * base / sigma) ** 2
         # the normal equations of the weighted rows and the priors, which act on the total correction
-        y = np.bincount(idx.ravel(), (val * (ww * b_rows)[:, None]).ravel(), minlength=m) - current * prior ** 2
+        y = np.bincount(idx.ravel(), (val * (ww * b_rows)[:, None]).ravel(), minlength=m) - (current - target) * prior ** 2
         if dense:
             normal = np.bincount(outer, (ww[:, None, None] * val[:, :, None] * val[:, None, :]).ravel(),
                                  minlength=m * m).reshape(m, m) + np.diag(prior ** 2)
@@ -1292,6 +1507,36 @@ def _solve(placed: list[_Placed], obs: np.ndarray, gsd: float, bias: np.ndarray,
         if report:
             report(i + 1, steps)
     return x, float((w[:n_obs] == 1.0).mean()), observed
+
+
+def _anchor_surface(heights: Heights, anchors: np.ndarray, k: int = ANCHOR_NEIGHBOURS) -> np.ndarray:
+    """Each height cell's prior from the rangefinder: the median height of the k anchors
+    (rows of E, N, height) nearest its centre."""
+    rows, cols = heights.z.shape
+    e = heights.e0 + (np.arange(cols) + 0.5) * heights.cell
+    n = heights.n0 - (np.arange(rows) + 0.5) * heights.cell
+    centres = np.stack(np.meshgrid(e, n), -1).reshape(-1, 2)
+    d = np.hypot(centres[:, None, 0] - anchors[None, :, 0], centres[:, None, 1] - anchors[None, :, 1])
+    nearest = np.argsort(d, axis=1)[:, :min(k, len(anchors))]
+    return np.median(anchors[nearest, 2], axis=1).reshape(rows, cols)
+
+
+def _distortion_move(pl: _Placed, e: np.ndarray, n: np.ndarray) -> np.ndarray:
+    """How far the content frame pl shows at mosaic points (e, n) moves on the ground per unit
+    change of its k1: rows (E, N). The pixel stays; its pinhole point, and so the ground it is
+    taken to show, moves (to first order, x_u changes by -x_u r^2 per unit of k1)."""
+    hz = pl.h if pl.heights is None else np.maximum(pl.h - pl.heights.at_points(e, n), 0.1)
+    uf, vf, _, _ = _project(pl, e - pl.c[0], n - pl.c[1], hz)
+    x, y = _undistort((uf - pl.cx) / pl.frame.pose.focal_px, (vf - pl.cy) / pl.frame.pose.focal_px, pl.k1)
+    eps = 1e-3
+    r2 = x * x + y * y
+
+    def ground(x, y):
+        ray = pl.r_t.T @ np.stack([np.ones_like(x), x, y])         # north, east, down
+        t = hz / ray[2]
+        return (pl.j @ np.stack([ray[1] * t, ray[0] * t])).T
+
+    return (ground(x - eps * x * r2, y - eps * y * r2) - ground(x, y)) / eps
 
 
 def _cg(idx: np.ndarray, val: np.ndarray, ww: np.ndarray, diag: np.ndarray, y: np.ndarray, x: np.ndarray,
@@ -1402,7 +1647,8 @@ FRAME_MODELS_VERSION = 1
 
 def _frame_models(m: Mosaic) -> dict:
     """How each placed frame sees the ground, for FrameModels: its camera (UTM position, height
-    above the ground plane, local-to-UTM map, NED-to-camera rotation with the boresight, lens),
+    above the ground plane, local-to-UTM map, NED-to-camera rotation with the boresight, lens
+    and its distortion k1, when estimated),
     its alignment correction, the surface it was projected onto, and its corrected footprint's
     corners in lon/lat."""
     g, h = m.grid, m.heights
@@ -1417,6 +1663,7 @@ def _frame_models(m: Mosaic) -> dict:
             "local_to_utm": pl.j.tolist(), "ned_to_camera": pl.r_t.tolist(),
             "alignment_shift_m": pl.shift.tolist(), "alignment_rotation_rad": pl.rot,
             "footprint_lonlat": np.column_stack([lon, lat]).tolist(),
+            **({"lens_k1": pl.k1} if pl.k1 else {}),
         })
     return {
         "version": FRAME_MODELS_VERSION, "crs": f"EPSG:{g.epsg}",
@@ -1460,7 +1707,8 @@ class FrameModels:
             placed.append(_Placed(
                 Frame(f["file"], np.zeros((0, 0), np.float32), pose), f["height_m"], np.asarray(f["camera_utm"], float),
                 j, np.linalg.inv(j), np.asarray(f["ned_to_camera"], float), *f["principal_point_px"],
-                np.zeros((0, 2)), np.asarray(f["alignment_shift_m"], float), f["alignment_rotation_rad"], heights))
+                np.zeros((0, 2)), np.asarray(f["alignment_shift_m"], float), f["alignment_rotation_rad"], heights,
+                f.get("lens_k1", 0.0)))
             footprints.append(np.asarray(f["footprint_lonlat"], float))
         return cls(tuple(f["file"] for f in fm["frames"]), tuple(footprints), tuple(placed), zone, north)
 

@@ -6,6 +6,30 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Mosaics of RGB-only flights: the visual frames laid out by their own overlaps, as a
+  thermal mosaic's are (the boresight, each frame's shift and rotation, the surface's
+  heights), with the wide camera's lens distortion estimated, and composited at their full
+  detail. `process --mosaic` makes it for a flight without thermal frames, and
+  `--mosaic-visual-only` on a flight with them, in place of the thermal mosaic. In the API,
+  `MosaicOptions(visual_only=True)`, or `make_mosaic` on a dataset with visual frames and no
+  thermal ones; `MosaicReport.visual_only` is then True, and `mosaic` and `preview` None.
+  Its height cells are 32 of the alignment's pixels by default (a thermal mosaic's: 64).
+- Frame models (`frame_models` in a mosaic's sidecar) give a frame's lens distortion as
+  `lens_k1` when it was estimated, and `read_frame_models` uses it.
+
+### Changed
+
+- Mosaics are faster: the frames' overlaps are matched in worker processes rather than threads
+  (`jobs`), with the frames in shared memory; the thermal test flight's mosaic
+  took 35 s instead of 96 s on 8 workers. The mosaics are unchanged, to the pixel.
+- A script calling the API outside `if __name__ == "__main__":` works in its own process,
+  with a `RuntimeWarning`, where worker processes would import it and run it again (on
+  Windows and macOS, and on Linux since Python 3.14); before, such a script failed there.
+- `MosaicOptions.height_cell` defaults to None: 64 for a thermal mosaic, 32 for a visual
+  mosaic on its own. `--mosaic-height-cell` likewise.
+
 ## [1.12.0] - 2026-11-02
 
 ### Added
