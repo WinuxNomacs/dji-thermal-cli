@@ -367,6 +367,12 @@ def rgb_flight(flight, tmp_path_factory):
     return folder
 
 
+def test_check_makes_no_webodm_plan_for_a_flight_without_thermal_frames(rgb_flight):
+    """There is nothing to plan: no plan, and none of its findings (no "only 0 nadir frame(s)" error)."""
+    res = dtc.check(rgb_flight, webodm=True)
+    assert res.webodm is None and not any(f.code.startswith("webodm_") for f in res.findings)
+
+
 def test_make_mosaic_lays_out_a_flight_without_thermal_frames_by_its_own_overlaps(rgb_flight, tmp_path):
     """A flight of visual frames only: make_mosaic makes their mosaic alone (no thermal mosaic),
     with its stages and its files, and the frames' lens distortion in its frame models."""
