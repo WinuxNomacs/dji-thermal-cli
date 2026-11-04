@@ -406,7 +406,8 @@ def check(path: str | os.PathLike, unit: str = "C", max_pitch: float = _mosaic.D
           jobs: int | None = None, progress: ProgressFn | None = None, webodm: bool = False) -> CheckResult:
     """A dataset's errors and anomalies, each with the options that address it. webodm: also
     plan a WebODM / ODM task (see webodm): frame selection, coverage, the process command to
-    prepare the images and the ODM options to use."""
+    prepare the images and the ODM options to use (None for a dataset without thermal
+    frames, which has nothing to plan)."""
     found = dataset.scan(_existing(path))
     unit = _unit(unit)
     reports = [checks.FileReport(str(p), dataset.FileStatus(p, dataset.UNREADABLE, why), None, None)
@@ -424,7 +425,7 @@ def check(path: str | os.PathLike, unit: str = "C", max_pitch: float = _mosaic.D
     order = {s: i for i, s in enumerate(checks.SEVERITIES)}
     findings.sort(key=lambda f: order[f.severity])
     plan = None
-    if webodm:
+    if webodm and thermal:          # no thermal frames (a flight of visual frames only): nothing to plan
         poses = {}
         for r in reports:
             if r.info is not None:

@@ -6,6 +6,12 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `check --webodm` (`check(..., webodm=True)`) makes no WebODM plan for a flight of visual
+  frames only: it gave the error "only 0 nadir frame(s) with a position" and a plan for
+  thermal frames it doesn't have. `CheckResult.webodm` is then None.
+
 ## [1.13.0] - 2026-11-03
 
 ### Added
