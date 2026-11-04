@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-11-04
+
 ### Fixed
 
 - `check --webodm` (`check(..., webodm=True)`) makes no WebODM plan for a flight of visual
@@ -251,7 +253,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.13.0...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.13.1...HEAD
+[1.13.1]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.13.0...v1.13.1
 [1.13.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.10.0...v1.11.0
