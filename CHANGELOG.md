@@ -6,6 +6,15 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `check --webodm` recommends ODM's `texturing-skip-global-seam-leveling`. ODM's global seam
+  leveling adjusts the frames' values to even them out. Measured on a normalized flight of 151
+  frames, textured both ways from one reconstruction: the orthophoto was as close to the frames
+  either way (a median 0.15 C from the frame closest to straight down) and its seams no more
+  visible, but with the leveling a few pixels read about -390 C, twice out of two runs, where
+  the frames' coldest was -45 C.
+
 ## [1.13.1] - 2026-11-04
 
 ### Fixed

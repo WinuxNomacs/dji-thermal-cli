@@ -57,7 +57,8 @@ dji-thermal-cli check --input-dir /path/to/flight --webodm
 - **The `process` command** that prepares the images: `-o temp_c:tiff`, one value for any
   measurement parameter that differs between files, and `--normalize`.
 - **ODM task options** with the reason for each: `radiometric-calibration none`,
-  `orthophoto-resolution` from the ground sample distance, `gps-accuracy` from the RTK
+  `texturing-skip-global-seam-leveling` (ODM's leveling shifts temperatures and can leave a few
+  pixels far outside any measured), `orthophoto-resolution` from the ground sample distance, `gps-accuracy` from the RTK
   accuracy; and, depending on the site, `feature-quality`, `min-num-features`,
   `fast-orthophoto`, `skip-3dmodel`. With `--format json` they come as data and as ODM
   arguments.
