@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-11-14
+
 ### Changed
 
 - `check --webodm` recommends ODM's `texturing-skip-global-seam-leveling`. ODM's global seam
@@ -262,7 +264,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.13.1...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.14.0...HEAD
+[1.14.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.13.1...v1.14.0
 [1.13.1]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.13.0...v1.13.1
 [1.13.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.11.0...v1.12.0
