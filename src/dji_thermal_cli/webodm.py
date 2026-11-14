@@ -69,6 +69,10 @@ def plan(reports: list[checks.FileReport], poses: dict[str, mosaic.Pose], findin
     recommended: dict[str, Option] = {
         "radiometric-calibration": Option("none", "the TIFFs already hold temperatures in degrees C; ODM's "
                                           "camera calibration is for raw thermal images"),
+        "texturing-skip-global-seam-leveling": Option(True, "ODM's global seam leveling adjusts the frames' "
+                                                      "values to even them out: it shifts temperatures by tenths "
+                                                      "of a degree and can leave a few pixels far outside any "
+                                                      "temperature measured"),
     }
     consider: dict[str, Option] = {}
 

@@ -52,12 +52,15 @@ def test_check_webodm_plan():
     assert args[:2] == ["-o", "temp_c:tiff"]
     assert ("--max-pitch" in args) == (oblique > 0) and ("--normalize" in args) == (nadir >= 2)
     assert plan.recommended["radiometric-calibration"].value == "none"
+    assert plan.recommended["texturing-skip-global-seam-leveling"].value is True
     gsd_cm = plan.coverage["gsd_m"] * 100
     assert plan.recommended["orthophoto-resolution"].value == math.ceil(gsd_cm * 10) / 10
     if "gps-accuracy" in plan.recommended:                   # RTK positions
         assert plan.recommended["gps-accuracy"].value >= 0.02
     assert plan.coverage["frames"] == nadir and plan.coverage["images_per_point_median"] >= 1
-    assert "--radiometric-calibration" in plan.odm_arguments()
+    odm = plan.odm_arguments()
+    assert "--radiometric-calibration" in odm
+    assert odm[odm.index("--texturing-skip-global-seam-leveling") + 1].startswith("--")      # a flag: no value after it
     assert any(f.code == "webodm_low_overlap" for f in res.findings) == (plan.coverage["images_per_point_median"] < 9)
 
 
@@ -66,7 +69,8 @@ def test_check_webodm_cli():
     proc = _cli("check", "--input-dir", _flight(), "--webodm", "--format", "json")
     out = json.loads(proc.stdout)
     assert out["webodm"]["process_command"].startswith("dji-thermal-cli process --input-dir INPUT")
-    assert "findings" not in out["webodm"] and out["webodm"]["odm_arguments"][:2] == ["--radiometric-calibration", "none"]
+    assert "findings" not in out["webodm"] and out["webodm"]["odm_arguments"][:3] == [
+        "--radiometric-calibration", "none", "--texturing-skip-global-seam-leveling"]
     table = _cli("check", "--input-dir", _flight(), "--webodm").stdout
     assert "WebODM / ODM" in table and "orthophoto-resolution" in table
 
