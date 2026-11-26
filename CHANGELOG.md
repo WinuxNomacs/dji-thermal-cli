@@ -6,6 +6,16 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The object distance defaults to each file's embedded distance (`--distance embedded`,
+  `Settings(distance="embedded")`, `MeasurementOverrides(use_rangefinder=False)`): the
+  distance the drone's thermal camera was set to for the flight, as DJI intends and as DJI's
+  own tools measure. It was the laser rangefinder's (`lrf`), which is now experimental: DJI's
+  correction for the air grows with distance, and at flight heights can take temperatures far
+  from the file's own (on an M4T flight, 5 m against the rangefinder's 21 m moved a frame's
+  coldest pixel 3.2 C). Pass `--distance lrf` for the previous behaviour.
+
 ## [1.14.0] - 2026-11-14
 
 ### Changed

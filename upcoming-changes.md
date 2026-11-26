@@ -11,12 +11,22 @@ sections below.
 
 **Then**: nothing planned yet.
 
-**Done:** P1 (performance, 2026-11-03), S1 (the eave smear, 2026-11-03: finer height cells for RGB-only mosaics), V1
+**Done:** D1 (the object distance defaults to the embedded one, `lrf` experimental, 2026-11-26: see "Object
+distance"), P1 (performance, 2026-11-03), S1 (the eave smear, 2026-11-03: finer height cells for RGB-only mosaics), V1
 (RGB-only mosaics in the API and on the command line, 2026-11-03), and their release as 1.13.0 (2026-11-03).
 
 All of it is built on the branch `rgb-mosaic-trial` (decided 2026-11-03), which already holds the trial:
 `visual.build_alone` (d753692), and the lens distortion and rangefinder prior (8e5acef), both off unless asked for, so
 thermal mosaics are unchanged by them.
+
+## Object distance (D1, done 2026-11-26, not released)
+
+The user, 2026-11-26, from the WebODM plugin's research (its `docs/distance.md`): measure with the distance the
+drone's thermal camera was set to, as DJI intends, and mark the laser rangefinder's as experimental. Built on
+`distance-embedded-default`: `--distance`, `Settings.distance` and `MeasurementOverrides.use_rangefinder` default to
+the embedded distance; `lrf` stays, documented as experimental (`--help`, README, the check messages that named it
+the default). A behaviour change for callers relying on the default (dji-thermal-ui pins 1.13.1; the WebODM plugin
+always passes its distance), so the next release is a minor bump with a CHANGELOG note, when the user says.
 
 ## The release of P1, S1 and V1 (done: 1.13.0)
 

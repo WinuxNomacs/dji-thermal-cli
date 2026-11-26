@@ -47,7 +47,8 @@ def test_settings_conversion():
     assert o.reflection == pytest.approx(20.0) and s.range_c() == pytest.approx((15.0, 45.0))
     a = s.adjustments()
     assert a.replace_above == pytest.approx(100.0) and a.replace_above_value == dtc.api.adjust.NO_DATA
-    assert dtc.Settings().overrides().use_rangefinder
+    assert dtc.Settings().distance == "embedded" and not dtc.Settings().overrides().use_rangefinder
+    assert dtc.Settings(distance="lrf").overrides().use_rangefinder
 
 
 @pytest.mark.flight
@@ -55,9 +56,12 @@ def test_measure_in_memory():
     src = _flight()[0]
     m = dtc.measure(src)
     rj = tsdk.open(src.read_bytes())
-    if m.distance_source == "rangefinder":                  # the reading, clamped to the SDK's 1-25 m
+    assert m.distance_source == "embedded" and m.params["distance"] == rj.get_measurement_params().distance
+    lrf_m = dtc.measure(src, dtc.Settings(distance="lrf"))
+    if lrf_m.distance_source == "rangefinder":              # the reading, clamped to the camera's range
         lrf = float(djixmp.fields(src.read_bytes())["LRFTargetDistance"])
-        assert m.params["distance"] == pytest.approx(min(max(lrf, 1.0), 25.0), abs=0.05)
+        lo, hi = rj.get_measurement_params_range()["distance"]
+        assert lrf_m.params["distance"] == pytest.approx(min(max(lrf, lo), hi), abs=0.05)
     assert m.temperature.dtype == np.float32 and m.temperature.shape == (rj.height, rj.width)
     k = dtc.measure(src, unit="K")
     np.testing.assert_array_equal(k.temperature, (m.temperature.astype(np.float64) + 273.15).astype(np.float32))

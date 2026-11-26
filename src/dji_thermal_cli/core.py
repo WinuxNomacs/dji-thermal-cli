@@ -36,7 +36,8 @@ class MeasurementOverrides:
 
     use_rangefinder: when distance is not set, take each file's laser-rangefinder
     target distance (DJI XMP) instead of the embedded distance, where the file has
-    a valid reading.
+    a valid reading. Experimental, off by default: DJI's correction for the air grows
+    with distance, and at flight heights can take temperatures far from the file's own.
 
     sdk: an unpacked DJI Thermal SDK to measure with instead of the port (see native)."""
 
@@ -45,7 +46,7 @@ class MeasurementOverrides:
     emissivity: float | None = None
     reflection: float | None = None
     ambient_temp: float | None = None
-    use_rangefinder: bool = True
+    use_rangefinder: bool = False
     sdk: str | None = None
 
     def apply(self, params):
