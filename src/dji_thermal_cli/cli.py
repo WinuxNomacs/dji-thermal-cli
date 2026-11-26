@@ -14,11 +14,14 @@ thermal images.
   rewrite the original R-JPEG: DJI bakes its environmental parameters into
   a binary APP4 block at capture time that is not writable by the SDK.
 
-  Object distance (--distance): "lrf" (default) uses a file's laser-
+  Object distance (--distance): "embedded" (default) keeps each file's
+  embedded distance, the one its thermal camera was set to for the flight, as
+  DJI's own tools measure; "lrf" (experimental) uses a file's laser-
   rangefinder reading where it has a valid one (DJI XMP LRFStatus=Normal and
   LRFTargetDistance, e.g. the M4T), clamped to the range the camera accepts,
-  else its embedded distance; "embedded" always keeps the embedded distance;
-  a number sets that distance in metres for every file.
+  else its embedded distance: DJI's correction for the air grows with
+  distance, and at flight heights can take temperatures far from the file's
+  own; a number sets that distance in metres for every file.
 
   `list` prints each R-JPEG's embedded measurement parameters (and the
   valid range for each, resolution, R-JPEG version, and current color-bar
@@ -85,7 +88,7 @@ def _distance(text: str) -> str | float:
     try:
         return float(text)
     except ValueError:
-        raise argparse.ArgumentTypeError("must be lrf, embedded or a distance in metres") from None
+        raise argparse.ArgumentTypeError("must be embedded, lrf or a distance in metres") from None
 
 
 PALETTE_LOOKS = (
@@ -152,7 +155,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     proc.add_argument("--input-dir", required=True, type=Path, help="Directory (searched recursively) or single R-JPEG file")
     proc.add_argument("--output-dir", required=True, type=Path)
-    proc.add_argument("--distance", type=_distance, default="lrf", metavar="{lrf,embedded,METRES}", help="Object distance: 'lrf' = each file's laser-rangefinder distance where valid, else embedded (default); 'embedded' = each file's embedded value; or a distance in metres for every file")
+    proc.add_argument("--distance", type=_distance, default="embedded", metavar="{embedded,lrf,METRES}", help="Object distance: 'embedded' = each file's embedded value, as its thermal camera was set (default); 'lrf' = each file's laser-rangefinder distance where valid, else embedded (experimental: DJI's correction for the air can take temperatures far from the file's own at flight heights); or a distance in metres for every file")
     proc.add_argument("--humidity", type=float, default=None, help="Relative humidity as a percent, e.g. 50 for 50%% (default: keep embedded)")
     proc.add_argument("--emissivity", type=float, default=None, help="Emissivity, 0.0-1.0; the accepted range depends on the camera, see `list --format json` (default: keep embedded)")
     proc.add_argument("--reflected-temp", type=float, default=None, dest="reflected_temp", help="Reflected apparent temperature (default: keep embedded)")

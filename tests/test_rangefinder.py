@@ -79,9 +79,9 @@ def _process(tmp_path, data, overrides):
 
 
 @pytest.mark.parametrize("overrides, distance, source", [
-    (core.MeasurementOverrides(), 21.4, "rangefinder"),
-    (core.MeasurementOverrides(distance=7.0), 7.0, "option"),
-    (core.MeasurementOverrides(use_rangefinder=False), None, "embedded"),
+    (core.MeasurementOverrides(), None, "embedded"),         # the default: as the thermal camera was set
+    (core.MeasurementOverrides(use_rangefinder=True), 21.4, "rangefinder"),
+    (core.MeasurementOverrides(distance=7.0, use_rangefinder=True), 7.0, "option"),
 ])
 @pytest.mark.samples
 def test_precedence(overrides, distance, source, tmp_path):
@@ -96,7 +96,7 @@ def test_precedence(overrides, distance, source, tmp_path):
 @pytest.mark.samples
 def test_unusable_reading_keeps_embedded(tmp_path):
     data = _sample("M4T")
-    r, _ = _process(tmp_path, _with_xmp(data, _lrf("TooFar", "0")), core.MeasurementOverrides())
+    r, _ = _process(tmp_path, _with_xmp(data, _lrf("TooFar", "0")), core.MeasurementOverrides(use_rangefinder=True))
     assert r.distance_source == "embedded"
     assert r.notes and "status TooFar" in r.notes[0]
 
@@ -106,7 +106,7 @@ def test_unusable_reading_keeps_embedded(tmp_path):
 def test_clamped_to_camera_range(reading, used, tmp_path):
     data = _sample("M30T")
     assert tsdk.open(data).get_measurement_params_range()["distance"] == (1.0, 25.0)
-    r, temps = _process(tmp_path, _with_xmp(data, _lrf("Normal", reading)), core.MeasurementOverrides())
+    r, temps = _process(tmp_path, _with_xmp(data, _lrf("Normal", reading)), core.MeasurementOverrides(use_rangefinder=True))
     assert (r.distance, r.distance_source) == (used, "rangefinder")
     assert "outside this camera's 1-25 m range" in r.notes[0]
     assert np.array_equal(temps, _temps_at(data, used))
@@ -118,12 +118,12 @@ def test_cli(tmp_path):
     src.parent.mkdir()
     src.write_bytes(_with_xmp(_sample("M4T"), _lrf("Normal", "21.4")))
     proc = _cli("process", "--input-dir", src.parent, "--output-dir", tmp_path / "out", "--jobs", "1")
+    assert "Object distance source: 1 embedded" in proc.stdout, proc.stderr      # the default
+    proc = _cli("process", "--input-dir", src.parent, "--output-dir", tmp_path / "out", "--jobs", "1", "--distance", "lrf")
     assert "Object distance source: 1 laser rangefinder" in proc.stdout, proc.stderr
-    proc = _cli("process", "--input-dir", src.parent, "--output-dir", tmp_path / "out", "--jobs", "1", "--distance", "embedded")
-    assert "Object distance source: 1 embedded" in proc.stdout, proc.stderr
     proc = _cli("process", "--input-dir", src.parent, "--output-dir", tmp_path / "out", "--jobs", "1", "--distance", "7")
     assert "Object distance source: 1 --distance" in proc.stdout, proc.stderr
     proc = _cli("process", "--input-dir", src.parent, "--output-dir", tmp_path / "out", "--distance", "far")
-    assert proc.returncode != 0 and "must be lrf, embedded or a distance in metres" in proc.stderr
+    assert proc.returncode != 0 and "must be embedded, lrf or a distance in metres" in proc.stderr
     proc = _cli("list", "--input-dir", src.parent)
     assert "21.40" in proc.stdout, proc.stderr

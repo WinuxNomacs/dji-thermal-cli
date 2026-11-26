@@ -164,7 +164,7 @@ def _parameter_findings(thermal: list[FileReport], unit: str) -> list[Finding]:
                                f"{len(odd)} at {', '.join(f'{v:g}' for v in seen[:5])}{'...' if len(seen) > 5 else ''}",
                                [p for p, _ in odd],
                                f"set one value for every file with {option}" if key != "distance" else
-                               "--distance lrf (the default) uses each file's rangefinder reading; or set one with --distance METRES"))
+                               "--distance embedded (the default) measures each file with its own; or set one with --distance METRES"))
     sym = units.SYMBOLS[unit]
     temps = {key: [r.info["thermal"]["measurement_params"][key] for r in thermal] for key in ("ambient_temp", "reflection")}
     pairs = [("ambient_temp", "ambient", "--ambient-temp"), ("reflection", "reflected", "--reflected-temp")]
@@ -262,7 +262,7 @@ def _rangefinder_findings(thermal: list[FileReport]) -> list[Finding]:
     bad = [p for p, lrf in with_lrf if (lrf["status"] or "").lower() != "normal" or not lrf["distance_m"]]
     if bad:
         out.append(Finding(WARNING, "rangefinder_invalid", f"{len(bad)} file(s) have no valid rangefinder reading",
-                           bad, "their embedded distance is used instead; set one with --distance METRES if that's wrong"))
+                           bad, "only matters with --distance lrf (experimental): their embedded distance is used instead"))
     good = [(p, lrf["distance_m"]) for p, lrf in with_lrf if p not in set(bad)]
     embedded = [r.info["thermal"]["measurement_params"]["distance"] for r in thermal]
     if good and embedded:
@@ -270,14 +270,15 @@ def _rangefinder_findings(thermal: list[FileReport]) -> list[Finding]:
         if abs(lrf_med - emb_med) > 1.0:
             out.append(Finding(INFO, "rangefinder_distance",
                                f"the embedded object distance is {emb_med:g} m but the rangefinder reads "
-                               f"{lrf_med:.1f} m (median); --distance lrf (the default) measures with the rangefinder's",
-                               [], "--distance embedded keeps the embedded distance instead"))
+                               f"{lrf_med:.1f} m (median); --distance embedded (the default) measures with the embedded one",
+                               [], "--distance lrf (experimental) measures with the rangefinder's, through DJI's correction "
+                               "for the air, which at flight heights can take temperatures far from the file's own"))
     flagged = _outliers(good, MIN_LRF_DIFF_M)
     if flagged:
         out.append(Finding(INFO, "rangefinder_outlier", f"{len(flagged)} file(s) with an unusual rangefinder distance: "
                            + ", ".join(f"{Path(p).name} {v:.1f} m" for p, v in flagged[:5]), [p for p, _ in flagged],
-                           "the laser hit something nearer or farther (a roof, a tree, the horizon); "
-                           "--distance METRES sets one distance for every file"))
+                           "the laser hit something nearer or farther (a roof, a tree, the horizon); only matters with "
+                           "--distance lrf (experimental)"))
     return out
 
 

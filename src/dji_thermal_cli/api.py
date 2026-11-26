@@ -87,14 +87,15 @@ class Settings:
     """How to measure a dataset. None keeps each file's own embedded value.
 
     Temperatures (reflected_temp, ambient_temp, range_min/max, replace_*) are in `unit`
-    (C, F or K) and are converted to Celsius for the SDK. distance is "lrf" (each file's
-    laser-rangefinder distance where valid, else its embedded one), "embedded", or metres.
+    (C, F or K) and are converted to Celsius for the SDK. distance is "embedded" (each
+    file's own, the distance its thermal camera was set to: the default), "lrf" (experimental: each file's
+    laser-rangefinder distance where valid, else its embedded one), or metres.
     humidity is a percent. palette is a number 0-9 or a name (see PALETTES).
     replace_*_value is a temperature or "nodata". sdk: an unpacked DJI Thermal SDK to measure
     with instead of the built-in port (DJI's library, run in a child process: see native).
     """
 
-    distance: str | float = "lrf"
+    distance: str | float = "embedded"
     humidity: float | None = None
     emissivity: float | None = None
     reflected_temp: float | None = None
@@ -119,7 +120,7 @@ class Settings:
             raise SettingsError(f"unit must be C, F or K, not {self.unit!r}")
         object.__setattr__(self, "unit", unit)
         if not (self.distance in ("lrf", "embedded") or isinstance(self.distance, (int, float))):
-            raise SettingsError("distance must be 'lrf', 'embedded' or a distance in metres")
+            raise SettingsError("distance must be 'embedded', 'lrf' or a distance in metres")
         if isinstance(self.distance, (int, float)) and not isinstance(self.distance, bool):
             object.__setattr__(self, "distance", float(self.distance))
         if self.palette is not None:

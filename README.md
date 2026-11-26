@@ -535,13 +535,25 @@ distance came from, any gimbal override with the original angle, and the replace
 thresholds, values and pixel counts. EXR and PNG outputs also carry the adjustments as text
 attributes, and the mosaic report lists them under `adjustments`.
 
-Object distance is the exception to "keep the embedded value". Cameras with a laser
-rangefinder (e.g. the M4T) record the measured distance to the target in their DJI XMP
-(`LRFStatus`, `LRFTargetDistance`), while the R-JPEG's embedded distance is often just the
-5 m default. When a file has a valid reading (status `Normal`), that distance is used,
-clamped to the range the camera accepts (with a note when clamped). This is
-`--distance lrf`, the default; `--distance embedded` keeps each file's embedded distance,
-and `--distance 12.5` sets one distance (metres) for every file.
+Object distance keeps the embedded value too, by default (`--distance embedded`): the
+distance the drone's thermal camera was set to for the flight, as DJI intends and as DJI's
+own tools measure. DJI's Thermal Analysis Tool guide (v1.2): "The camera's default
+calibration distance is generally fixed during production. This is the distance at which
+temperature measurements are the most accurate." It may be a setting of the thermal camera's
+own, apart from the laser rangefinder and the flight height: verify it on your drone. The
+distance doesn't change a file's raw data; it only sets how much DJI's SDK corrects for the
+air between the camera and the surface.
+
+`--distance lrf` is experimental. Cameras with a laser rangefinder (e.g. the M4T) record
+the measured distance to the target in their DJI XMP (`LRFStatus`, `LRFTargetDistance`);
+with `lrf`, a file with a valid reading (status `Normal`) is measured with it, clamped to
+the range the camera accepts (with a note when clamped), else with its embedded distance.
+DJI's correction for the air grows with distance: at flight heights it pushes every
+temperature away from the ambient temperature, about twice as far at 120 m as at 5 m on the
+M4T files checked, and can take temperatures far from the file's own. Check any longer
+distance against something of known temperature in the scene. The laser hits one point, and
+the whole frame is measured with it. `--distance 12.5` sets one distance (metres) for every
+file.
 The run summary says where each file's distance came from, and `list` shows the
 rangefinder reading in its `lrf_m` column.
 
