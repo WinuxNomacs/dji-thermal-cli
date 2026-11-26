@@ -6,6 +6,8 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-11-26
+
 ### Changed
 
 - The object distance defaults to each file's embedded distance (`--distance embedded`,
@@ -274,7 +276,8 @@ First release.
 
 Release candidate of 1.0.0, with the same contents.
 
-[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.14.0...HEAD
+[Unreleased]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.15.0...HEAD
+[1.15.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.14.0...v1.15.0
 [1.14.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.13.1...v1.14.0
 [1.13.1]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.13.0...v1.13.1
 [1.13.0]: https://github.com/WinuxNomacs/dji-thermal-cli/compare/v1.12.0...v1.13.0
